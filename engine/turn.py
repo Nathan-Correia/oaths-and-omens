@@ -179,13 +179,22 @@ def run_turn(state, agents, rng=None, on_step=None):
     return state
 
 
+def _player_stats_snapshot(state):
+    """Small full snapshot (not diffed/sparse - it's tiny) of each
+    faction's non-board resources, captured at every checkpoint
+    alongside the board deltas so the visualizer's info panel can show
+    silver/kill-XP at whichever checkpoint is currently selected."""
+    return {f: {"silver": p.silver, "kill_xp": p.kill_xp, "alive": p.alive} for f, p in state.players.items()}
+
+
 def run_turn_and_log(state, agents, rng=None):
     """Same as run_turn, but also builds and returns a turn_record
     capturing everything needed to reconstruct and inspect this turn
     later: a sparse keyframe (state at turn start), the actions each
     agent actually chose at every phase (never the legal-action menu -
-    only real choices, kept sparse by omitting empty ones), and the
-    resulting board deltas for each phase.
+    only real choices, kept sparse by omitting empty ones), the
+    resulting board deltas for each phase, and each faction's
+    silver/kill-XP at every checkpoint.
 
     Returns (state, turn_record). turn_record shape:
       {
@@ -194,6 +203,7 @@ def run_turn_and_log(state, agents, rng=None):
         "actions": {"buy": {...}, "movement": [...], "cavalry": [...]},
         "battle_events": [...],
         "deltas": {"buy": [...], "movement": [...], "cavalry": [...], "battle": [...]},
+        "player_stats": [snapshot, ...]  # one per checkpoint, 10 total
       }
     """
     rng = rng or random.Random()
@@ -202,6 +212,8 @@ def run_turn_and_log(state, agents, rng=None):
     keyframe = sparse_hexes(snapshot_hexes(state))
 
     state = apply_income_phase(state)
+
+    player_stats = [_player_stats_snapshot(state)]
 
     before = snapshot_hexes(state)
     buy_actions = {}
@@ -215,6 +227,7 @@ def run_turn_and_log(state, agents, rng=None):
     state = apply_buy_phase(state, buy_actions)
     after = snapshot_hexes(state)
     buy_delta = diff_hexes(before, after)
+    player_stats.append(_player_stats_snapshot(state))
 
     movement_actions = []
     movement_deltas = []
@@ -232,6 +245,7 @@ def run_turn_and_log(state, agents, rng=None):
         after = snapshot_hexes(state)
         movement_actions.append(actions)
         movement_deltas.append(diff_hexes(before, after))
+        player_stats.append(_player_stats_snapshot(state))
 
     cavalry_actions = []
     cavalry_deltas = []
@@ -249,6 +263,7 @@ def run_turn_and_log(state, agents, rng=None):
         after = snapshot_hexes(state)
         cavalry_actions.append(actions)
         cavalry_deltas.append(diff_hexes(before, after))
+        player_stats.append(_player_stats_snapshot(state))
 
     before = snapshot_hexes(state)
     battle_events = _run_battle_phase(state, agents, rng)
@@ -256,6 +271,7 @@ def run_turn_and_log(state, agents, rng=None):
     _update_elimination(state)
     after = snapshot_hexes(state)
     battle_delta = diff_hexes(before, after)
+    player_stats.append(_player_stats_snapshot(state))
 
     state.turn_number += 1
 
@@ -274,6 +290,7 @@ def run_turn_and_log(state, agents, rng=None):
             "cavalry": cavalry_deltas,
             "battle": battle_delta,
         },
+        "player_stats": player_stats,
     }
     return state, turn_record
 

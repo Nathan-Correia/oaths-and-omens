@@ -41,7 +41,10 @@ except ImportError:
 # Config
 # ---------------------------------------------------------------------------
 
-WINDOW_W, WINDOW_H = 1000, 1010
+BOARD_AREA_W = 1000  # width reserved for the hex board itself (unchanged from before)
+SIDEBAR_WIDTH = 340   # extra width added for the always-visible player info panel
+WINDOW_W = BOARD_AREA_W + SIDEBAR_WIDTH
+WINDOW_H = 1010
 MARGIN = 20  # pixels of padding around the board
 
 SLIDER_BAND_HEIGHT = 110  # reserved band at the bottom for both sliders
@@ -50,6 +53,23 @@ SLIDER_FILL_COLOR = (120, 160, 220)
 SLIDER_HANDLE_COLOR = (230, 230, 235)
 SLIDER_HANDLE_RADIUS = 9
 SLIDER_LABEL_COLOR = (220, 220, 225)
+
+SIDEBAR_BG_COLOR = (24, 24, 30)
+SIDEBAR_DIVIDER_COLOR = (50, 50, 58)
+SIDEBAR_DEAD_TEXT_COLOR = (110, 110, 115)
+
+# --- Battle log popup: a table, one column per faction, one row per
+# round. Sized so 3 columns fit comfortably; fewer factions just means
+# a narrower popup (not padded out to look like 3 always).
+BATTLE_POPUP_BG_COLOR = (20, 20, 26)
+BATTLE_POPUP_BORDER_COLOR = (90, 90, 100)
+BATTLE_COLUMN_WIDTH = 260
+BATTLE_LABEL_COL_WIDTH = 110
+BATTLE_ROW_HEIGHT = 70
+BATTLE_HEADER_HEIGHT = 40
+BATTLE_POPUP_PADDING = 16
+BATTLE_CELL_TEXT_COLOR = (225, 225, 230)
+BATTLE_CELL_DIM_COLOR = (130, 130, 138)
 
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "board_state.json")
 
@@ -115,12 +135,21 @@ def _apply_delta(current, delta_entries):
 
 
 def load_game(path):
-    """Returns (radius, num_factions, terrain_map, turn_checkpoints).
+    """Returns (radius, num_factions, terrain_map, turn_checkpoints,
+    turn_player_stats, turn_battles_by_hex).
 
     terrain_map: {(q,r,s): terrain_str}
     turn_checkpoints: list (one per turn) of lists of 10 dense board
     states, each a dict {(q,r,s): {"city","troops","battle"}}. Built by
     replaying each turn's sparse keyframe + deltas on a running board.
+    turn_player_stats: list (one per turn) of lists of 10 dicts
+    {faction: {"silver","kill_xp","alive"}} - one per checkpoint,
+    straight from the log (already a full snapshot each time, no
+    reconstruction needed).
+    turn_battles_by_hex: list (one per turn) of {(q,r,s): battle_event}
+    - a battle belongs to the turn it resolved in, not to any specific
+    checkpoint, so clicking a hex looks this up independent of which
+    checkpoint is currently displayed.
     """
     with open(path, "r") as f:
         data = json.load(f)
@@ -132,6 +161,8 @@ def load_game(path):
 
     current = {coord: _empty_hex() for coord in terrain_map}
     turn_checkpoints = []
+    turn_player_stats = []
+    turn_battles_by_hex = []
 
     for turn in data["turns"]:
         checkpoints = []
@@ -155,7 +186,19 @@ def load_game(path):
 
         turn_checkpoints.append(checkpoints)
 
-    return data["radius"], data["num_factions"], terrain_map, turn_checkpoints
+        # player_stats keys arrive as JSON strings ("0","1",...) - convert to int
+        stats_per_checkpoint = [
+            {int(f): v for f, v in snapshot.items()} for snapshot in turn["player_stats"]
+        ]
+        turn_player_stats.append(stats_per_checkpoint)
+
+        battles_by_hex = {}
+        for event in turn.get("battle_events", []):
+            battles_by_hex[tuple(event["hex"])] = event
+        turn_battles_by_hex.append(battles_by_hex)
+
+    return (data["radius"], data["num_factions"], terrain_map,
+            turn_checkpoints, turn_player_stats, turn_battles_by_hex)
 
 
 # ---------------------------------------------------------------------------
@@ -294,6 +337,236 @@ def draw_hex(surface, center, size, terrain, hex_data, font, battle_font):
 # Slider widget (reused for both the turn slider and the checkpoint slider)
 # ---------------------------------------------------------------------------
 
+def compute_unit_counts(board_state, num_factions):
+    """{faction: {"infantry","cavalry","archers"}} - sums troops sitting
+    peacefully on the board AND units currently locked in a pending
+    battle (both are equally "alive", just in different data shapes)."""
+    counts = {f: {"infantry": 0, "cavalry": 0, "archers": 0} for f in range(num_factions)}
+    for data in board_state.values():
+        troops = data.get("troops")
+        if troops:
+            f = troops["faction"]
+            for ut in TROOP_TYPES:
+                counts[f][ut] += troops.get(ut, 0)
+        battle = data.get("battle")
+        if battle:
+            for c in battle["contributions"]:
+                f = c["faction"]
+                for ut in TROOP_TYPES:
+                    counts[f][ut] += c.get(ut, 0)
+    return counts
+
+
+def draw_sidebar(surface, x0, y0, height, num_factions, player_stats, unit_counts, header_font, row_font):
+    """Always-visible per-faction panel: color swatch, alive/dead state,
+    silver, kill-XP, and each unit type's count separately."""
+    pygame.draw.rect(surface, SIDEBAR_BG_COLOR, pygame.Rect(x0, y0, SIDEBAR_WIDTH, height))
+
+    row_h = height / num_factions
+    pad = 14
+
+    for faction in range(num_factions):
+        row_top = y0 + faction * row_h
+        stats = player_stats.get(faction, {})
+        alive = stats.get("alive", True)
+        text_color = TEXT_COLOR if alive else SIDEBAR_DEAD_TEXT_COLOR
+
+        if faction > 0:
+            pygame.draw.line(surface, SIDEBAR_DIVIDER_COLOR,
+                              (x0 + pad, row_top), (x0 + SIDEBAR_WIDTH - pad, row_top), width=1)
+
+        # swatch always shows the faction's real color, even when eliminated -
+        # dimming it too would make a naturally-grey faction (index 7) visually
+        # indistinguishable from the "eliminated" state. Only the text dims.
+        swatch = pygame.Rect(0, 0, 22, 22)
+        swatch.topleft = (x0 + pad, row_top + 10)
+        pygame.draw.rect(surface, FACTION_COLORS[faction], swatch)
+        if not alive:
+            pygame.draw.line(surface, SIDEBAR_DEAD_TEXT_COLOR, swatch.topleft,
+                              (swatch.right, swatch.bottom), width=2)
+            pygame.draw.line(surface, SIDEBAR_DEAD_TEXT_COLOR, (swatch.left, swatch.bottom),
+                              (swatch.right, swatch.top), width=2)
+
+        header = f"Faction {faction}" + ("" if alive else "  (eliminated)")
+        header_surf = header_font.render(header, True, text_color)
+        surface.blit(header_surf, (x0 + pad + 32, row_top + 8))
+
+        silver = stats.get("silver", 0)
+        kill_xp = stats.get("kill_xp", 0)
+        counts = unit_counts.get(faction, {"infantry": 0, "cavalry": 0, "archers": 0})
+
+        line1 = f"Silver: {silver}    Kill XP: {kill_xp}"
+        line2 = f"Infantry: {counts['infantry']}   Cavalry: {counts['cavalry']}   Archers: {counts['archers']}"
+
+        line1_surf = row_font.render(line1, True, text_color)
+        line2_surf = row_font.render(line2, True, text_color)
+        surface.blit(line1_surf, (x0 + pad + 32, row_top + 34))
+        surface.blit(line2_surf, (x0 + pad + 32, row_top + 54))
+
+
+def _empty_totals():
+    return {"infantry": 0, "cavalry": 0, "archers": 0}
+
+
+def compute_battle_table(battle_event):
+    """Turns one battle_event log into a table: {"factions": [...], "rows": [...]}.
+    Each row is {"label": str, "cells": {faction: {"text": str, "totals": {...}}}}.
+    Rows are: Archer Phase, Round 1, Round 2, ..., Result. Totals are a
+    running per-faction unit count, ticking down (or occasionally back
+    up, from a dismount) row by row - so scanning down one column shows
+    that faction's strength over the course of the fight."""
+    totals = {}
+    for c in battle_event["contributions_start"]:
+        t = totals.setdefault(c["faction"], _empty_totals())
+        for ut in TROOP_TYPES:
+            t[ut] += c.get(ut, 0)
+    factions = sorted(totals.keys())
+
+    rows = []
+
+    # --- Archer Phase row ---
+    dealt_by_faction = {f: 0 for f in factions}
+    for entry in battle_event["archer_phase"]:
+        totals[entry["faction"]][entry["unit_type"]] -= entry["count"]
+        dealt_by_faction[entry["killer"]] = dealt_by_faction.get(entry["killer"], 0) + entry["count"]
+
+    archer_cells = {}
+    for f in factions:
+        dealt = dealt_by_faction.get(f, 0)
+        text = f"Dealt {dealt} kill{'s' if dealt != 1 else ''}" if dealt > 0 else "-"
+        archer_cells[f] = {"text": text, "totals": dict(totals[f])}
+    rows.append({"label": "Archer Phase", "cells": archer_cells})
+
+    # --- one row per round ---
+    for round_idx, round_log in enumerate(battle_event["rounds"], start=1):
+        cells = {}
+        deaths_by_faction = {}
+        for d in round_log["deaths"]:
+            deaths_by_faction.setdefault(d["faction"], []).append(d)
+        dismounts_by_faction = {}
+        for d in round_log["dismounts"]:
+            dismounts_by_faction.setdefault(d["faction"], []).append(d)
+
+        for f in factions:
+            submitted = round_log["target_choices_submitted"].get(f)
+            resolved = round_log["resolved_targets"].get(f)
+            roll = round_log["rolls"].get(f)
+            kills_dealt = round_log["kills_dealt"].get(f, 0)
+
+            lines = []
+            if submitted is None:
+                lines.append("-")
+            elif resolved is not None:
+                roll_text = f" (roll {roll})" if roll is not None else ""
+                lines.append(f"-> Faction {resolved}{roll_text}")
+                if kills_dealt:
+                    lines.append(f"{kills_dealt} kill{'s' if kills_dealt != 1 else ''} dealt")
+            else:
+                lines.append(f"wanted Faction {submitted}, outnumbered")
+
+            for d in deaths_by_faction.get(f, []):
+                totals[f][d["unit_type"]] -= d["count"]
+                lines.append(f"lost {d['count']} {d['unit_type']}")
+
+            for d in dismounts_by_faction.get(f, []):
+                if d["success"]:
+                    totals[f]["infantry"] += 1
+                    lines.append("cavalry dismounted -> +1 infantry")
+                elif d.get("reason") == "cap":
+                    lines.append("dismount blocked (unit cap)")
+                else:
+                    lines.append("dismount roll failed")
+
+            cells[f] = {"text": "\n".join(lines), "totals": dict(totals[f])}
+
+        rows.append({"label": f"Round {round_idx}", "cells": cells})
+
+    # --- Result row ---
+    winner = battle_event["winner"]
+    result_cells = {}
+    for f in factions:
+        if winner is None:
+            text = "Mutual wipeout"
+        elif f == winner:
+            text = "WINNER"
+        else:
+            text = "Defeated"
+        result_cells[f] = {"text": text, "totals": dict(totals[f])}
+    rows.append({"label": "Result", "cells": result_cells})
+
+    return {"factions": factions, "rows": rows}
+
+
+def find_hex_at_pixel(centers, hex_size, pos):
+    """Nearest hex to a click position, or None if nothing's close enough
+    (guards against picking a far-off hex when clicking empty space)."""
+    px, py = pos
+    best_coord, best_dist_sq = None, None
+    for coord, (cx, cy) in centers.items():
+        d = (cx - px) ** 2 + (cy - py) ** 2
+        if best_dist_sq is None or d < best_dist_sq:
+            best_dist_sq, best_coord = d, coord
+    if best_dist_sq is not None and best_dist_sq <= (hex_size * 1.05) ** 2:
+        return best_coord
+    return None
+
+
+def draw_battle_popup(surface, window_w, window_h, table, header_font, cell_font, label_font):
+    factions = table["factions"]
+    rows = table["rows"]
+    num_factions = max(1, len(factions))
+
+    popup_w = BATTLE_LABEL_COL_WIDTH + BATTLE_COLUMN_WIDTH * num_factions + BATTLE_POPUP_PADDING * 2
+    available_h = window_h - 40
+    row_h = min(BATTLE_ROW_HEIGHT, max(28, (available_h - BATTLE_HEADER_HEIGHT - BATTLE_POPUP_PADDING * 2) / max(1, len(rows))))
+    popup_h = min(available_h, BATTLE_HEADER_HEIGHT + row_h * len(rows) + BATTLE_POPUP_PADDING * 2)
+
+    popup_x = max(0, (window_w - popup_w) // 2)
+    popup_y = max(0, (window_h - popup_h) // 2)
+
+    popup_rect = pygame.Rect(popup_x, popup_y, popup_w, popup_h)
+    pygame.draw.rect(surface, BATTLE_POPUP_BG_COLOR, popup_rect)
+    pygame.draw.rect(surface, BATTLE_POPUP_BORDER_COLOR, popup_rect, width=2)
+
+    col_x0 = popup_x + BATTLE_POPUP_PADDING + BATTLE_LABEL_COL_WIDTH
+    header_y = popup_y + BATTLE_POPUP_PADDING
+
+    for i, f in enumerate(factions):
+        cx = col_x0 + i * BATTLE_COLUMN_WIDTH
+        swatch = pygame.Rect(cx, header_y, 16, 16)
+        pygame.draw.rect(surface, FACTION_COLORS[f], swatch)
+        text_surf = header_font.render(f"Faction {f}", True, BATTLE_CELL_TEXT_COLOR)
+        surface.blit(text_surf, (cx + 22, header_y))
+
+    body_y0 = header_y + BATTLE_HEADER_HEIGHT
+
+    for r, row in enumerate(rows):
+        row_top = body_y0 + r * row_h
+        if r > 0:
+            pygame.draw.line(surface, BATTLE_POPUP_BORDER_COLOR,
+                              (popup_x + 4, row_top), (popup_x + popup_w - 4, row_top), width=1)
+
+        label_surf = label_font.render(row["label"], True, BATTLE_CELL_TEXT_COLOR)
+        surface.blit(label_surf, (popup_x + BATTLE_POPUP_PADDING, row_top + 6))
+
+        for i, f in enumerate(factions):
+            cx = col_x0 + i * BATTLE_COLUMN_WIDTH
+            cell = row["cells"].get(f)
+            if not cell:
+                continue
+            for line_idx, line in enumerate(cell["text"].split("\n")):
+                line_surf = cell_font.render(line, True, BATTLE_CELL_TEXT_COLOR)
+                surface.blit(line_surf, (cx, row_top + 6 + line_idx * 15))
+
+            t = cell["totals"]
+            totals_text = f"{t['infantry']} {t['cavalry']} {t['archers']}"
+            totals_surf = cell_font.render(totals_text, True, BATTLE_CELL_DIM_COLOR)
+            surface.blit(totals_surf, (cx, row_top + row_h - 18))
+
+    hint_surf = label_font.render("(click anywhere to close)", True, BATTLE_CELL_DIM_COLOR)
+    surface.blit(hint_surf, (popup_x + BATTLE_POPUP_PADDING, popup_y + popup_h - 22))
+
+
 class Slider:
     """A click/drag scrubber along one horizontal track at a fixed y.
     `label_fn(index) -> str` builds the label text shown above the track,
@@ -350,7 +623,7 @@ def main():
         print("Run run_game_and_log.py first to create it.")
         sys.exit(1)
 
-    radius, num_factions, terrain_map, turn_checkpoints = load_game(STATE_FILE)
+    radius, num_factions, terrain_map, turn_checkpoints, turn_player_stats, turn_battles_by_hex = load_game(STATE_FILE)
     num_turns = len(turn_checkpoints)
 
     pygame.init()
@@ -359,17 +632,22 @@ def main():
     clock = pygame.time.Clock()
 
     board_area_h = WINDOW_H - SLIDER_BAND_HEIGHT
-    size = compute_hex_size(radius, WINDOW_W, board_area_h, MARGIN)
+    size = compute_hex_size(radius, BOARD_AREA_W, board_area_h, MARGIN)
     font = pygame.font.SysFont("arial", max(9, int(SHAPE_SIZE * 1.1)), bold=True)
     battle_font = pygame.font.SysFont("arial", 10, bold=True)
     label_font = pygame.font.SysFont("arial", 16)
+    sidebar_header_font = pygame.font.SysFont("arial", 15, bold=True)
+    sidebar_row_font = pygame.font.SysFont("arial", 14)
+    battle_header_font = pygame.font.SysFont("arial", 15, bold=True)
+    battle_cell_font = pygame.font.SysFont("arial", 12)
+    battle_label_font = pygame.font.SysFont("arial", 13, bold=True)
 
     raw_centers = {coord: hex_to_pixel(coord[0], coord[1], size) for coord in terrain_map}
     xs = [p[0] for p in raw_centers.values()]
     ys = [p[1] for p in raw_centers.values()]
     board_cx = (min(xs) + max(xs)) / 2
     board_cy = (min(ys) + max(ys)) / 2
-    offset_x = WINDOW_W / 2 - board_cx
+    offset_x = BOARD_AREA_W / 2 - board_cx
     offset_y = board_area_h / 2 - board_cy
     centers = {coord: (p[0] + offset_x, p[1] + offset_y) for coord, p in raw_centers.items()}
 
@@ -384,6 +662,7 @@ def main():
 
     current_turn = 0
     current_checkpoint = 0
+    open_battle_table = None  # None, or a table dict from compute_battle_table
 
     running = True
     dragging = None  # None | "turn" | "checkpoint"
@@ -393,7 +672,10 @@ def main():
                 running = False
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
-                    running = False
+                    if open_battle_table is not None:
+                        open_battle_table = None
+                    else:
+                        running = False
                 elif event.key in (pygame.K_LEFT, pygame.K_a):
                     current_checkpoint = max(0, current_checkpoint - 1)
                 elif event.key in (pygame.K_RIGHT, pygame.K_d):
@@ -403,12 +685,21 @@ def main():
                 elif event.key in (pygame.K_DOWN, pygame.K_s):
                     current_turn = max(0, current_turn - 1)
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                if turn_slider.hit_test(event.pos):
+                if open_battle_table is not None:
+                    # any click closes the popup, per the "(click anywhere to close)" hint
+                    open_battle_table = None
+                elif turn_slider.hit_test(event.pos):
                     dragging = "turn"
                     current_turn = turn_slider.index_at(event.pos[0])
                 elif checkpoint_slider.hit_test(event.pos):
                     dragging = "checkpoint"
                     current_checkpoint = checkpoint_slider.index_at(event.pos[0])
+                elif event.pos[0] < BOARD_AREA_W and event.pos[1] < board_area_h:
+                    clicked_hex = find_hex_at_pixel(centers, size, event.pos)
+                    if clicked_hex is not None:
+                        battle_event = turn_battles_by_hex[current_turn].get(clicked_hex)
+                        if battle_event is not None:
+                            open_battle_table = compute_battle_table(battle_event)
             elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
                 dragging = None
             elif event.type == pygame.MOUSEMOTION and dragging:
@@ -418,13 +709,22 @@ def main():
                     current_checkpoint = checkpoint_slider.index_at(event.pos[0])
 
         board_state = turn_checkpoints[current_turn][current_checkpoint]
+        player_stats = turn_player_stats[current_turn][current_checkpoint]
+        unit_counts = compute_unit_counts(board_state, num_factions)
 
         screen.fill(BG_COLOR)
         for coord, terrain in terrain_map.items():
             draw_hex(screen, centers[coord], size, terrain, board_state[coord], font, battle_font)
 
+        draw_sidebar(screen, BOARD_AREA_W, 0, board_area_h, num_factions,
+                     player_stats, unit_counts, sidebar_header_font, sidebar_row_font)
+
         turn_slider.draw(screen, current_turn, label_font)
         checkpoint_slider.draw(screen, current_checkpoint, label_font)
+
+        if open_battle_table is not None:
+            draw_battle_popup(screen, WINDOW_W, WINDOW_H, open_battle_table,
+                               battle_header_font, battle_cell_font, battle_label_font)
 
         pygame.display.flip()
         clock.tick(30)
