@@ -7,6 +7,11 @@ A MoveAction is: {"from_hex": coord, "to_hex": coord,
 Any subset of a stack can move (partial splits are legal), and units
 left behind simply stay on the origin hex.
 
+RULE: only one army may move per player per step - matches the
+physical "place one hand on one army and move it" mechanic. Enforced
+in _validate_and_collect: if an agent submits more than one action in
+a single step, only the first is considered; the rest are ignored.
+
 Collision handling, once per step:
   1. Swap detection (line battle): two different factions moving into
      each other's hex in the same step never complete their moves -
@@ -99,29 +104,36 @@ def get_legal_cavalry_actions(state, faction):
 
 def _validate_and_collect(state, actions_by_faction):
     """Returns a list of validated moves: {"faction", "from_hex", "to_hex", "units"}.
-    Invalid moves (bad origin, insufficient units, locked/frozen origin,
-    impassable destination) are silently dropped."""
+
+    Enforces "one army per player per step": only the FIRST action in
+    each faction's submitted list is considered at all - if an agent
+    submits more than one, the rest are simply ignored, mirroring the
+    physical "place one hand on one army" rule. Invalid moves (bad
+    origin, insufficient units, locked/frozen origin, impassable
+    destination) are silently dropped."""
     collected = []
     for faction, actions in actions_by_faction.items():
-        for action in actions:
-            from_hex = tuple(action["from_hex"])
-            to_hex = tuple(action["to_hex"])
-            units = action["units"]
+        if not actions:
+            continue
+        action = actions[0]
+        from_hex = tuple(action["from_hex"])
+        to_hex = tuple(action["to_hex"])
+        units = action["units"]
 
-            h = state.board.get(from_hex)
-            if not h or not h.army or h.army["faction"] != faction:
-                continue
-            if h.locked or h.army.get("frozen"):
-                continue
-            if not _has_units(units):
-                continue
-            if any(h.army[ut] < units.get(ut, 0) for ut in UNIT_TYPES):
-                continue
-            nh = state.board.get(to_hex)
-            if not nh or nh.terrain in IMPASSABLE_TERRAIN:
-                continue
+        h = state.board.get(from_hex)
+        if not h or not h.army or h.army["faction"] != faction:
+            continue
+        if h.locked or h.army.get("frozen"):
+            continue
+        if not _has_units(units):
+            continue
+        if any(h.army[ut] < units.get(ut, 0) for ut in UNIT_TYPES):
+            continue
+        nh = state.board.get(to_hex)
+        if not nh or nh.terrain in IMPASSABLE_TERRAIN:
+            continue
 
-            collected.append({"faction": faction, "from_hex": from_hex, "to_hex": to_hex, "units": dict(units)})
+        collected.append({"faction": faction, "from_hex": from_hex, "to_hex": to_hex, "units": dict(units)})
     return collected
 
 

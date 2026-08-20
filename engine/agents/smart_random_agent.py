@@ -4,9 +4,12 @@ SmartRandomAgent - a step up from pure random, in exactly three ways:
   1. Buy phase: spends all available silver on infantry, and converts
      every banked kill-XP token into a cavalry or archer unit (type
      chosen randomly per token).
-  2. Movement / cavalry phases: every army greedily takes one step
-     toward whichever enemy city is currently nearest to it (hex
-     distance), moving the whole stack rather than splitting.
+  2. Movement / cavalry phases: each step, the single largest eligible
+     army greedily takes one step toward whichever enemy city is
+     currently nearest to it (hex distance), moving the whole stack
+     rather than splitting. Only one army may move per player per step
+     (see engine/movement.py), so this can't move every army at once -
+     it picks the biggest one each step.
   3. Battle targeting and rectification are inherited unchanged from
      RandomAgent - this agent isn't "smarter" about fighting, only
      about economy and positioning.
@@ -67,6 +70,13 @@ class SmartRandomAgent(RandomAgent):
         """Shared logic for both decide_movement and decide_cavalry: for
         every distinct origin army in legal_actions, move the whole
         stack one step toward the nearest enemy city, if possible."""
+    def _greedy_move_largest_army(self, state, faction, legal_actions):
+        """Only one army may move per player per step (see engine/movement.py),
+        so rather than every eligible army trying to advance at once,
+        this picks the single largest eligible army and moves the whole
+        thing one step toward its nearest enemy city - matching "try to
+        move its largest armies toward the nearest enemy city" without
+        violating the one-army-per-step rule."""
         if not legal_actions:
             return []
 
@@ -74,8 +84,15 @@ class SmartRandomAgent(RandomAgent):
         for a in legal_actions:
             actions_by_origin.setdefault(tuple(a["from_hex"]), []).append(a)
 
-        chosen = []
-        for origin, actions in actions_by_origin.items():
+        # rank origins by the largest total-unit action available there
+        # (a proxy for "how big is this army"), largest first
+        ranked_origins = sorted(
+            actions_by_origin.items(),
+            key=lambda item: max(sum(a["units"].values()) for a in item[1]),
+            reverse=True,
+        )
+
+        for origin, actions in ranked_origins:
             target_city = self._nearest_enemy_city(state, faction, origin)
             if target_city is None:
                 continue
@@ -89,12 +106,12 @@ class SmartRandomAgent(RandomAgent):
 
             # move the whole available stack, not a partial split
             best_action = max(matching, key=lambda a: sum(a["units"].values()))
-            chosen.append(best_action)
+            return [best_action]
 
-        return chosen
+        return []
 
     def decide_movement(self, state, faction, step, legal_actions):
-        return self._greedy_move_all_armies(state, faction, legal_actions)
+        return self._greedy_move_largest_army(state, faction, legal_actions)
 
     def decide_cavalry(self, state, faction, step, legal_actions):
-        return self._greedy_move_all_armies(state, faction, legal_actions)
+        return self._greedy_move_largest_army(state, faction, legal_actions)
