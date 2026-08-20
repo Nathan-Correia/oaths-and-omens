@@ -22,7 +22,7 @@ import random
 
 from engine.setup import create_initial_state
 from engine.turn import run_turn_and_log, check_game_end
-from engine.agents.smart_random_agent import SmartRandomAgent
+from engine.agents.heuristic_agent import HeuristicAgent
 
 OUTPUT_FILE = "board_state.json"
 RADIUS = 8
@@ -34,7 +34,7 @@ SEED = 42
 def main():
     rng = random.Random(SEED)
     state = create_initial_state(radius=RADIUS, num_factions=NUM_FACTIONS, seed=SEED)
-    agents = {f: SmartRandomAgent(f, rng=random.Random(1000 + f)) for f in state.players}
+    agents = {f: HeuristicAgent(f, rng=random.Random(1000 + f)) for f in state.players}
 
     terrain_map = {f"{c[0]}_{c[1]}_{c[2]}": h.terrain for c, h in state.board.items()}
 
