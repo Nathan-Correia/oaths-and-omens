@@ -174,7 +174,7 @@ def _apply_kills_to_faction(battle, faction, num_kills, killer_faction, log):
                 break
 
 
-def resolve_round(battle, target_choices, state, rng):
+def resolve_round(battle, target_choices, state, infantry_counts, rng):
     """Runs one full round: targeting conflicts, rolls, simultaneous
     kill application, then cavalry dismounts. Returns a round_log dict:
       "target_choices_submitted": {faction: target_or_None} - what each
@@ -187,6 +187,13 @@ def resolve_round(battle, target_choices, state, rng):
         unit deaths (used by the caller to credit kill-XP).
       "dismounts": [{"faction","success","reason"?}, ...] one entry per
         cavalry unit that died this round.
+
+    infantry_counts: {faction: current_infantry_in_play}, a running
+    tally maintained by the caller (see resolve_full_battle) - the
+    dismount cap check used to call count_units_in_play (a full board
+    scan) on every single roll, which profiling showed as the single
+    largest cost in the whole engine on long/large games. Updated here
+    in O(1) on every successful dismount instead.
 
     Dismounted infantry are added directly into one of the dying
     faction's existing battle contributions - they become live
@@ -231,13 +238,14 @@ def resolve_round(battle, target_choices, state, rng):
             if _roll_d20(rng) < 14:
                 dismount_log.append({"faction": faction, "success": False})
                 continue
-            if count_units_in_play(state, faction, "infantry") >= SPAWN_CAPS["infantry"]:
+            if infantry_counts.get(faction, 0) >= SPAWN_CAPS["infantry"]:
                 dismount_log.append({"faction": faction, "success": False, "reason": "cap"})
                 continue
             for c in battle.contributions:
                 if c["faction"] == faction:
                     c["infantry"] += 1
                     break
+            infantry_counts[faction] = infantry_counts.get(faction, 0) + 1
             dismount_log.append({"faction": faction, "success": True})
 
     battle.round_number += 1
@@ -262,7 +270,7 @@ def get_winner(battle):
     return None  # mutual annihilation, or battle not over yet
 
 
-def resolve_full_battle(battle, target_fn, state, rng=None):
+def resolve_full_battle(battle, target_fn, state, infantry_counts=None, rng=None):
     """Runs the whole battle to completion.
 
     target_fn(battle, faction) -> target_faction_or_None, called once
@@ -270,6 +278,12 @@ def resolve_full_battle(battle, target_fn, state, rng=None):
     state: the full GameState - needed (not just `battle`) because the
     cavalry dismount ability has to check the faction's concurrent
     unit cap across the whole board, not just this battle.
+    infantry_counts: {faction: current_infantry_in_play}, a running
+    tally shared across every battle resolved in the same turn (see
+    turn.py's _run_battle_phase) so dismount cap checks stay correct
+    when a faction fights in more than one battle the same turn. If
+    not provided (e.g. calling this in isolation/tests), one is built
+    from a fresh scan and used only for this battle.
 
     Returns a full log: {"archer_phase": [...], "rounds": [round_log, ...]}
     - full per-round detail (targets, rolls, deaths, dismounts), for
@@ -277,6 +291,8 @@ def resolve_full_battle(battle, target_fn, state, rng=None):
     """
     rng = rng or random.Random()
     players = state.players
+    if infantry_counts is None:
+        infantry_counts = {f: count_units_in_play(state, f, "infantry") for f in battle.factions()}
     full_log = {"archer_phase": [], "rounds": []}
 
     archer_log = apply_archer_abilities(battle, rng, state)
@@ -294,7 +310,7 @@ def resolve_full_battle(battle, target_fn, state, rng=None):
                 continue
             target_choices[faction] = target_fn(battle, faction)
 
-        round_log = resolve_round(battle, target_choices, state, rng)
+        round_log = resolve_round(battle, target_choices, state, infantry_counts, rng)
         full_log["rounds"].append(round_log)
 
         for entry in round_log["deaths"]:

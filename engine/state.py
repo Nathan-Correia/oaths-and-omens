@@ -155,7 +155,16 @@ def count_units_in_play(state, faction, unit_type):
     board or mid-battle. This is the live, concurrent cap check
     ("physical pieces in the bag") - NOT a lifetime production count.
     A unit that dies frees up capacity immediately; kill-XP is spent
-    as currency and has no bearing on this count."""
+    as currency and has no bearing on this count.
+
+    NOTE: this does a full board+battles scan every call. Profiling
+    showed callers that need this repeatedly within one phase (buy,
+    battle dismounts) re-scanning on every check/application, which
+    dominated total engine runtime on large/long games. Those callers
+    now take one snapshot via count_all_units_in_play() and maintain a
+    local running tally instead of calling this in a loop - see
+    buy.py and turn.py's _run_battle_phase. Prefer that pattern for
+    any new hot-path caller; this function is fine for one-off checks."""
     total = 0
     for h in state.board.values():
         if h.army and h.army["faction"] == faction:
@@ -165,3 +174,20 @@ def count_units_in_play(state, faction, unit_type):
             if c["faction"] == faction:
                 total += c[unit_type]
     return total
+
+
+def count_all_units_in_play(state, faction):
+    """Same data as three count_units_in_play() calls, but in a single
+    pass over the board/battles - the snapshot callers take once before
+    maintaining their own running tally (see count_units_in_play's note)."""
+    counts = {"infantry": 0, "cavalry": 0, "archers": 0}
+    for h in state.board.values():
+        if h.army and h.army["faction"] == faction:
+            for ut in UNIT_TYPES:
+                counts[ut] += h.army[ut]
+    for b in state.battles.values():
+        for c in b.contributions:
+            if c["faction"] == faction:
+                for ut in UNIT_TYPES:
+                    counts[ut] += c[ut]
+    return counts

@@ -37,7 +37,7 @@ from engine.agents.heuristic_agent import HeuristicAgent
 OUTPUT_FILE = "board_state.json"
 RADIUS = 8
 NUM_FACTIONS = 8
-MAX_TURNS = 50
+MAX_TURNS = 100
 
 # Seeded from the system clock so every run produces a different game.
 # Printed at the end so a specific run can still be reproduced later by

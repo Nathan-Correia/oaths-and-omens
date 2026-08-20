@@ -21,7 +21,7 @@ from engine.agents.heuristic_agent import HeuristicAgent
 
 RADIUS = 8
 NUM_FACTIONS = 8
-MAX_TURNS = 1000
+MAX_TURNS = 100
 SEED = 1
 
 

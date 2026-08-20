@@ -12,7 +12,7 @@ from .buy import get_legal_buy_actions, apply_buy_phase
 from .movement import get_legal_movement_actions, get_legal_cavalry_actions, apply_movement_step
 from .battle import resolve_full_battle, get_winner, rectify_overflow
 from .terrain import apply_terrain_effects
-from .state import army_total
+from .state import army_total, count_units_in_play
 
 MOVEMENT_STEPS = 3
 CAVALRY_STEPS = 4
@@ -78,8 +78,16 @@ def _run_battle_phase(state, agents, rng):
     logs (contributions at battle start, archer phase, every round's
     detail, winner, and rectification choice) - always computed (it's
     cheap, bounded by actual rounds fought) even if the caller doesn't
-    end up persisting it."""
+    end up persisting it.
+
+    Builds ONE infantry-in-play tally per faction, shared across every
+    battle resolved this phase, rather than each battle scanning the
+    board fresh (see battle.py's resolve_full_battle) - keeps cavalry
+    dismount cap checks correct if the same faction fights in more
+    than one battle this turn, and avoids the repeated full-board scan
+    that profiling showed as the single largest cost in the engine."""
     battle_events = []
+    infantry_counts = {f: count_units_in_play(state, f, "infantry") for f in state.players}
     pending_hexes = list(state.battles.keys())
     for hex_coord in pending_hexes:
         battle = state.battles.get(hex_coord)
@@ -93,7 +101,7 @@ def _run_battle_phase(state, agents, rng):
             legal = get_legal_target_actions(battle, faction)
             return agent.decide_target(state, battle, faction, legal)
 
-        full_log = resolve_full_battle(battle, target_fn, state, rng)
+        full_log = resolve_full_battle(battle, target_fn, state, infantry_counts, rng)
 
         winner = get_winner(battle)
         send_back = []

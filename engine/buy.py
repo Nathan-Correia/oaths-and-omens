@@ -16,10 +16,19 @@ Legal-action generation returns *atomic* single-unit actions (buy one
 infantry, convert one unit); an agent can submit a list of several in
 one buy phase, applied in order against the same faction's own
 resources.
+
+PERFORMANCE NOTE: cap checks used to call count_units_in_play (a full
+board+battles scan) once per candidate hex and once per applied
+action - on a large, long-running game this dominated total engine
+runtime (profiling showed it as the single biggest cost by a wide
+margin). Both get_legal_buy_actions and apply_buy_phase now take one
+snapshot per faction via count_all_units_in_play() and maintain a
+plain local dict tally, incrementing/decrementing it in O(1) as
+actions are (tentatively or actually) applied, instead of rescanning.
 """
 
 from .geometry import hex_neighbors
-from .state import SPAWN_CAPS, army_total, count_units_in_play
+from .state import SPAWN_CAPS, army_total, count_all_units_in_play
 
 INFANTRY_COST = 2
 
@@ -32,18 +41,18 @@ def _adjacent_enemy_present(state, city_hex, faction):
     return False
 
 
-def _remaining_cap(state, faction, unit_type):
-    """Concurrent cap: SPAWN_CAPS[unit_type] minus how many of that type
-    this faction currently has in play (on the board or mid-battle) -
-    a unit dying frees up a slot immediately, unlike a lifetime count."""
-    return SPAWN_CAPS[unit_type] - count_units_in_play(state, faction, unit_type)
+def _remaining_cap(counts, unit_type):
+    """counts: the running {"infantry","cavalry","archers"} tally for one
+    faction (from count_all_units_in_play, kept up to date by the caller)."""
+    return SPAWN_CAPS[unit_type] - counts[unit_type]
 
 
 def get_legal_buy_actions(state, faction):
     player = state.players[faction]
+    counts = count_all_units_in_play(state, faction)
     actions = []
 
-    if _remaining_cap(state, faction, "infantry") > 0 and player.silver >= INFANTRY_COST:
+    if _remaining_cap(counts, "infantry") > 0 and player.silver >= INFANTRY_COST:
         for coord, h in state.board.items():
             if h.city_owner == faction and not h.locked:
                 if not _adjacent_enemy_present(state, coord, faction):
@@ -53,13 +62,13 @@ def get_legal_buy_actions(state, faction):
         for coord, h in state.board.items():
             if h.army and h.army["faction"] == faction and h.army["infantry"] > 0:
                 for unit_type in ("cavalry", "archers"):
-                    if _remaining_cap(state, faction, unit_type) > 0:
+                    if _remaining_cap(counts, unit_type) > 0:
                         actions.append({"type": "convert_to_special", "hex": coord, "unit_type": unit_type})
 
     return actions
 
 
-def _apply_one(state, faction, action):
+def _apply_one(state, faction, action, counts):
     player = state.players[faction]
 
     if action["type"] == "buy_infantry":
@@ -69,7 +78,7 @@ def _apply_one(state, faction, action):
             return False
         if _adjacent_enemy_present(state, coord, faction):
             return False
-        if player.silver < INFANTRY_COST or _remaining_cap(state, faction, "infantry") <= 0:
+        if player.silver < INFANTRY_COST or _remaining_cap(counts, "infantry") <= 0:
             return False
         player.silver -= INFANTRY_COST
         if h.army is None:
@@ -77,6 +86,7 @@ def _apply_one(state, faction, action):
         if h.army["faction"] != faction or army_total(h.army) >= 6:
             return False  # can't spawn into an enemy tile or an already-full stack
         h.army["infantry"] += 1
+        counts["infantry"] += 1
         return True
 
     elif action["type"] == "convert_to_special":
@@ -85,12 +95,14 @@ def _apply_one(state, faction, action):
         h = state.board.get(coord)
         if not h or not h.army or h.army["faction"] != faction or h.army["infantry"] <= 0:
             return False
-        if player.kill_xp <= 0 or player.silver < 1 or _remaining_cap(state, faction, unit_type) <= 0:
+        if player.kill_xp <= 0 or player.silver < 1 or _remaining_cap(counts, unit_type) <= 0:
             return False
         player.kill_xp -= 1
         player.silver -= 1
         h.army["infantry"] -= 1
         h.army[unit_type] += 1
+        counts["infantry"] -= 1
+        counts[unit_type] += 1
         return True
 
     return False
@@ -102,6 +114,7 @@ def apply_buy_phase(state, actions_by_faction):
     ever touch their own resources during this phase so ordering across
     factions doesn't matter."""
     for faction, actions in actions_by_faction.items():
+        counts = count_all_units_in_play(state, faction)
         for action in actions:
-            _apply_one(state, faction, action)
+            _apply_one(state, faction, action, counts)
     return state
