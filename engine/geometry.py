@@ -3,6 +3,8 @@ Hex-grid geometry (cube coordinates), self-contained so the engine
 package doesn't depend on the visualizer's hex_common.py.
 """
 
+from functools import lru_cache
+
 CUBE_DIRECTIONS = [
     (1, 0, -1), (1, -1, 0), (0, -1, 1),
     (-1, 0, 1), (-1, 1, 0), (0, 1, -1),
@@ -20,7 +22,17 @@ def cube_hexes_in_radius(radius):
     return coords
 
 
+@lru_cache(maxsize=None)
 def hex_neighbors(coord, radius):
+    """Cached: adjacency for a fixed (coord, radius) never changes over
+    a game, and this gets called extremely often (once per eligible
+    army per step, from multiple agents/phases) - profiling showed it
+    as one of the hottest functions in the engine. Total distinct
+    (coord, radius) pairs ever queried is bounded by the board size, so
+    the cache stays small (unbounded maxsize is safe here).
+
+    Returns a list - callers must treat it as read-only (iterate, don't
+    mutate), since the same list object is handed out to every caller."""
     q, r, s = coord
     out = []
     for dq, dr, ds in CUBE_DIRECTIONS:
