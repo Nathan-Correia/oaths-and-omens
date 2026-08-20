@@ -25,6 +25,15 @@ margin). Both get_legal_buy_actions and apply_buy_phase now take one
 snapshot per faction via count_all_units_in_play() and maintain a
 plain local dict tally, incrementing/decrementing it in O(1) as
 actions are (tentatively or actually) applied, instead of rescanning.
+
+Similarly, _adjacent_enemy_present (a hex-neighbor scan) can't change
+its answer for a given city over the course of one faction's own
+apply_buy_phase call - buy actions only ever add units at that same
+faction's own cities/armies, never move or place enemy units - so
+apply_buy_phase caches it per city per call instead of rescanning that
+city's neighbors for every repeated buy_infantry action there (an
+agent can legally submit many purchases at the same city in one
+phase).
 """
 
 from .geometry import hex_neighbors
@@ -68,7 +77,7 @@ def get_legal_buy_actions(state, faction):
     return actions
 
 
-def _apply_one(state, faction, action, counts):
+def _apply_one(state, faction, action, counts, enemy_adjacent_cache):
     player = state.players[faction]
 
     if action["type"] == "buy_infantry":
@@ -76,7 +85,11 @@ def _apply_one(state, faction, action, counts):
         h = state.board.get(coord)
         if not h or h.city_owner != faction or h.locked:
             return False
-        if _adjacent_enemy_present(state, coord, faction):
+        adjacent_enemy = enemy_adjacent_cache.get(coord)
+        if adjacent_enemy is None:
+            adjacent_enemy = _adjacent_enemy_present(state, coord, faction)
+            enemy_adjacent_cache[coord] = adjacent_enemy
+        if adjacent_enemy:
             return False
         if player.silver < INFANTRY_COST or _remaining_cap(counts, "infantry") <= 0:
             return False
@@ -115,6 +128,12 @@ def apply_buy_phase(state, actions_by_faction):
     factions doesn't matter."""
     for faction, actions in actions_by_faction.items():
         counts = count_all_units_in_play(state, faction)
+        # Enemy-adjacency for a given city can't change over the course of
+        # one faction's own buy-phase application (buy actions only ever
+        # add units at that same faction's own cities/armies, never move or
+        # place enemy units) - cache it per city instead of rescanning that
+        # city's neighbors for every repeated buy_infantry action there.
+        enemy_adjacent_cache = {}
         for action in actions:
-            _apply_one(state, faction, action, counts)
+            _apply_one(state, faction, action, counts, enemy_adjacent_cache)
     return state

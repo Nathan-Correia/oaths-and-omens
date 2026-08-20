@@ -42,5 +42,11 @@ def hex_neighbors(coord, radius):
     return out
 
 
+@lru_cache(maxsize=None)
 def hex_distance(a, b):
+    """Cached for the same reason as hex_neighbors: pure function of two
+    coords, no board state involved, and it's called very often (agent
+    pathing heuristics, nearest-city search) with plenty of repeated
+    (a, b) pairs across a turn. Distinct pairs are bounded by board size
+    squared, which stays small even for the largest supported maps."""
     return max(abs(a[0] - b[0]), abs(a[1] - b[1]), abs(a[2] - b[2]))

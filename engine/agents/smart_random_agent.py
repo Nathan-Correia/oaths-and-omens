@@ -85,15 +85,25 @@ class SmartRandomAgent(RandomAgent):
             actions_by_origin.setdefault(tuple(a["from_hex"]), []).append(a)
 
         # rank origins by the largest total-unit action available there
-        # (a proxy for "how big is this army"), largest first
+        # (a proxy for "how big is this army"), largest first. Every action
+        # for a given origin now carries the same unit total (each
+        # direction moves the whole army - see movement.py), so the first
+        # one's total already is that max; no need to scan all of them.
         ranked_origins = sorted(
             actions_by_origin.items(),
-            key=lambda item: max(sum(a["units"].values()) for a in item[1]),
+            key=lambda item: sum(item[1][0]["units"].values()),
             reverse=True,
         )
 
+        # City ownership can't change during this (read-only) decision, so
+        # scan for enemy city coords once per call rather than having
+        # _nearest_enemy_city rescan the whole board for every origin tried
+        # below.
+        enemy_cities = [coord for coord, h in state.board.items()
+                         if h.city_owner is not None and h.city_owner != faction]
+
         for origin, actions in ranked_origins:
-            target_city = self._nearest_enemy_city(state, faction, origin)
+            target_city = min(enemy_cities, key=lambda c: hex_distance(origin, c)) if enemy_cities else None
             if target_city is None:
                 continue
             best_hex = self._best_step_toward(state, origin, target_city)

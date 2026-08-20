@@ -53,9 +53,14 @@ class HeuristicAgent(SmartRandomAgent):
 
         if convert_actions:
             num_conversions = player.kill_xp
+            # Decisions here don't mutate `state` (only apply_buy_phase does,
+            # later), so these counts are constant across every iteration of
+            # this loop - compute once rather than re-scanning the whole
+            # board+battles per conversion (profiling showed this as a
+            # significant cost with several kill-XP banked at once).
+            cav_count = count_units_in_play(state, faction, "cavalry")
+            arc_count = count_units_in_play(state, faction, "archers")
             for _ in range(num_conversions):
-                cav_count = count_units_in_play(state, faction, "cavalry")
-                arc_count = count_units_in_play(state, faction, "archers")
                 # lean toward whichever type we have fewer of; small chance
                 # to ignore that and pick randomly, for flavor
                 if self.rng.random() < RANDOM_MOVE_CHANCE:
@@ -116,11 +121,26 @@ class HeuristicAgent(SmartRandomAgent):
         for a in legal_actions:
             actions_by_origin.setdefault(tuple(a["from_hex"]), []).append(a)
 
+        # get_legal_movement_actions/get_legal_cavalry_actions now hand back
+        # exactly one action per direction per origin, always moving the
+        # whole army/cavalry contingent (see movement.py) - so every action
+        # for a given origin already carries the same unit total, and the
+        # old max(...) over all of an origin's actions was recomputing that
+        # same sum once per direction for nothing.
         ranked_origins = sorted(
             actions_by_origin.items(),
-            key=lambda item: max(sum(a["units"].values()) for a in item[1]),
+            key=lambda item: sum(item[1][0]["units"].values()),
             reverse=True,
         )
+
+        # City ownership can't change during this (read-only) decision - it
+        # only changes via apply_movement_step/battle resolution, which run
+        # later. Scan the board for city coords once per call and reuse
+        # across every origin tried below, instead of _nearest_own_city/
+        # _nearest_enemy_city each rescanning the whole board per origin.
+        own_cities = [coord for coord, h in state.board.items() if h.city_owner == faction]
+        enemy_cities = [coord for coord, h in state.board.items()
+                         if h.city_owner is not None and h.city_owner != faction]
 
         for origin, actions in ranked_origins:
             origin_army = state.board[origin].army
@@ -142,7 +162,7 @@ class HeuristicAgent(SmartRandomAgent):
             # favorable attack; fall back toward our own nearest city
             threats = [t for _, t in adjacent_enemies if t > 0]
             if threats and my_total < max(threats) * RETREAT_THRESHOLD:
-                home = self._nearest_own_city(state, faction, origin)
+                home = min(own_cities, key=lambda c: hex_distance(origin, c)) if own_cities else None
                 if home is not None:
                     best_hex = self._safe_best_step_toward(state, faction, origin, home, my_total)
                     matching = [a for a in actions if tuple(a["to_hex"]) == best_hex] if best_hex else []
@@ -152,7 +172,7 @@ class HeuristicAgent(SmartRandomAgent):
 
             # 3. ADVANCE - march toward the nearest enemy city, avoiding
             # any hex held by a strictly stronger enemy along the way
-            target_city = self._nearest_enemy_city(state, faction, origin)
+            target_city = min(enemy_cities, key=lambda c: hex_distance(origin, c)) if enemy_cities else None
             if target_city is None:
                 continue
             best_hex = self._safe_best_step_toward(state, faction, origin, target_city, my_total)

@@ -7,6 +7,29 @@ A MoveAction is: {"from_hex": coord, "to_hex": coord,
 Any subset of a stack can move (partial splits are legal), and units
 left behind simply stay on the origin hex.
 
+ACTION-SPACE SHAPING: get_legal_movement_actions/get_legal_cavalry_actions
+used to enumerate every non-empty sub-multiset split of every eligible
+army, times every direction, every step (see _all_splits below) -
+profiling showed this combinatorial blow-up (unit-split x direction x
+army) as the single largest cost in the engine. In practice neither
+SmartRandomAgent nor HeuristicAgent ever choose anything but the full
+stack (they rank candidate actions by total units moved, and the
+full-stack split is always the unique maximum), so the split
+enumeration was pure waste for every non-fuzzing agent - and it's also
+an unusably large discrete action space for an eventual RL policy.
+
+Both functions now return exactly one action per (eligible army,
+passable neighbor): move the whole stack (or, in the cavalry phase,
+the whole cavalry contingent). This is a strict subset of the old
+output, so any code that always picked the max-units action for a
+given destination (SmartRandomAgent, HeuristicAgent) sees identical
+behavior. RandomAgent - whose job is to fuzz partial-split code paths,
+not play well - now does its own on-demand sub-splitting (see
+agents/random_agent.py) on the single action it picks, rather than the
+engine materializing every possible split up front for every army.
+_all_splits() is kept around for that purpose (and for tests/tools that
+want the full split enumeration for a single army).
+
 RULE: only one army may move per player per step - matches the
 physical "place one hand on one army and move it" mechanic. Enforced
 in _validate_and_collect: if an agent submits more than one action in
@@ -77,12 +100,12 @@ def get_legal_movement_actions(state, faction):
         army = h.army
         if not army or army["faction"] != faction or h.locked or army.get("frozen"):
             continue
+        full_units = {"infantry": army["infantry"], "cavalry": army["cavalry"], "archers": army["archers"]}
         for n in hex_neighbors(coord, state.radius):
             nh = state.board.get(n)
             if not nh or nh.terrain in IMPASSABLE_TERRAIN:
                 continue
-            for split in _all_splits(army):
-                actions.append({"from_hex": coord, "to_hex": n, "units": split})
+            actions.append({"from_hex": coord, "to_hex": n, "units": dict(full_units)})
     return actions
 
 
@@ -101,8 +124,8 @@ def get_legal_cavalry_actions(state, faction):
             nh = state.board.get(n)
             if not nh or nh.terrain in IMPASSABLE_TERRAIN:
                 continue
-            for c in range(1, army["cavalry"] + 1):
-                actions.append({"from_hex": coord, "to_hex": n, "units": {"infantry": 0, "cavalry": c, "archers": 0}})
+            actions.append({"from_hex": coord, "to_hex": n,
+                             "units": {"infantry": 0, "cavalry": army["cavalry"], "archers": 0}})
     return actions
 
 

@@ -8,7 +8,7 @@ crashes, illegal states, and rules ambiguities early.
 import random
 
 from .base_agent import BaseAgent
-from ..state import MAX_STACK_SIZE
+from ..state import MAX_STACK_SIZE, UNIT_TYPES
 
 
 class RandomAgent(BaseAgent):
@@ -24,6 +24,23 @@ class RandomAgent(BaseAgent):
         n = self.rng.randint(0, min(3, len(legal_actions)))
         return self.rng.sample(legal_actions, n) if n > 0 else []
 
+    def _random_sub_split(self, full_units):
+        """Picks a random non-empty sub-multiset of `full_units` (which
+        the engine now always hands back as the whole army/cavalry
+        contingent for a given move - see movement.py's module
+        docstring). This is what exercises the engine's partial-split
+        code paths now that get_legal_movement_actions/
+        get_legal_cavalry_actions no longer enumerate every split
+        themselves: done once, on the single action already chosen,
+        instead of the engine generating every split for every
+        candidate action up front."""
+        result = {ut: (self.rng.randint(0, full_units.get(ut, 0)) if full_units.get(ut, 0) else 0)
+                   for ut in UNIT_TYPES}
+        if not any(result.values()):
+            available = [ut for ut in UNIT_TYPES if full_units.get(ut, 0) > 0]
+            result[self.rng.choice(available)] = 1
+        return result
+
     def decide_movement(self, state, faction, step, legal_actions):
         if not legal_actions:
             return []
@@ -31,14 +48,16 @@ class RandomAgent(BaseAgent):
         # every possible split every step would be needlessly chaotic)
         if self.rng.random() < 0.5:
             return []
-        return [self.rng.choice(legal_actions)]
+        action = self.rng.choice(legal_actions)
+        return [{**action, "units": self._random_sub_split(action["units"])}]
 
     def decide_cavalry(self, state, faction, step, legal_actions):
         if not legal_actions:
             return []
         if self.rng.random() < 0.5:
             return []
-        return [self.rng.choice(legal_actions)]
+        action = self.rng.choice(legal_actions)
+        return [{**action, "units": self._random_sub_split(action["units"])}]
 
     def decide_target(self, state, battle, faction, legal_targets):
         if not legal_targets:

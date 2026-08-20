@@ -24,29 +24,84 @@ CHECKPOINT_LABELS = ["Start", "Buy", "Move 1", "Move 2", "Move 3",
                       "Cav 1", "Cav 2", "Cav 3", "Cav 4", "Battle"]
 
 
+def _snapshot_entry(state, coord, h):
+    """Per-hex log entry (see snapshot_hexes) for one already-looked-up
+    hex. Split out so callers that only need a handful of coords (see
+    _snapshot_subset) don't have to pay for a full-board scan."""
+    entry = {"q": coord[0], "r": coord[1], "s": coord[2],
+              "city": h.city_owner, "troops": None, "battle": None}
+    if h.locked:
+        battle = state.battles.get(coord)
+        if battle is not None:
+            totals = battle.faction_totals()
+            entry["battle"] = {
+                "contributions": [
+                    {"faction": f, "infantry": t["infantry"], "cavalry": t["cavalry"], "archers": t["archers"]}
+                    for f, t in totals.items()
+                ]
+            }
+    else:
+        entry["troops"] = dict(h.army) if h.army is not None else None
+    return entry
+
+
 def snapshot_hexes(state):
     """Full per-hex snapshot (all coords), combining board + any
     pending-battle contributions, for logging/visualization. Terrain
     is intentionally omitted - it's static for the whole game and gets
     factored out into the log file's top-level terrain map instead."""
-    result = []
-    for coord, h in state.board.items():
-        entry = {"q": coord[0], "r": coord[1], "s": coord[2],
-                  "city": h.city_owner, "troops": None, "battle": None}
-        if h.locked:
-            battle = state.battles.get(coord)
-            if battle is not None:
-                totals = battle.faction_totals()
-                entry["battle"] = {
-                    "contributions": [
-                        {"faction": f, "infantry": t["infantry"], "cavalry": t["cavalry"], "archers": t["archers"]}
-                        for f, t in totals.items()
-                    ]
-                }
-        else:
-            entry["troops"] = dict(h.army) if h.army is not None else None
-        result.append(entry)
-    return result
+    return [_snapshot_entry(state, coord, h) for coord, h in state.board.items()]
+
+
+def _snapshot_subset(state, coords_in_board_order):
+    """Same per-hex entries as snapshot_hexes, but only for the given
+    coords (already ordered to match state.board's iteration order) -
+    used where the caller knows in advance that only a small, specific
+    set of hexes could possibly have changed (see _touched_move_coords
+    / _touched_buy_coords), so a full board scan can be skipped."""
+    return {coord: _snapshot_entry(state, coord, state.board[coord]) for coord in coords_in_board_order}
+
+
+def _order_by_board(board_order, coords):
+    """Sorts a small set of touched coords into the same relative order
+    they'd appear in a full board scan, so partial deltas below come
+    out in the exact same order a full snapshot_hexes/diff_hexes pass
+    would have produced (matters only for log determinism/readability -
+    consumers key deltas by coord, not position). `board_order` is
+    {coord: index}, built once per turn by the caller - state.board's
+    key set/order never changes over a game, so rebuilding it on every
+    phase call (as this used to) was pure waste."""
+    return sorted(coords, key=board_order.__getitem__)
+
+
+def _touched_move_coords(actions_by_faction):
+    """Every hex apply_movement_step could possibly mutate this step is
+    either the origin or destination of one of this step's submitted
+    moves (departures, arrivals, merges, battles started/reinforced,
+    reverted overstacked merges - see apply_movement_step's own
+    docstring) - never any other hex. Using the raw submitted actions
+    (before validation) is a safe superset: invalid/dropped moves just
+    mean a couple of extra no-op coords get snapshotted."""
+    coords = set()
+    for actions in actions_by_faction.values():
+        for a in actions:
+            coords.add(tuple(a["from_hex"]))
+            coords.add(tuple(a["to_hex"]))
+    return coords
+
+
+def _touched_buy_coords(buy_actions_by_faction):
+    """Every hex apply_buy_phase could possibly mutate is the city_hex
+    of a buy_infantry action or the hex of a convert_to_special action -
+    never any other hex (see buy.py's _apply_one)."""
+    coords = set()
+    for actions in buy_actions_by_faction.values():
+        for a in actions:
+            if a["type"] == "buy_infantry":
+                coords.add(tuple(a["city_hex"]))
+            elif a["type"] == "convert_to_special":
+                coords.add(tuple(a["hex"]))
+    return coords
 
 
 def sparse_hexes(full_hexes):
@@ -219,11 +274,16 @@ def run_turn_and_log(state, agents, rng=None):
     turn_number = state.turn_number
     keyframe = sparse_hexes(snapshot_hexes(state))
 
+    # state.board's key set/order is fixed for the whole game (hexes are
+    # never added/removed) - build the coord->index map once per turn and
+    # reuse it for every phase's partial-delta ordering below, rather than
+    # rebuilding it on every one of the 8 buy/movement/cavalry phase calls.
+    board_order = {c: i for i, c in enumerate(state.board)}
+
     state = apply_income_phase(state)
 
     player_stats = [_player_stats_snapshot(state)]
 
-    before = snapshot_hexes(state)
     buy_actions = {}
     for faction, agent in agents.items():
         if not state.players[faction].alive:
@@ -232,15 +292,16 @@ def run_turn_and_log(state, agents, rng=None):
         chosen = agent.decide_buy(state, faction, legal)
         if chosen:
             buy_actions[faction] = chosen
+    touched = _order_by_board(board_order, _touched_buy_coords(buy_actions))
+    before = _snapshot_subset(state, touched)
     state = apply_buy_phase(state, buy_actions)
-    after = snapshot_hexes(state)
-    buy_delta = diff_hexes(before, after)
+    after = _snapshot_subset(state, touched)
+    buy_delta = [after[c] for c in touched if before[c] != after[c]]
     player_stats.append(_player_stats_snapshot(state))
 
     movement_actions = []
     movement_deltas = []
     for step in range(MOVEMENT_STEPS):
-        before = snapshot_hexes(state)
         actions = {}
         for faction, agent in agents.items():
             if not state.players[faction].alive:
@@ -249,16 +310,17 @@ def run_turn_and_log(state, agents, rng=None):
             chosen = agent.decide_movement(state, faction, step, legal)
             if chosen:
                 actions[faction] = chosen
+        touched = _order_by_board(board_order, _touched_move_coords(actions))
+        before = _snapshot_subset(state, touched)
         apply_movement_step(state, actions)
-        after = snapshot_hexes(state)
+        after = _snapshot_subset(state, touched)
         movement_actions.append(actions)
-        movement_deltas.append(diff_hexes(before, after))
+        movement_deltas.append([after[c] for c in touched if before[c] != after[c]])
         player_stats.append(_player_stats_snapshot(state))
 
     cavalry_actions = []
     cavalry_deltas = []
     for step in range(CAVALRY_STEPS):
-        before = snapshot_hexes(state)
         actions = {}
         for faction, agent in agents.items():
             if not state.players[faction].alive:
@@ -267,10 +329,12 @@ def run_turn_and_log(state, agents, rng=None):
             chosen = agent.decide_cavalry(state, faction, step, legal)
             if chosen:
                 actions[faction] = chosen
+        touched = _order_by_board(board_order, _touched_move_coords(actions))
+        before = _snapshot_subset(state, touched)
         apply_movement_step(state, actions)
-        after = snapshot_hexes(state)
+        after = _snapshot_subset(state, touched)
         cavalry_actions.append(actions)
-        cavalry_deltas.append(diff_hexes(before, after))
+        cavalry_deltas.append([after[c] for c in touched if before[c] != after[c]])
         player_stats.append(_player_stats_snapshot(state))
 
     before = snapshot_hexes(state)
