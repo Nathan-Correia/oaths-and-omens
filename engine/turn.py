@@ -8,7 +8,7 @@ in agents/base_agent.py.
 import random
 
 from .income import apply_income_phase
-from .buy import get_legal_buy_actions, apply_buy_phase, SPAWN_CAPS
+from .buy import get_legal_buy_actions, apply_buy_phase
 from .movement import get_legal_movement_actions, get_legal_cavalry_actions, apply_movement_step
 from .battle import resolve_full_battle, get_winner, rectify_overflow
 from .terrain import apply_terrain_effects
@@ -26,25 +26,6 @@ def get_legal_target_actions(battle, faction):
     return [f for f, t in totals.items() if f != faction and sum(t.values()) > 0]
 
 
-def _resolve_pending_free_infantry(state):
-    """Cavalry death-ability infantry queued mid-battle get spawned here,
-    at any city the player owns with room (v1: first eligible city
-    found; if none, the opportunity is simply lost)."""
-    for faction, player in state.players.items():
-        while player.pending_free_infantry > 0:
-            player.pending_free_infantry -= 1
-            if player.spawn_counts["infantry"] >= SPAWN_CAPS["infantry"]:
-                continue
-            for coord, h in state.board.items():
-                if h.city_owner == faction and not h.locked:
-                    if h.army is None:
-                        h.army = {"faction": faction, "infantry": 0, "cavalry": 0, "archers": 0, "frozen": False}
-                    if h.army["faction"] == faction and army_total(h.army) < 6:
-                        h.army["infantry"] += 1
-                        player.spawn_counts["infantry"] += 1
-                        break
-
-
 def _run_battle_phase(state, agents, rng):
     pending_hexes = list(state.battles.keys())
     for hex_coord in pending_hexes:
@@ -57,7 +38,7 @@ def _run_battle_phase(state, agents, rng):
             legal = get_legal_target_actions(battle, faction)
             return agent.decide_target(state, battle, faction, legal)
 
-        resolve_full_battle(battle, target_fn, state.players, rng)
+        resolve_full_battle(battle, target_fn, state, rng)
 
         winner = get_winner(battle)
         if winner is None:
@@ -125,7 +106,6 @@ def run_turn(state, agents, rng=None, on_step=None):
             on_step(state)
 
     _run_battle_phase(state, agents, rng)
-    _resolve_pending_free_infantry(state)
     state = apply_terrain_effects(state)
     _update_elimination(state)
 

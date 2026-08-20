@@ -8,9 +8,9 @@ Design notes:
     state.battles[hex] instead, as a list of per-faction contributions
     (each contribution remembers which hex it moved in from, since the
     winner needs that to send overflow units back after the fight).
-  - kill_xp_bank is a list of unit tokens (not just a count), because
-    the "swap a piece from someone else's bank" rule needs to know
-    which player each banked unit conceptually belongs to.
+  - kill_xp is tracked as a plain integer (currency), not literal unit
+    tokens - it can only ever be spent to convert infantry into
+    cavalry/archers, so there's no need to model it as physical pieces.
 """
 
 from dataclasses import dataclass, field, asdict
@@ -64,10 +64,8 @@ class HexState:
 class PlayerState:
     faction: int
     silver: int = 0
-    kill_xp_bank: list = field(default_factory=list)   # list of {"unit_type": str}
-    spawn_counts: dict = field(default_factory=lambda: {"infantry": 0, "cavalry": 0, "archers": 0})
+    kill_xp: int = 0                     # plain currency count, not literal tokens
     voting_tokens: int = 1
-    pending_free_infantry: int = 0   # queued by the cavalry death ability, resolved next buy phase
     alive: bool = True
 
     def to_dict(self):
@@ -76,9 +74,8 @@ class PlayerState:
     @staticmethod
     def from_dict(d):
         return PlayerState(faction=d["faction"], silver=d["silver"],
-                            kill_xp_bank=d["kill_xp_bank"], spawn_counts=d["spawn_counts"],
+                            kill_xp=d.get("kill_xp", 0),
                             voting_tokens=d.get("voting_tokens", 1),
-                            pending_free_infantry=d.get("pending_free_infantry", 0),
                             alive=d.get("alive", True))
 
 
@@ -151,3 +148,20 @@ class GameState:
             battles[b.hex_coord] = b
         return GameState(board=board, players=players, battles=battles,
                           turn_number=d.get("turn_number", 0), radius=d.get("radius", 8))
+
+
+def count_units_in_play(state, faction, unit_type):
+    """How many of `faction`'s `unit_type` units currently exist, on the
+    board or mid-battle. This is the live, concurrent cap check
+    ("physical pieces in the bag") - NOT a lifetime production count.
+    A unit that dies frees up capacity immediately; kill-XP is spent
+    as currency and has no bearing on this count."""
+    total = 0
+    for h in state.board.values():
+        if h.army and h.army["faction"] == faction:
+            total += h.army[unit_type]
+    for b in state.battles.values():
+        for c in b.contributions:
+            if c["faction"] == faction:
+                total += c[unit_type]
+    return total

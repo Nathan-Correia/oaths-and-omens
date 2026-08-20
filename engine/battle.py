@@ -17,11 +17,14 @@ Sequence for one battle:
        d. kills applied simultaneously (mutual kills both happen).
           Death priority per faction: infantry -> cavalry -> archers,
           cascading past empty types.
-       e. cavalry death ability rolls at the end of the round for each
-          cavalry unit that died this round: 14-20 -> owner queues a
-          free infantry (resolved automatically next buy phase).
-       f. attacker of each kill gains kill_xp tokens for the units
-          that died.
+       e. cavalry death ability rolls for each cavalry unit that died
+          this round: 14-20 -> a dismounted infantry unit joins that
+          faction's forces in this same battle immediately (subject to
+          their concurrent unit cap), before the next round's
+          is-the-battle-over check - so a last-cavalry dismount can
+          keep a faction in the fight.
+       f. attacker of each kill gains kill-XP (a plain currency count)
+          for the units that died.
   3. When one faction remains, that faction wins the hex. If the
      winning stack exceeds 6 units, the winner chooses how to send the
      overflow back to any of their own contributing origin hexes
@@ -36,7 +39,7 @@ revisiting if archer balance ends up sensitive to who they hit first.
 
 import random
 
-from .state import UNIT_TYPES, MAX_STACK_SIZE
+from .state import UNIT_TYPES, MAX_STACK_SIZE, SPAWN_CAPS, count_units_in_play
 
 DEATH_PRIORITY = ["infantry", "cavalry", "archers"]
 MAX_ROUNDS_SAFETY_CAP = 200
@@ -132,11 +135,22 @@ def _apply_kills_to_faction(battle, faction, num_kills, killer_faction, log):
                 break
 
 
-def resolve_round(battle, target_choices, rng):
+def resolve_round(battle, target_choices, state, rng):
     """Runs one full round: targeting conflicts, rolls, simultaneous
-    kill application, cavalry death-ability rolls. Returns a log list
-    (each entry: {"faction","unit_type","count","killer"}) plus a list
-    of cavalry-death-ability results: [{"faction": f, "free_infantry": bool}]."""
+    kill application, then cavalry dismounts. Returns (death_log,
+    dismount_log):
+      death_log: [{"faction","unit_type","count","killer"}, ...] for
+        real unit deaths (used by the caller to credit kill-XP).
+      dismount_log: [{"faction","success", "reason"?}, ...] one entry
+        per cavalry unit that died this round, recording whether its
+        death-ability roll succeeded and, if it did, whether there was
+        cap room for the dismounted infantry to actually join.
+
+    Dismounted infantry are added directly into one of the dying
+    faction's existing battle contributions - they become live
+    combatants immediately, before the next round's is_battle_over
+    check, so a last-cavalry dismount can keep a faction in the fight.
+    """
     resolved_targets = _resolve_targets(battle, target_choices)
     totals = battle.faction_totals()
     unit_counts = {f: sum(t.values()) for f, t in totals.items()}
@@ -153,30 +167,34 @@ def resolve_round(battle, target_choices, rng):
             pending_kills.append((target, kills, attacker))
 
     death_log = []
+    cav_died_by_faction = {}
     for target, kills, killer in pending_kills:
         # snapshot cavalry count before applying kills, to know how many cavalry died
         cav_before = sum(c["cavalry"] for c in battle.contributions if c["faction"] == target)
         _apply_kills_to_faction(battle, target, kills, killer, death_log)
         cav_after = sum(c["cavalry"] for c in battle.contributions if c["faction"] == target)
-        cav_died = cav_before - cav_after
-        for _ in range(cav_died):
-            death_log.append({"faction": target, "unit_type": "cavalry_death_ability_pending", "count": 1, "killer": killer})
+        died = cav_before - cav_after
+        if died > 0:
+            cav_died_by_faction[target] = cav_died_by_faction.get(target, 0) + died
 
-    # cavalry death ability rolls
-    ability_log = []
-    for entry in death_log:
-        if entry["unit_type"] == "cavalry_death_ability_pending":
-            triggers = _roll_d20(rng) >= 14
-            ability_log.append({"faction": entry["faction"], "free_infantry": triggers})
-
-    # credit killers with kill-xp tokens for real unit deaths (not the synthetic ability marker)
-    for entry in death_log:
-        if entry["unit_type"] == "cavalry_death_ability_pending":
-            continue
-        # killer credit handled by caller via death_log directly
+    # cavalry death ability: one roll per cavalry unit that died this round
+    dismount_log = []
+    for faction, died_count in cav_died_by_faction.items():
+        for _ in range(died_count):
+            if _roll_d20(rng) < 14:
+                dismount_log.append({"faction": faction, "success": False})
+                continue
+            if count_units_in_play(state, faction, "infantry") >= SPAWN_CAPS["infantry"]:
+                dismount_log.append({"faction": faction, "success": False, "reason": "cap"})
+                continue
+            for c in battle.contributions:
+                if c["faction"] == faction:
+                    c["infantry"] += 1
+                    break
+            dismount_log.append({"faction": faction, "success": True})
 
     battle.round_number += 1
-    return death_log, ability_log
+    return death_log, dismount_log
 
 
 def is_battle_over(battle):
@@ -190,24 +208,26 @@ def get_winner(battle):
     return None  # mutual annihilation, or battle not over yet
 
 
-def resolve_full_battle(battle, target_fn, players, rng=None):
+def resolve_full_battle(battle, target_fn, state, rng=None):
     """Runs the whole battle to completion.
 
     target_fn(battle, faction) -> target_faction_or_None, called once
     per living faction per round (this is the agent decision point).
-    players: {faction: PlayerState} - used to credit kill-XP tokens
-    and queue the cavalry death-ability's free infantry.
+    state: the full GameState - needed (not just `battle`) because the
+    cavalry dismount ability has to check the faction's concurrent
+    unit cap across the whole board, not just this battle.
 
     Returns a full log of every round's events, for replay/debugging.
     """
     rng = rng or random.Random()
+    players = state.players
     full_log = {"archer_phase": [], "rounds": []}
 
     archer_log = apply_archer_abilities(battle, rng)
     full_log["archer_phase"] = archer_log
     for entry in archer_log:
         if entry["killer"] in players:
-            players[entry["killer"]].kill_xp_bank.append({"unit_type": entry["unit_type"]})
+            players[entry["killer"]].kill_xp += entry["count"]
 
     rounds_run = 0
     while not is_battle_over(battle) and rounds_run < MAX_ROUNDS_SAFETY_CAP:
@@ -218,19 +238,13 @@ def resolve_full_battle(battle, target_fn, players, rng=None):
                 continue
             target_choices[faction] = target_fn(battle, faction)
 
-        death_log, ability_log = resolve_round(battle, target_choices, rng)
-        full_log["rounds"].append({"deaths": death_log, "abilities": ability_log})
+        death_log, dismount_log = resolve_round(battle, target_choices, state, rng)
+        full_log["rounds"].append({"deaths": death_log, "dismounts": dismount_log})
 
         for entry in death_log:
-            if entry["unit_type"] == "cavalry_death_ability_pending":
-                continue
             killer = entry["killer"]
             if killer in players:
-                players[killer].kill_xp_bank.append({"unit_type": entry["unit_type"]})
-
-        for entry in ability_log:
-            if entry["free_infantry"] and entry["faction"] in players:
-                players[entry["faction"]].pending_free_infantry += 1
+                players[killer].kill_xp += entry["count"]
 
         rounds_run += 1
 

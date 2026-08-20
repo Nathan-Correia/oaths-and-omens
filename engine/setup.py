@@ -58,7 +58,7 @@ def create_initial_state(radius=8, num_factions=8, seed=42):
         players[faction] = PlayerState(
             faction=faction,
             silver=STARTING_SILVER,
-            kill_xp_bank=[{"unit_type": "infantry"} for _ in range(STARTING_KILL_XP)],
+            kill_xp=STARTING_KILL_XP,
         )
 
     return GameState(board=board, players=players, battles={}, turn_number=0, radius=radius)

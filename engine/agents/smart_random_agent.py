@@ -40,7 +40,7 @@ class SmartRandomAgent(RandomAgent):
                 chosen.append(self.rng.choice(infantry_actions))
 
         if convert_actions:
-            num_conversions = len(player.kill_xp_bank)
+            num_conversions = player.kill_xp
             for _ in range(num_conversions):
                 unit_type = self.rng.choice(["cavalry", "archers"])
                 matching = [a for a in convert_actions if a["unit_type"] == unit_type]
