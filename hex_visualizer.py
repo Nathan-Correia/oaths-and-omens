@@ -92,7 +92,7 @@ SHAPE_SIZE = 11
 SQUARE_SIZE = SHAPE_SIZE - 1  # cavalry square rendered a touch smaller than the others
 
 # City icon sizing (no outline on these, kept separate from troop shapes)
-CITY_ICON_SIZE = 7  # half-width of the square base
+CITY_ICON_SIZE = 9  # half-width of the square base
 
 # Battle-contribution rectangle sizing (stacked when a hex is locked in a fight)
 BATTLE_RECT_WIDTH = 40
@@ -204,14 +204,14 @@ def draw_city_icon(surface, center, faction_color):
     cx, cy = center
     s = CITY_ICON_SIZE
 
-    base_rect = pygame.Rect(0, 0, s * 1.6, s)
+    base_rect = pygame.Rect(0, 0, s * 4 / 3, s)
     base_rect.center = (round(cx), round(cy))
     pygame.draw.rect(surface, faction_color, base_rect)
 
     roof_points = [
-        (base_rect.centerx, base_rect.top - s * 1.4),
-        (base_rect.left, base_rect.top - s * 0.5),
-        (base_rect.right, base_rect.top - s * 0.5),
+        (base_rect.centerx, base_rect.top - s * 1),
+        (base_rect.left, base_rect.top),
+        (base_rect.right, base_rect.top),
     ]
     pygame.draw.polygon(surface, faction_color, roof_points)
 
