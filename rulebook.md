@@ -12,7 +12,6 @@ Each player controls one faction and begins the game with a bag containing:
 - 12 cavalry
 - 12 archers
 - 2 cities
-- 1 voting token
 - 1 D20 die
 
 ## Map Creation
@@ -43,9 +42,9 @@ Each turn begins with a buy phase, right after income is collected.
 
 **Buying units**: infantry cost 2 silver each and can be purchased at any city you control, as long as no enemy units occupy a tile orthogonally adjacent to that city. Cavalry and archers cannot be purchased with silver — they can only be acquired by trading in kill experience (see below).
 
-**Production limits**: over the course of the game, each player may field at most 24 infantry, 12 cavalry, and 12 archers in total.
+**Production limits**: each player may have at most 24 infantry, 12 cavalry, and 12 archers in play at once. This is a concurrent limit, not a lifetime total — losing a unit immediately frees up capacity to field another of that type.
 
-**Trading**: players may trade anything with each other — silver, kill experience, voting tokens, units, cities, and favours. Units and cities may only actually change hands during the buy phase.
+**Trading**: players may trade anything with each other — silver, kill experience, units, cities, and favours. Units and cities may only actually change hands during the buy phase.
 
 ## Movement
 
@@ -55,9 +54,9 @@ All players move simultaneously: everyone selects and commits their moves for th
 
 Movement happens in two parts each turn:
 
-**Regular movement phase**: 3 steps. Each step, an army may move 1 hex. Any number of units may be split off from an army and moved independently — you don't have to move a whole stack together.
+**Regular movement phase**: 3 steps. Each step, every player may move exactly one army 1 hex — even if you control several eligible armies, only one of them may act per step. Any number of units may be split off from that army and moved independently — you don't have to move a whole stack together.
 
-**Cavalry movement phase**: an additional 4 steps, usable only by cavalry units. Each individual cavalry unit may move up to 2 hexes total during this phase, and a player may not use more than 4 total cavalry steps across their whole cavalry force.
+**Cavalry movement phase**: an additional 4 steps, usable only by cavalry units, and subject to the same one-army-per-step rule. Each individual cavalry unit may move up to 2 hexes total during this phase, and a player may not use more than 4 total cavalry steps across their whole cavalry force.
 
 If multiple armies end up moving into the same tile, or attack each other, a battle begins. All armies involved in a battle are locked in place — they cannot move again — until the battle phase resolves the fight.
 
@@ -74,6 +73,8 @@ Once triggered, all three battle types resolve the same way.
 ### Reinforcements and overstacking
 
 Because armies lock in place as soon as a battle starts, additional armies are free to move into a battle on a later step of the same movement phase, joining the fight as reinforcements. This means a battle can temporarily exceed the normal 6-unit stack limit while it's ongoing. Once the battle ends, if the winning side has more than 6 units remaining, the winning player must reduce their stack back down to 6 by sending the excess units back to any tile their own units came from during that battle.
+
+Outside of battle, the 6-unit limit is strict: a peaceful move that would merge into a stack and push it past 6 units simply doesn't happen. The move is illegal and the army stays where it started.
 
 ### Resolving a Battle
 
@@ -93,7 +94,7 @@ If the attacking player has only 1 unit remaining in the battle, a roll of 16–
 
 All rolls for a round happen simultaneously, and all resulting kills are applied at the same time — including cases where two opposing armies land kills on each other in the same round.
 
-**Choosing which units die**: when an army takes casualties, its owner chooses which units are lost, though the practical order is infantry first, then cavalry, then archers.
+**Casualties**: when an army takes casualties, units are always lost in a fixed order — infantry first, then cavalry, then archers.
 
 A battle continues, round after round, until only one player's army remains standing on the tile. If every remaining player's army is wiped out simultaneously, the tile is left empty with no one victorious.
 
@@ -101,7 +102,7 @@ A battle continues, round after round, until only one player's army remains stan
 
 **Archers**: when a player's archers are part of a battle, each archer unit rolls its ability once, before the first round of combat begins. On a roll of 11–20, that archer scores 1 kill against the opposing army with the most units.
 
-**Cavalry**: whenever a cavalry unit dies in battle, its owner immediately rolls its ability. On a roll of 14–20, the owning player receives a free infantry unit, spawned at one of their own cities. On a roll of 1–13, nothing happens.
+**Cavalry**: whenever a cavalry unit dies in battle, its owner immediately rolls its ability. On a roll of 14–20, that cavalry dismounts: a new infantry unit joins the same battle immediately as a live combatant (subject to the normal 12/24 concurrent unit limits) — this can even keep an otherwise-defeated army in the fight. On a roll of 1–13, nothing happens.
 
 ## Kill Experience
 
@@ -117,7 +118,7 @@ Kill experience represents accumulated kills and cannot be hoarded indefinitely 
 |---|---|
 | **Mountain** | Impassable. |
 | **Lake** | Impassable. |
-| **Desert** | Any army that ends its full turn on a desert tile loses 1 unit. |
+| **Desert** | Any army that ends its full turn on a desert tile loses 1 unit — unless that tile has a city on it, in which case the loss doesn't apply. |
 | **Marsh** | Any army that enters a marsh tile is frozen and cannot move again for the rest of that turn. |
 | **Forest** | An army attacking out of a forest tile gains +2 to all of its battle rolls. |
 | **Plains** | No special effect. |
@@ -127,13 +128,15 @@ Kill experience represents accumulated kills and cannot be hoarded indefinitely 
 
 Cities are captured simply by occupying them: if a player moves an army into a city tile that isn't defended by another army, they immediately take ownership of that city. If the city is defended, ownership only changes hands if the attacker wins the resulting battle and occupies the tile.
 
+## Elimination
+
+A player is eliminated once they control no cities and have no units remaining anywhere on the board. Both conditions must be true — a player with units but no cities, or cities but no units, is not eliminated.
+
 ## Win Condition
 
-The game ends after a fixed number of turns. Final scores are tallied from three categories: Cities, Voting, and Military. In the event of a tie, the tiebreaker order is: most cities, then most votes, then most units remaining.
+The game ends after a fixed number of turns. Final scores are tallied from two categories: Cities and Military. In the event of a tie, the tiebreaker order is: most cities, then most units remaining.
 
 **Cities**: each player scores 1 point for every city they control at the end of the game.
-
-**Voting**: each player casts one vote for every voting token they hold, for any player who still controls at least one city (players may vote for themselves). Voting tokens belonging to an eliminated player, or a player with no cities, are worth 0 points. After a countdown, all players reveal their vote simultaneously. Each voting token cast for a player is worth 1 point to that player.
 
 **Military**: each player counts their remaining units at game's end. The player with the most units receives 3 points, the second-most receives 2 points, and the third-most receives 1 point.
 
