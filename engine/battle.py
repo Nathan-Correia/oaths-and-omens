@@ -10,10 +10,11 @@ Sequence for one battle:
        b. target conflicts resolved: if 2+ factions target the same
           faction, only the one with more total units in the battle
           actually attacks this round - the other(s) don't attack.
-       c. one d20 roll per faction-with-a-valid-target; kill table:
-          1-5 -> 0, 6-15 -> 1, 16-20 -> 2 (except: if the ATTACKER has
-          exactly 1 unit left, 16-20 -> 1 kill instead of 2 - this
-          reflects "if you have 1 unit left, 16-20 is a single kill").
+       c. one d20 roll per faction-with-a-valid-target, plus terrain
+          bonuses (see below); kill table: 1-5 -> 0, 6-15 -> 1, 16-20
+          -> 2 (except: if the ATTACKER has exactly 1 unit left, 16-20
+          -> 1 kill instead of 2 - this reflects "if you have 1 unit
+          left, 16-20 is a single kill").
        d. kills applied simultaneously (mutual kills both happen).
           Death priority per faction: infantry -> cavalry -> archers,
           cascading past empty types.
@@ -30,6 +31,15 @@ Sequence for one battle:
      overflow back to any of their own contributing origin hexes
      (rectify_overflow) - if none are valid, those units are lost.
 
+Terrain bonuses (+2 to a d20 roll each, stacking, capped at 20):
+  - Forest: a faction gets +2 on every roll (including the archer
+    ability roll) if any of its contributions to this battle
+    originated from a forest hex - "attacking out of a forest."
+  - City: a faction gets +2 on every roll if it owns the city sitting
+    on the battle's hex - defending their own city. Ownership can't
+    change mid-battle (only rectify_overflow transfers it, once the
+    fight is over), so this is safe to check at any point.
+
 SIMPLIFICATION: the archer pre-round ability targets whichever enemy
 faction currently has the most units in the battle, rather than
 reusing the round-1 target choice. This decouples the ability from the
@@ -43,10 +53,36 @@ from .state import UNIT_TYPES, MAX_STACK_SIZE, SPAWN_CAPS, count_units_in_play
 
 DEATH_PRIORITY = ["infantry", "cavalry", "archers"]
 MAX_ROUNDS_SAFETY_CAP = 200
+TERRAIN_BONUS = 2
 
 
 def _roll_d20(rng):
     return rng.randint(1, 20)
+
+
+def _terrain_bonus(state, battle, faction):
+    """+2 if any of this faction's contributions originated from a
+    forest hex ("attacking out of a forest"), +2 if this faction owns
+    the city on the battle's hex (defending their own city) - these
+    stack, per the rulebook. City ownership is looked up on the live
+    board rather than snapshotted, but it can't change mid-battle
+    (only rectify_overflow transfers it, once the fight is over), so
+    this is safe to check at any point during resolution."""
+    bonus = 0
+    for c in battle.contributions:
+        if c["faction"] == faction:
+            origin = c.get("origin_hex")
+            if origin is not None:
+                oh = state.board.get(tuple(origin))
+                if oh and oh.terrain == "forest":
+                    bonus += TERRAIN_BONUS
+                    break
+
+    h = state.board.get(battle.hex_coord)
+    if h and h.city_owner == faction:
+        bonus += TERRAIN_BONUS
+
+    return bonus
 
 
 def _kills_for_roll(roll, attacker_total_units):
@@ -64,8 +100,10 @@ def faction_alive_totals(battle):
     return {f: sum(t.values()) for f, t in totals.items() if sum(t.values()) > 0}
 
 
-def apply_archer_abilities(battle, rng):
-    """Runs once, before round 1. Returns a log list of kills applied."""
+def apply_archer_abilities(battle, rng, state):
+    """Runs once, before round 1. Returns a log list of kills applied.
+    Terrain bonuses apply to the archers' ability roll the same as any
+    other battle roll."""
     totals = battle.faction_totals()
     alive = faction_alive_totals(battle)
     log = []
@@ -79,9 +117,10 @@ def apply_archer_abilities(battle, rng):
             continue
         target = max(rivals, key=lambda f: rivals[f])
 
+        bonus = _terrain_bonus(state, battle, faction)
         kills = 0
         for _ in range(archers):
-            if _roll_d20(rng) >= 11:
+            if min(20, _roll_d20(rng) + bonus) >= 11:
                 kills += 1
         if kills > 0:
             _apply_kills_to_faction(battle, target, kills, killer_faction=faction, log=log)
@@ -166,7 +205,8 @@ def resolve_round(battle, target_choices, state, rng):
         attacker_units = unit_counts.get(attacker, 0)
         if attacker_units <= 0:
             continue
-        roll = _roll_d20(rng)
+        bonus = _terrain_bonus(state, battle, attacker)
+        roll = min(20, _roll_d20(rng) + bonus)
         kills = _kills_for_roll(roll, attacker_units)
         rolls[attacker] = roll
         kills_dealt[attacker] = kills
@@ -239,7 +279,7 @@ def resolve_full_battle(battle, target_fn, state, rng=None):
     players = state.players
     full_log = {"archer_phase": [], "rounds": []}
 
-    archer_log = apply_archer_abilities(battle, rng)
+    archer_log = apply_archer_abilities(battle, rng, state)
     full_log["archer_phase"] = archer_log
     for entry in archer_log:
         if entry["killer"] in players:
