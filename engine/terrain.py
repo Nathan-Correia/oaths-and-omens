@@ -3,7 +3,11 @@ Terrain effects applied once at the end of each full turn (after
 movement, cavalry movement, and all battles have resolved).
 
   - Desert: any army that ends the full turn on a desert hex loses 1
-    unit (infantry -> cavalry -> archers priority, same as battle deaths).
+    unit (infantry -> cavalry -> archers priority, same as battle
+    deaths) - UNLESS that hex has a city on it. A city on desert
+    terrain still provides its terrain otherwise (e.g. for any future
+    desert-specific rules), it just exempts units from the unit-loss
+    effect specifically.
   - Marsh: armies frozen this turn (by entering a marsh hex) are
     unfrozen, ready to move again next turn.
 """
@@ -16,7 +20,7 @@ def apply_terrain_effects(state):
         if h.army is None:
             continue
 
-        if h.terrain == "desert":
+        if h.terrain == "desert" and h.city_owner is None:
             for ut in UNIT_TYPES:
                 if h.army[ut] > 0:
                     h.army[ut] -= 1
