@@ -137,14 +137,17 @@ def _apply_kills_to_faction(battle, faction, num_kills, killer_faction, log):
 
 def resolve_round(battle, target_choices, state, rng):
     """Runs one full round: targeting conflicts, rolls, simultaneous
-    kill application, then cavalry dismounts. Returns (death_log,
-    dismount_log):
-      death_log: [{"faction","unit_type","count","killer"}, ...] for
-        real unit deaths (used by the caller to credit kill-XP).
-      dismount_log: [{"faction","success", "reason"?}, ...] one entry
-        per cavalry unit that died this round, recording whether its
-        death-ability roll succeeded and, if it did, whether there was
-        cap room for the dismounted infantry to actually join.
+    kill application, then cavalry dismounts. Returns a round_log dict:
+      "target_choices_submitted": {faction: target_or_None} - what each
+        faction actually asked for, before conflict resolution.
+      "resolved_targets": {faction: target} - who actually got to
+        attack this round, after the higher-unit-count conflict rule.
+      "rolls": {faction: raw_d20_roll} - only for factions that attacked.
+      "kills_dealt": {faction: num_kills} - resulting kill count per roll.
+      "deaths": [{"faction","unit_type","count","killer"}, ...] real
+        unit deaths (used by the caller to credit kill-XP).
+      "dismounts": [{"faction","success","reason"?}, ...] one entry per
+        cavalry unit that died this round.
 
     Dismounted infantry are added directly into one of the dying
     faction's existing battle contributions - they become live
@@ -156,6 +159,8 @@ def resolve_round(battle, target_choices, state, rng):
     unit_counts = {f: sum(t.values()) for f, t in totals.items()}
 
     # roll first, then apply all kills simultaneously (mutual kills both happen)
+    rolls = {}
+    kills_dealt = {}
     pending_kills = []  # (target_faction, num_kills, killer_faction)
     for attacker, target in resolved_targets.items():
         attacker_units = unit_counts.get(attacker, 0)
@@ -163,6 +168,8 @@ def resolve_round(battle, target_choices, state, rng):
             continue
         roll = _roll_d20(rng)
         kills = _kills_for_roll(roll, attacker_units)
+        rolls[attacker] = roll
+        kills_dealt[attacker] = kills
         if kills > 0:
             pending_kills.append((target, kills, attacker))
 
@@ -194,7 +201,14 @@ def resolve_round(battle, target_choices, state, rng):
             dismount_log.append({"faction": faction, "success": True})
 
     battle.round_number += 1
-    return death_log, dismount_log
+    return {
+        "target_choices_submitted": dict(target_choices),
+        "resolved_targets": dict(resolved_targets),
+        "rolls": rolls,
+        "kills_dealt": kills_dealt,
+        "deaths": death_log,
+        "dismounts": dismount_log,
+    }
 
 
 def is_battle_over(battle):
@@ -217,7 +231,9 @@ def resolve_full_battle(battle, target_fn, state, rng=None):
     cavalry dismount ability has to check the faction's concurrent
     unit cap across the whole board, not just this battle.
 
-    Returns a full log of every round's events, for replay/debugging.
+    Returns a full log: {"archer_phase": [...], "rounds": [round_log, ...]}
+    - full per-round detail (targets, rolls, deaths, dismounts), for
+    replay/debugging and the future step-by-step battle viewer.
     """
     rng = rng or random.Random()
     players = state.players
@@ -238,10 +254,10 @@ def resolve_full_battle(battle, target_fn, state, rng=None):
                 continue
             target_choices[faction] = target_fn(battle, faction)
 
-        death_log, dismount_log = resolve_round(battle, target_choices, state, rng)
-        full_log["rounds"].append({"deaths": death_log, "dismounts": dismount_log})
+        round_log = resolve_round(battle, target_choices, state, rng)
+        full_log["rounds"].append(round_log)
 
-        for entry in death_log:
+        for entry in round_log["deaths"]:
             killer = entry["killer"]
             if killer in players:
                 players[killer].kill_xp += entry["count"]

@@ -1,21 +1,25 @@
 """
 Hexagon-shaped hex grid visualizer (pygame).
 
-Reads board_state.json (written by map_generator.py, expected to sit
-in the same directory as this file) and renders it.
+Reads board_state.json (the diff-based format written by
+run_game_and_log.py / engine/turn.py:run_turn_and_log) and reconstructs
+every turn's 10 checkpoint states (start-of-turn keyframe, then after
+buy, each of the 3 movement steps, each of the 4 cavalry steps, and
+after battle) by replaying that turn's sparse deltas on top of a
+running full board. Two sliders let you scrub by turn and by
+checkpoint-within-turn independently.
 
 Each hex can show:
   - terrain (washed-out fill color, background context only)
   - a city icon (top-center, square+triangle "building" glyph, faction-colored)
-  - a troop row (center, up to 3 shapes: circle=infantry, square=cavalry,
-    triangle=archers), faction-colored, each shape showing its count
+  - EITHER a peaceful troop row (center, up to 3 shapes: circle=infantry,
+    square=cavalry, triangle=archers, each showing its count) OR, if the
+    hex is currently locked in a pending battle, a stack of small
+    faction-colored rectangles - one per faction contributing to the
+    fight, each showing "infantry cavalry archers" as plain numbers.
 
 All colors are defined as named constants up top so they're easy to
 retune without touching any drawing logic.
-
-Next step (not yet implemented): board_state.json will become a list
-of states instead of a single board, and this file will grow a
-timeline/scrubber to step through them.
 """
 
 import json
@@ -27,14 +31,20 @@ from hex_common import (
     hex_to_pixel, hex_corner, compute_hex_size,
 )
 
+try:
+    from engine.turn import CHECKPOINT_LABELS
+except ImportError:
+    CHECKPOINT_LABELS = ["Start", "Buy", "Move 1", "Move 2", "Move 3",
+                          "Cav 1", "Cav 2", "Cav 3", "Cav 4", "Battle"]
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
-WINDOW_W, WINDOW_H = 1000, 960
+WINDOW_W, WINDOW_H = 1000, 1010
 MARGIN = 20  # pixels of padding around the board
 
-SLIDER_HEIGHT = 60  # reserved band at the bottom of the window for the timeline
+SLIDER_BAND_HEIGHT = 110  # reserved band at the bottom for both sliders
 SLIDER_TRACK_COLOR = (70, 70, 78)
 SLIDER_FILL_COLOR = (120, 160, 220)
 SLIDER_HANDLE_COLOR = (230, 230, 235)
@@ -56,8 +66,8 @@ TERRAIN_COLORS = {
 }
 
 # --- Faction colors: one qualitative, colorblind-conscious palette
-# (Dark2/Set1-style), used consistently for troop shapes AND city icons.
-# Index = faction id (0-7). Edit freely / reorder as needed.
+# (Dark2/Set1-style), used consistently for troop shapes, city icons,
+# AND battle-contribution rectangles. Index = faction id (0-7).
 FACTION_COLORS = [
     (228, 26, 28),    # 0 red
     (55, 126, 184),   # 1 blue
@@ -84,32 +94,68 @@ SQUARE_SIZE = SHAPE_SIZE - 1  # cavalry square rendered a touch smaller than the
 # City icon sizing (no outline on these, kept separate from troop shapes)
 CITY_ICON_SIZE = 7  # half-width of the square base
 
+# Battle-contribution rectangle sizing (stacked when a hex is locked in a fight)
+BATTLE_RECT_WIDTH = 40
+BATTLE_RECT_HEIGHT = 13
+BATTLE_RECT_GAP = 2
+
 
 # ---------------------------------------------------------------------------
-# Loading board state
+# Loading + reconstructing the diff-based log
 # ---------------------------------------------------------------------------
 
-def load_states(path):
-    """Read board_state.json and return (radius, num_factions, list_of_board_dicts).
+def _empty_hex():
+    return {"city": None, "troops": None, "battle": None}
 
-    Each board dict is keyed by (q, r, s) cube-coord tuples, matching
-    the in-memory shape the generator uses internally.
+
+def _apply_delta(current, delta_entries):
+    for e in delta_entries:
+        coord = (e["q"], e["r"], e["s"])
+        current[coord] = {"city": e["city"], "troops": e["troops"], "battle": e["battle"]}
+
+
+def load_game(path):
+    """Returns (radius, num_factions, terrain_map, turn_checkpoints).
+
+    terrain_map: {(q,r,s): terrain_str}
+    turn_checkpoints: list (one per turn) of lists of 10 dense board
+    states, each a dict {(q,r,s): {"city","troops","battle"}}. Built by
+    replaying each turn's sparse keyframe + deltas on a running board.
     """
     with open(path, "r") as f:
         data = json.load(f)
 
-    states = []
-    for hexes in data["states"]:
-        board = {}
-        for entry in hexes:
-            coord = (entry["q"], entry["r"], entry["s"])
-            board[coord] = {
-                "terrain": entry["terrain"],
-                "city": entry["city"],
-                "troops": entry["troops"],
-            }
-        states.append(board)
-    return data["radius"], data["num_factions"], states
+    terrain_map = {}
+    for key, terrain in data["terrain"].items():
+        q, r, s = (int(x) for x in key.split("_"))
+        terrain_map[(q, r, s)] = terrain
+
+    current = {coord: _empty_hex() for coord in terrain_map}
+    turn_checkpoints = []
+
+    for turn in data["turns"]:
+        checkpoints = []
+
+        _apply_delta(current, turn["keyframe"])
+        checkpoints.append(dict(current))
+
+        _apply_delta(current, turn["deltas"]["buy"])
+        checkpoints.append(dict(current))
+
+        for step_delta in turn["deltas"]["movement"]:
+            _apply_delta(current, step_delta)
+            checkpoints.append(dict(current))
+
+        for step_delta in turn["deltas"]["cavalry"]:
+            _apply_delta(current, step_delta)
+            checkpoints.append(dict(current))
+
+        _apply_delta(current, turn["deltas"]["battle"])
+        checkpoints.append(dict(current))
+
+        turn_checkpoints.append(checkpoints)
+
+    return data["radius"], data["num_factions"], terrain_map, turn_checkpoints
 
 
 # ---------------------------------------------------------------------------
@@ -145,7 +191,6 @@ def draw_triangle_shape(surface, center, size, color, count, font):
     ]
     pygame.draw.polygon(surface, color, points)
     pygame.draw.polygon(surface, SHAPE_OUTLINE_COLOR, points, width=1)
-    # nudge text down slightly since the triangle's visual center sits high
     _draw_count_text(surface, (cx, cy + size * 0.15), count, font)
 
 
@@ -172,12 +217,6 @@ def draw_city_icon(surface, center, faction_color):
 
 
 def _shape_positions(present, cx, cy, size):
-    """
-    Return {troop_type: (x, y)} for the shapes present in this hex.
-    - 1 or 2 types: simple horizontal row, centered.
-    - all 3 types: triangle formation, archers on top (matches the
-      triangle icon sitting naturally at the apex).
-    """
     spacing = size * 0.78
     n = len(present)
 
@@ -192,9 +231,51 @@ def _shape_positions(present, cx, cy, size):
     return {ttype: (start_x + i * spacing, cy + size * 0.05) for i, ttype in enumerate(present)}
 
 
-def draw_hex(surface, center, size, hex_data, font):
+def draw_troop_row(surface, center, size, troops, font):
+    cx, cy = center
+    faction_color = FACTION_COLORS[troops["faction"]]
+    present = [t for t in TROOP_TYPES if troops.get(t, 0) > 0]
+    if not present:
+        return
+    positions = _shape_positions(present, cx, cy, size)
+    for ttype in present:
+        shape_center = positions[ttype]
+        count = troops[ttype]
+        if ttype == "infantry":
+            draw_circle_shape(surface, shape_center, SHAPE_SIZE, faction_color, count, font)
+        elif ttype == "cavalry":
+            draw_square_shape(surface, shape_center, SQUARE_SIZE, faction_color, count, font)
+        elif ttype == "archers":
+            draw_triangle_shape(surface, shape_center, SHAPE_SIZE, faction_color, count, font)
+
+
+def draw_battle_rectangles(surface, center, contributions, battle_font):
+    """One small faction-colored rectangle per contributing faction,
+    stacked vertically with a bit of padding, each showing plain
+    "infantry cavalry archers" numbers. Contributions are merged per
+    faction before this is called. Overflow above/below the hex if
+    there are many contributors is an accepted tradeoff, not handled."""
+    cx, cy = center
+    n = len(contributions)
+    total_h = n * BATTLE_RECT_HEIGHT + (n - 1) * BATTLE_RECT_GAP
+    start_y = cy - total_h / 2 + BATTLE_RECT_HEIGHT / 2
+
+    for i, c in enumerate(contributions):
+        y = start_y + i * (BATTLE_RECT_HEIGHT + BATTLE_RECT_GAP)
+        rect = pygame.Rect(0, 0, BATTLE_RECT_WIDTH, BATTLE_RECT_HEIGHT)
+        rect.center = (round(cx), round(y))
+        color = FACTION_COLORS[c["faction"]]
+        pygame.draw.rect(surface, color, rect)
+
+        text = f'{c["infantry"]} {c["cavalry"]} {c["archers"]}'
+        text_surf = battle_font.render(text, True, TEXT_COLOR)
+        text_rect = text_surf.get_rect(center=rect.center)
+        surface.blit(text_surf, text_rect)
+
+
+def draw_hex(surface, center, size, terrain, hex_data, font, battle_font):
     points = [hex_corner(center, size, i) for i in range(6)]
-    pygame.draw.polygon(surface, TERRAIN_COLORS[hex_data["terrain"]], points)
+    pygame.draw.polygon(surface, TERRAIN_COLORS[terrain], points)
     pygame.draw.polygon(surface, HEX_OUTLINE_COLOR, points, width=1)
 
     cx, cy = center
@@ -203,40 +284,28 @@ def draw_hex(surface, center, size, hex_data, font):
         city_center = (cx, cy - size * 0.62 + 4)
         draw_city_icon(surface, city_center, FACTION_COLORS[hex_data["city"]])
 
-    troops = hex_data["troops"]
-    if troops:
-        faction_color = FACTION_COLORS[troops["faction"]]
-        present = [t for t in TROOP_TYPES if troops.get(t, 0) > 0]
-        if present:
-            positions = _shape_positions(present, cx, cy, size)
-            for ttype in present:
-                shape_center = positions[ttype]
-                count = troops[ttype]
-                if ttype == "infantry":
-                    draw_circle_shape(surface, shape_center, SHAPE_SIZE, faction_color, count, font)
-                elif ttype == "cavalry":
-                    draw_square_shape(surface, shape_center, SQUARE_SIZE, faction_color, count, font)
-                elif ttype == "archers":
-                    draw_triangle_shape(surface, shape_center, SHAPE_SIZE, faction_color, count, font)
+    if hex_data["battle"] is not None:
+        draw_battle_rectangles(surface, center, hex_data["battle"]["contributions"], battle_font)
+    elif hex_data["troops"]:
+        draw_troop_row(surface, center, size, hex_data["troops"], font)
 
+
+# ---------------------------------------------------------------------------
+# Slider widget (reused for both the turn slider and the checkpoint slider)
+# ---------------------------------------------------------------------------
 
 class Slider:
-    """A click/drag timeline scrubber pinned to the bottom of the window.
+    """A click/drag scrubber along one horizontal track at a fixed y.
+    `label_fn(index) -> str` builds the label text shown above the track,
+    so the turn slider and checkpoint slider can each show different info."""
 
-    Draws a horizontal track spanning most of the window width, a filled
-    portion up to the current state, a draggable handle, and a "state
-    X / N" label. `index_at(x)` converts a mouse x-coordinate into the
-    nearest state index, snapped to the discrete number of states.
-    """
-
-    def __init__(self, window_w, window_h, band_height, num_states):
+    def __init__(self, window_w, track_y, num_states, label_fn, x_pad=40):
         self.num_states = num_states
-        pad = 40
-        self.track_y = window_h - band_height // 2 - 8
-        self.track_x1 = pad
-        self.track_x2 = window_w - pad
+        self.track_x1 = x_pad
+        self.track_x2 = window_w - x_pad
         self.track_width = self.track_x2 - self.track_x1
-        self.label_y = window_h - band_height + 12
+        self.track_y = track_y
+        self.label_fn = label_fn
 
     def _x_for_index(self, index):
         if self.num_states <= 1:
@@ -262,7 +331,6 @@ class Slider:
         pygame.draw.line(surface, SLIDER_FILL_COLOR,
                           (self.track_x1, self.track_y), (handle_x, self.track_y), width=4)
 
-        # tick marks for each discrete state
         for i in range(self.num_states):
             tx = self._x_for_index(i)
             pygame.draw.circle(surface, SLIDER_TRACK_COLOR, (int(tx), self.track_y), 3)
@@ -270,35 +338,33 @@ class Slider:
         pygame.draw.circle(surface, SLIDER_HANDLE_COLOR, (int(handle_x), self.track_y), SLIDER_HANDLE_RADIUS)
         pygame.draw.circle(surface, SHAPE_OUTLINE_COLOR, (int(handle_x), self.track_y), SLIDER_HANDLE_RADIUS, width=1)
 
-        label = f"State {current_index + 1} / {self.num_states}   (drag the handle, or use ←/→)"
+        label = self.label_fn(current_index)
         text_surf = font.render(label, True, SLIDER_LABEL_COLOR)
-        text_rect = text_surf.get_rect(center=((self.track_x1 + self.track_x2) // 2, self.label_y))
+        text_rect = text_surf.get_rect(center=((self.track_x1 + self.track_x2) // 2, self.track_y - 18))
         surface.blit(text_surf, text_rect)
 
 
 def main():
     if not os.path.exists(STATE_FILE):
         print(f"Could not find {STATE_FILE}")
-        print("Run map_generator.py first to create it.")
+        print("Run run_game_and_log.py first to create it.")
         sys.exit(1)
 
-    radius, num_factions, states = load_states(STATE_FILE)
-    num_states = len(states)
+    radius, num_factions, terrain_map, turn_checkpoints = load_game(STATE_FILE)
+    num_turns = len(turn_checkpoints)
 
     pygame.init()
     screen = pygame.display.set_mode((WINDOW_W, WINDOW_H))
     pygame.display.set_caption("Hex Board Visualizer")
     clock = pygame.time.Clock()
 
-    board_area_h = WINDOW_H - SLIDER_HEIGHT
+    board_area_h = WINDOW_H - SLIDER_BAND_HEIGHT
     size = compute_hex_size(radius, WINDOW_W, board_area_h, MARGIN)
     font = pygame.font.SysFont("arial", max(9, int(SHAPE_SIZE * 1.1)), bold=True)
+    battle_font = pygame.font.SysFont("arial", 10, bold=True)
     label_font = pygame.font.SysFont("arial", 16)
 
-    # centers are computed once (terrain/city/troop *positions* never move,
-    # only the data shown at each hex changes between states)
-    any_board = states[0]
-    raw_centers = {coord: hex_to_pixel(coord[0], coord[1], size) for coord in any_board}
+    raw_centers = {coord: hex_to_pixel(coord[0], coord[1], size) for coord in terrain_map}
     xs = [p[0] for p in raw_centers.values()]
     ys = [p[1] for p in raw_centers.values()]
     board_cx = (min(xs) + max(xs)) / 2
@@ -307,11 +373,20 @@ def main():
     offset_y = board_area_h / 2 - board_cy
     centers = {coord: (p[0] + offset_x, p[1] + offset_y) for coord, p in raw_centers.items()}
 
-    slider = Slider(WINDOW_W, WINDOW_H, SLIDER_HEIGHT, num_states)
-    current_state = 0
+    turn_slider = Slider(
+        WINDOW_W, WINDOW_H - 78, num_turns,
+        label_fn=lambda i: f"Turn {i + 1} / {num_turns}   (drag, or use ↑/↓)",
+    )
+    checkpoint_slider = Slider(
+        WINDOW_W, WINDOW_H - 28, len(CHECKPOINT_LABELS),
+        label_fn=lambda i: f"Phase: {CHECKPOINT_LABELS[i]}   (drag, or use ←/→)",
+    )
+
+    current_turn = 0
+    current_checkpoint = 0
 
     running = True
-    dragging = False
+    dragging = None  # None | "turn" | "checkpoint"
     while running:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
@@ -320,23 +395,36 @@ def main():
                 if event.key == pygame.K_ESCAPE:
                     running = False
                 elif event.key in (pygame.K_LEFT, pygame.K_a):
-                    current_state = max(0, current_state - 1)
+                    current_checkpoint = max(0, current_checkpoint - 1)
                 elif event.key in (pygame.K_RIGHT, pygame.K_d):
-                    current_state = min(num_states - 1, current_state + 1)
+                    current_checkpoint = min(len(CHECKPOINT_LABELS) - 1, current_checkpoint + 1)
+                elif event.key in (pygame.K_UP, pygame.K_w):
+                    current_turn = min(num_turns - 1, current_turn + 1)
+                elif event.key in (pygame.K_DOWN, pygame.K_s):
+                    current_turn = max(0, current_turn - 1)
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                if slider.hit_test(event.pos):
-                    dragging = True
-                    current_state = slider.index_at(event.pos[0])
+                if turn_slider.hit_test(event.pos):
+                    dragging = "turn"
+                    current_turn = turn_slider.index_at(event.pos[0])
+                elif checkpoint_slider.hit_test(event.pos):
+                    dragging = "checkpoint"
+                    current_checkpoint = checkpoint_slider.index_at(event.pos[0])
             elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
-                dragging = False
+                dragging = None
             elif event.type == pygame.MOUSEMOTION and dragging:
-                current_state = slider.index_at(event.pos[0])
+                if dragging == "turn":
+                    current_turn = turn_slider.index_at(event.pos[0])
+                elif dragging == "checkpoint":
+                    current_checkpoint = checkpoint_slider.index_at(event.pos[0])
+
+        board_state = turn_checkpoints[current_turn][current_checkpoint]
 
         screen.fill(BG_COLOR)
-        for coord, data in states[current_state].items():
-            draw_hex(screen, centers[coord], size, data, font)
+        for coord, terrain in terrain_map.items():
+            draw_hex(screen, centers[coord], size, terrain, board_state[coord], font, battle_font)
 
-        slider.draw(screen, current_state, label_font)
+        turn_slider.draw(screen, current_turn, label_font)
+        checkpoint_slider.draw(screen, current_checkpoint, label_font)
 
         pygame.display.flip()
         clock.tick(30)
