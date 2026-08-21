@@ -19,15 +19,27 @@ external decision point (agent's job, same as v1's target_fn) - not
 implemented here. rectify_overflow's `send_back` is likewise supplied by
 the caller.
 
-Not building v1's structured per-round replay log here (no replay/
-visualization consumer for engine_v2 yet) - resolve_full_battle just
-returns how many rounds ran, which is enough for tests/callers to know
-what happened.
+resolve_full_battle returns a full structured log ({"archer_phase": [...],
+"rounds": [...]}), same shape as engine/battle.py's - death/dismount
+entries are plain dicts with string unit types ("infantry"/"cavalry"/
+"archers"), not the leaner int-indexed tuples this module uses
+internally elsewhere, specifically so this log can be handed straight to
+the existing replay/visualization code (hex_visualizer.py's
+compute_battle_table) unchanged - see engine_v2/turn.py's
+run_turn_and_log.
 """
 
 import numpy as np
 
-from .state import MAX_STACK_SIZE, NO_FACTION, NO_ORIGIN, SPAWN_CAPS, TERRAIN_TO_INDEX, count_units_in_play
+from .state import (
+    MAX_STACK_SIZE,
+    NO_FACTION,
+    NO_ORIGIN,
+    SPAWN_CAPS,
+    TERRAIN_TO_INDEX,
+    UNIT_TYPES,
+    count_units_in_play,
+)
 
 DEATH_PRIORITY = (0, 1, 2)  # infantry, cavalry, archers
 MAX_ROUNDS_SAFETY_CAP = 50  # pure infinite-loop guard - real battles resolve in a handful of rounds
@@ -102,9 +114,9 @@ def _kills_for_roll(roll, attacker_total_units):
 def _apply_kills_to_faction(state, hex_index, target_faction, num_kills, killer_faction, death_log):
     """Removes up to num_kills units from target_faction's presence in
     this battle (infantry -> cavalry -> archers cascade, earliest
-    contribution slots first), logging (target_faction, unit_index,
-    count, killer_faction) per removal - mirrors engine/battle.py's
-    _apply_kills_to_faction."""
+    contribution slots first), appending one {"faction", "unit_type",
+    "count", "killer"} dict per removal - mirrors engine/battle.py's
+    _apply_kills_to_faction (dict shape and all, see module docstring)."""
     remaining = num_kills
     for ut in DEATH_PRIORITY:
         if remaining <= 0:
@@ -118,12 +130,14 @@ def _apply_kills_to_faction(state, hex_index, target_faction, num_kills, killer_
             if take > 0:
                 state.battle_units[hex_index, k, ut] -= take
                 remaining -= take
-                death_log.append((target_faction, ut, take, killer_faction))
+                death_log.append(
+                    {"faction": target_faction, "unit_type": UNIT_TYPES[ut], "count": take, "killer": killer_faction}
+                )
 
 
 def apply_archer_abilities(state, hex_index, rng):
     """Runs once, before round 1. Returns a death_log list of
-    (faction, unit_index, count, killer_faction) tuples - mirrors
+    {"faction", "unit_type", "count", "killer"} dicts - mirrors
     engine/battle.py's apply_archer_abilities."""
     order = _battle_faction_order(state, hex_index)
     totals = faction_totals(state, hex_index)
@@ -177,8 +191,9 @@ def _resolve_targets(state, hex_index, target_choices):
 def resolve_round(state, hex_index, target_choices, rng, infantry_counts):
     """Runs one full round in place: targeting conflicts, rolls,
     simultaneous kill application, then cavalry dismounts. Returns a
-    dict with "deaths" ([(faction, unit_index, count, killer), ...]) for
-    kill-XP crediting - mirrors engine/battle.py's resolve_round.
+    dict matching engine/battle.py's resolve_round's round_log shape
+    (target_choices_submitted, resolved_targets, rolls, kills_dealt,
+    deaths, dismounts) - "deaths" also drives kill-XP crediting.
 
     infantry_counts: {faction: current_infantry_in_play}, a running
     tally the caller maintains (shared across every battle resolved in
@@ -218,20 +233,27 @@ def resolve_round(state, hex_index, target_choices, rng, infantry_counts):
     for faction, died_count in cav_died_by_faction.items():
         for _ in range(died_count):
             if rng.randint(1, 20) < 14:
-                dismount_log.append((faction, False))
+                dismount_log.append({"faction": faction, "success": False})
                 continue
             if infantry_counts.get(faction, 0) >= int(SPAWN_CAPS[0]):
-                dismount_log.append((faction, False))
+                dismount_log.append({"faction": faction, "success": False, "reason": "cap"})
                 continue
             for k in range(state.battle_faction.shape[1]):
                 if state.battle_faction[hex_index, k] == faction:
                     state.battle_units[hex_index, k, 0] += 1
                     break
             infantry_counts[faction] = infantry_counts.get(faction, 0) + 1
-            dismount_log.append((faction, True))
+            dismount_log.append({"faction": faction, "success": True})
 
     state.battle_round[hex_index] += 1
-    return {"rolls": rolls, "kills_dealt": kills_dealt, "deaths": death_log, "dismounts": dismount_log}
+    return {
+        "target_choices_submitted": dict(target_choices),
+        "resolved_targets": dict(resolved_targets),
+        "rolls": rolls,
+        "kills_dealt": kills_dealt,
+        "deaths": death_log,
+        "dismounts": dismount_log,
+    }
 
 
 def is_battle_over(state, hex_index):
@@ -254,17 +276,22 @@ def resolve_full_battle(state, hex_index, target_fn, rng, infantry_counts=None):
     real turn orchestration should share one tally across every battle
     resolved that turn - see engine/turn.py's _run_battle_phase for why).
 
-    Returns the number of rounds actually run.
+    Returns {"archer_phase": [...], "rounds": [round_log, ...]} - the
+    same shape as engine/battle.py's resolve_full_battle, for replay/
+    visualization (see module docstring). Always computed, same as v1 -
+    cheap, bounded by actual rounds fought - even if a given caller
+    (e.g. run_turn, as opposed to run_turn_and_log) doesn't keep it.
     """
     if infantry_counts is None:
         infantry_counts = {f: count_units_in_play(state, f, 0) for f in _battle_faction_order(state, hex_index)}
 
     players_kill_xp = state.kill_xp
 
-    archer_deaths = apply_archer_abilities(state, hex_index, rng)
-    for (_faction, _ut, count, killer) in archer_deaths:
-        players_kill_xp[killer] += count
+    archer_phase = apply_archer_abilities(state, hex_index, rng)
+    for entry in archer_phase:
+        players_kill_xp[entry["killer"]] += entry["count"]
 
+    rounds = []
     rounds_run = 0
     while not is_battle_over(state, hex_index) and rounds_run < MAX_ROUNDS_SAFETY_CAP:
         order = _battle_faction_order(state, hex_index)
@@ -276,12 +303,13 @@ def resolve_full_battle(state, hex_index, target_fn, rng, infantry_counts=None):
             target_choices[faction] = target_fn(state, hex_index, faction)
 
         round_result = resolve_round(state, hex_index, target_choices, rng, infantry_counts)
-        for (_faction, _ut, count, killer) in round_result["deaths"]:
-            players_kill_xp[killer] += count
+        rounds.append(round_result)
+        for entry in round_result["deaths"]:
+            players_kill_xp[entry["killer"]] += entry["count"]
 
         rounds_run += 1
 
-    return rounds_run
+    return {"archer_phase": archer_phase, "rounds": rounds}
 
 
 def rectify_overflow(state, hex_index, winner_faction, send_back):

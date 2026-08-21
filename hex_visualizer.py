@@ -121,7 +121,25 @@ BATTLE_RECT_GAP = 2
 
 
 # ---------------------------------------------------------------------------
-# Loading + reconstructing the diff-based log
+# Loading + reconstructing the log - two formats, both producing the same
+# turn_checkpoints shape the rest of this file consumes:
+#
+#   v1 (engine/turn.py's run_turn_and_log): a turn is {"keyframe": [...],
+#   "deltas": {...}} - a sparse keyframe once per turn, then a sparse diff
+#   per phase-step, reconstructed incrementally on a running board. Built
+#   to keep file size proportional to how much actually happens, for
+#   large/long games.
+#
+#   v2 (engine_v2/turn.py's run_turn_and_log): a turn is
+#   {"checkpoints": [...]} - one independent sparse snapshot per
+#   checkpoint (not a diff against the previous one), each rebuilt fresh
+#   from empty every time. Simpler (no incremental reconstruction, no
+#   diffing to get wrong) at the cost of a bit more file size - a
+#   deliberate tradeoff, not a mistake; see that module's docstring.
+#
+# Which format a given turn uses is detected per-turn (via which of
+# "keyframe"/"checkpoints" is present), so a file could in principle mix
+# them, though in practice a whole file will come from one engine.
 # ---------------------------------------------------------------------------
 
 def _empty_hex():
@@ -134,14 +152,22 @@ def _apply_delta(current, delta_entries):
         current[coord] = {"city": e["city"], "troops": e["troops"], "battle": e["battle"]}
 
 
+def _checkpoint_from_sparse(terrain_map, sparse_entries):
+    """v2-format checkpoint: starts from an all-empty board (independent
+    of any other checkpoint) and overlays just the occupied/city/battle
+    hexes - see the format comment above."""
+    board = {coord: _empty_hex() for coord in terrain_map}
+    _apply_delta(board, sparse_entries)
+    return board
+
+
 def load_game(path):
     """Returns (radius, num_factions, terrain_map, turn_checkpoints,
     turn_player_stats, turn_battles_by_hex).
 
     terrain_map: {(q,r,s): terrain_str}
     turn_checkpoints: list (one per turn) of lists of 10 dense board
-    states, each a dict {(q,r,s): {"city","troops","battle"}}. Built by
-    replaying each turn's sparse keyframe + deltas on a running board.
+    states, each a dict {(q,r,s): {"city","troops","battle"}}.
     turn_player_stats: list (one per turn) of lists of 10 dicts
     {faction: {"silver","kill_xp","alive"}} - one per checkpoint,
     straight from the log (already a full snapshot each time, no
@@ -159,30 +185,33 @@ def load_game(path):
         q, r, s = (int(x) for x in key.split("_"))
         terrain_map[(q, r, s)] = terrain
 
-    current = {coord: _empty_hex() for coord in terrain_map}
+    current = {coord: _empty_hex() for coord in terrain_map}  # only used by the v1 (diff) path
     turn_checkpoints = []
     turn_player_stats = []
     turn_battles_by_hex = []
 
     for turn in data["turns"]:
-        checkpoints = []
+        if "checkpoints" in turn:
+            checkpoints = [_checkpoint_from_sparse(terrain_map, sparse) for sparse in turn["checkpoints"]]
+        else:
+            checkpoints = []
 
-        _apply_delta(current, turn["keyframe"])
-        checkpoints.append(dict(current))
-
-        _apply_delta(current, turn["deltas"]["buy"])
-        checkpoints.append(dict(current))
-
-        for step_delta in turn["deltas"]["movement"]:
-            _apply_delta(current, step_delta)
+            _apply_delta(current, turn["keyframe"])
             checkpoints.append(dict(current))
 
-        for step_delta in turn["deltas"]["cavalry"]:
-            _apply_delta(current, step_delta)
+            _apply_delta(current, turn["deltas"]["buy"])
             checkpoints.append(dict(current))
 
-        _apply_delta(current, turn["deltas"]["battle"])
-        checkpoints.append(dict(current))
+            for step_delta in turn["deltas"]["movement"]:
+                _apply_delta(current, step_delta)
+                checkpoints.append(dict(current))
+
+            for step_delta in turn["deltas"]["cavalry"]:
+                _apply_delta(current, step_delta)
+                checkpoints.append(dict(current))
+
+            _apply_delta(current, turn["deltas"]["battle"])
+            checkpoints.append(dict(current))
 
         turn_checkpoints.append(checkpoints)
 

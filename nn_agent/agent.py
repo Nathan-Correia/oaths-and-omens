@@ -15,8 +15,20 @@ JAX) can just ask for "the next key" instead of threading key state
 through every function signature by hand. The actual JAX computations
 underneath stay pure given whatever key they're handed - only this
 bookkeeping layer is stateful, which is a standard pattern for
-non-jitted driver code (see network.py's docstring - jitting/batching
-is later work, not this milestone).
+non-jitted driver code.
+
+The network's forward pass IS jitted here (jax.jit(network.apply)),
+unlike everything else in this file: `network` is closed over (not
+passed as a traced argument), so this compiles once per distinct input
+shape (i.e. once per board radius actually used) and every subsequent
+call - regardless of which faction, decision type, or battle hex - reuses
+that compiled version. encode_observation and actions.py's masking/
+decoding stay plain numpy/Python: encode_observation builds its arrays
+via boolean masking with a data-dependent size, which isn't jit-shaped
+the way a fixed dense-layer stack is, and neither of them is the
+bottleneck anyway (see the conversation this was added from - profiling
+showed essentially all per-decision cost was the un-jitted forward
+pass, not encoding/decoding).
 """
 
 import jax
@@ -43,10 +55,11 @@ def make_nn_agents(network, params, num_factions, seed=0, max_turns=100):
     callable}, matching engine_v2.turn.run_turn's expected signatures,
     all backed by the same (network, params)."""
     keys = _KeySource(seed)
+    apply_fn = jax.jit(network.apply)
 
     def forward(state, faction, battle_hex_index=0):
         per_hex, global_feats = encode_observation(state, faction, max_turns=max_turns)
-        return network.apply(params, per_hex, global_feats, battle_hex_index)
+        return apply_fn(params, per_hex, global_feats, battle_hex_index)
 
     def decide_buy(state, faction, legal):
         out = forward(state, faction)
