@@ -1,0 +1,107 @@
+"""
+Observation encoding: turns an engine_v2 ArrayState into the numeric
+arrays a neural net actually reads.
+
+Two things a raw ArrayState doesn't have that a network needs:
+  1. Everything as floats, categoricals one-hot'd - terrain/faction ids
+     are just integer codes right now, meaningless as raw numbers to a
+     network (terrain index 4 isn't "twice as much terrain" as index 2).
+  2. "Mine vs. theirs" instead of raw faction ids. This is what makes
+     self-play with ONE shared network work: the network is called once
+     per faction's decision, each time re-encoding the SAME board from
+     that faction's own point of view, so it never has to learn
+     "faction 3 behaves like X" - only "my stuff vs. everyone else's."
+
+Per-hex features (16 numbers per hex):
+  terrain one-hot (6) + city ownership relative to the acting faction
+  (3: none / mine / enemy's) + my army units here (3, infantry/cavalry/
+  archers, /6) + enemy army units here (3, /6) + locked-in-battle flag
+  (1). "Army units here" merges the peaceful army and battle-contribution
+  cases (a hex is exactly one or the other, never both) into a single
+  pair of features rather than carrying separate always-partially-zero
+  columns for each.
+
+Global features (4 numbers), not tied to any one hex: my silver, my
+kill-XP (both normalized against a rough scale, not a hard cap - values
+can exceed 1), fraction of OTHER factions still alive, and how far
+through the game we are (turn_number / max_turns).
+
+SIMPLIFICATION worth knowing about: enemy presence is aggregated across
+all non-self factions into one "the enemy" signal, per hex - the network
+can't tell WHICH opponent is where, just that someone hostile is. Fine
+for a first version; revisit if that turns out to matter once training
+is actually running.
+"""
+
+import jax.numpy as jnp
+import numpy as np
+
+from engine_v2.state import NO_FACTION, TERRAIN_TYPES
+
+NUM_TERRAIN_TYPES = len(TERRAIN_TYPES)
+PER_HEX_FEATURES = NUM_TERRAIN_TYPES + 3 + 3 + 3 + 1  # = 16
+GLOBAL_FEATURES = 4
+
+SILVER_SCALE = 100.0
+KILL_XP_SCALE = 20.0
+UNIT_SCALE = 6.0  # MAX_STACK_SIZE
+
+
+def _per_hex_army_features(state, faction):
+    """(my_units, enemy_units): each [num_hexes, 3], merging the
+    peaceful-army and locked-battle cases (mutually exclusive per hex -
+    see module docstring)."""
+    n = state.num_hexes
+    my_units = np.zeros((n, 3), dtype=np.float32)
+    enemy_units = np.zeros((n, 3), dtype=np.float32)
+
+    peaceful = ~state.locked
+    is_mine = peaceful & (state.army_faction == faction)
+    is_enemy = peaceful & (state.army_faction != faction) & (state.army_faction != NO_FACTION)
+    my_units[is_mine] = state.army_units[is_mine]
+    enemy_units[is_enemy] = state.army_units[is_enemy]
+
+    if np.any(state.locked):
+        mine_mask = state.battle_faction == faction
+        enemy_mask = (state.battle_faction != faction) & (state.battle_faction != NO_FACTION)
+        my_units += np.where(mine_mask[:, :, None], state.battle_units, 0).sum(axis=1)
+        enemy_units += np.where(enemy_mask[:, :, None], state.battle_units, 0).sum(axis=1)
+
+    return my_units, enemy_units
+
+
+def encode_observation(state, faction, max_turns=100):
+    """Returns (per_hex: float32[num_hexes, PER_HEX_FEATURES],
+    global_feats: float32[GLOBAL_FEATURES]), both jnp arrays, from
+    `faction`'s point of view."""
+    n = state.num_hexes
+
+    terrain_onehot = np.eye(NUM_TERRAIN_TYPES, dtype=np.float32)[state.terrain]
+
+    city_rel = np.zeros((n, 3), dtype=np.float32)
+    city_rel[state.city_owner == NO_FACTION, 0] = 1.0
+    city_rel[state.city_owner == faction, 1] = 1.0
+    city_rel[(state.city_owner != NO_FACTION) & (state.city_owner != faction), 2] = 1.0
+
+    my_units, enemy_units = _per_hex_army_features(state, faction)
+
+    locked_flag = state.locked.astype(np.float32)[:, None]
+
+    per_hex = np.concatenate(
+        [terrain_onehot, city_rel, my_units / UNIT_SCALE, enemy_units / UNIT_SCALE, locked_flag],
+        axis=1,
+    )
+
+    alive_others = int(np.sum(state.alive)) - (1 if state.alive[faction] else 0)
+    total_others = max(1, state.num_factions - 1)
+    global_feats = np.array(
+        [
+            float(state.silver[faction]) / SILVER_SCALE,
+            float(state.kill_xp[faction]) / KILL_XP_SCALE,
+            alive_others / total_others,
+            float(state.turn_number) / max_turns,
+        ],
+        dtype=np.float32,
+    )
+
+    return jnp.asarray(per_hex), jnp.asarray(global_feats)

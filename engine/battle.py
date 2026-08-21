@@ -52,7 +52,7 @@ import random
 from .state import UNIT_TYPES, MAX_STACK_SIZE, SPAWN_CAPS, count_units_in_play
 
 DEATH_PRIORITY = ["infantry", "cavalry", "archers"]
-MAX_ROUNDS_SAFETY_CAP = 200
+MAX_ROUNDS_SAFETY_CAP = 50  # pure infinite-loop guard - real battles resolve in a handful of rounds
 TERRAIN_BONUS = 2
 
 
