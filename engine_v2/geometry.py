@@ -39,6 +39,14 @@ def cube_hexes_in_radius(radius):
     return coords
 
 
+def hex_distance(a, b):
+    """Cube-coordinate hex distance - identical to engine/geometry.py's
+    hex_distance. Used by setup.py (farthest-point city spread) and the
+    ported agents (nearest-city heuristics), which still reason in
+    (q, r, s) coordinate terms rather than raw hex indices."""
+    return max(abs(a[0] - b[0]), abs(a[1] - b[1]), abs(a[2] - b[2]))
+
+
 class HexGrid:
     """Fixed hex-index bookkeeping for one board radius.
 

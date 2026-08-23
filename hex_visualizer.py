@@ -2,7 +2,7 @@
 Hexagon-shaped hex grid visualizer (pygame).
 
 Reads board_state.json (the diff-based format written by
-run_game_and_log.py / engine/turn.py:run_turn_and_log) and reconstructs
+run.py / engine_v2/turn.py:run_turn_and_log) and reconstructs
 every turn's 10 checkpoint states (start-of-turn keyframe, then after
 buy, each of the 3 movement steps, each of the 4 cavalry steps, and
 after battle) by replaying that turn's sparse deltas on top of a
@@ -32,7 +32,7 @@ from hex_common import (
 )
 
 try:
-    from engine.turn import CHECKPOINT_LABELS
+    from engine_v2.turn import CHECKPOINT_LABELS
 except ImportError:
     CHECKPOINT_LABELS = ["Start", "Buy", "Move 1", "Move 2", "Move 3",
                           "Cav 1", "Cav 2", "Cav 3", "Cav 4", "Battle"]
@@ -75,7 +75,7 @@ STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "board_sta
 
 # --- Terrain colors: washed-out / pastel so they read as background
 # texture rather than competing with faction colors. Edit freely.
-# Matches engine/state.py's TERRAIN_TYPES exactly.
+# Matches engine_v2/state.py's TERRAIN_TYPES exactly.
 TERRAIN_COLORS = {
     "plains":   (210, 232, 197),  # pale light green
     "forest":   (176, 204, 176),  # pale dark green

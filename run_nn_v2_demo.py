@@ -13,8 +13,7 @@ import random
 
 import jax
 
-from engine.setup import create_initial_state
-from engine_v2.state import from_v1
+from engine_v2.setup import create_initial_state
 from engine_v2.turn import check_game_end, run_turn, tally_final_score
 
 from nn_agent.agent import make_nn_agents
@@ -27,8 +26,7 @@ SEED = 1
 
 
 def main():
-    v1_state = create_initial_state(radius=RADIUS, num_factions=NUM_FACTIONS, seed=SEED)
-    state = from_v1(v1_state, NUM_FACTIONS)
+    state = create_initial_state(radius=RADIUS, num_factions=NUM_FACTIONS, seed=SEED)
 
     rng_key = jax.random.PRNGKey(SEED)
     network, params = init_params(rng_key, state.num_hexes, NUM_FACTIONS)

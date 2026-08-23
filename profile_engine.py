@@ -15,9 +15,9 @@ import pstats
 import random
 import time
 
-from engine.setup import create_initial_state
-from engine.turn import run_turn, run_turn_and_log, check_game_end
-from engine.agents.heuristic_agent import HeuristicAgent
+from engine_v2.setup import create_initial_state
+from engine_v2.turn import run_turn, run_turn_and_log, check_game_end
+from engine_v2.agents.heuristic_agent import make_heuristic_agents
 
 RADIUS = 8
 NUM_FACTIONS = 8
@@ -27,7 +27,7 @@ SEED = 1
 
 def make_game():
     state = create_initial_state(radius=RADIUS, num_factions=NUM_FACTIONS, seed=SEED)
-    agents = {f: HeuristicAgent(f, rng=random.Random(100 + f)) for f in state.players}
+    agents = make_heuristic_agents(NUM_FACTIONS, seed=SEED)
     rng = random.Random(SEED + 1)
     return state, agents, rng
 
@@ -35,14 +35,14 @@ def make_game():
 def run_plain():
     state, agents, rng = make_game()
     while not check_game_end(state, max_turns=MAX_TURNS):
-        state = run_turn(state, agents, rng=rng)
+        state = run_turn(state, *agents, rng=rng)
     return state
 
 
 def run_logged():
     state, agents, rng = make_game()
     while not check_game_end(state, max_turns=MAX_TURNS):
-        state, _record = run_turn_and_log(state, agents, rng=rng)
+        state, _record = run_turn_and_log(state, *agents, rng=rng)
     return state
 
 

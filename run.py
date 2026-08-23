@@ -9,18 +9,15 @@ This keeps file size proportional to how much actually happens in the
 game, rather than to board size or how many turns have passed -
 see the conversation this was designed in for the reasoning.
 
-Agent mix: factions 0-2 are RandomAgent, 3-5 are SmartRandomAgent,
-6-7 are HeuristicAgent. Faction id -> color is fixed (see
-hex_visualizer.py's FACTION_COLORS: 0=red, 1=blue, 2=green, 3=purple,
-4=orange, 5=brown, 6=pink, 7=grey), so with this assignment: red/
-blue/green are pure random, purple/orange/brown are smart-random,
-pink/grey are the heuristic agent.
+Agent mix: every faction is a HeuristicAgent. Faction id -> color is
+fixed (see hex_visualizer.py's FACTION_COLORS: 0=red, 1=blue, 2=green,
+3=purple, 4=orange, 5=brown, 6=pink, 7=grey).
 
 File shape:
 {
   "radius": int, "num_factions": int,
   "terrain": {"q_r_s": terrain_str, ...},
-  "turns": [turn_record, ...]   # see engine/turn.py:run_turn_and_log
+  "turns": [turn_record, ...]   # see engine_v2/turn.py:run_turn_and_log
 }
 """
 
@@ -28,11 +25,10 @@ import json
 import random
 import time
 
-from engine.setup import create_initial_state
-from engine.turn import run_turn_and_log, check_game_end
-from engine.agents.random_agent import RandomAgent
-from engine.agents.smart_random_agent import SmartRandomAgent
-from engine.agents.heuristic_agent import HeuristicAgent
+from engine_v2.setup import create_initial_state
+from engine_v2.state import TERRAIN_TYPES
+from engine_v2.turn import run_turn_and_log, check_game_end
+from engine_v2.agents.heuristic_agent import make_heuristic_agents
 
 OUTPUT_FILE = "board_state.json"
 RADIUS = 8
@@ -44,28 +40,24 @@ MAX_TURNS = 100
 # hardcoding this value back in, if that's ever useful for debugging.
 SEED = int(time.time() * 1000) % (2 ** 31)
 
-AGENT_ASSIGNMENT = {
-    0: HeuristicAgent,
-    1: HeuristicAgent,
-    2: HeuristicAgent,
-    3: HeuristicAgent,
-    4: HeuristicAgent,
-    5: HeuristicAgent,
-    6: HeuristicAgent,
-    7: HeuristicAgent,
-}
-
 
 def main():
     rng = random.Random(SEED)
     state = create_initial_state(radius=RADIUS, num_factions=NUM_FACTIONS, seed=SEED)
-    agents = {f: AGENT_ASSIGNMENT[f](f, rng=random.Random(SEED + 1000 + f)) for f in state.players}
+    decide_buy, decide_movement, decide_cavalry, decide_target, decide_rectification = make_heuristic_agents(
+        NUM_FACTIONS, seed=SEED,
+    )
 
-    terrain_map = {f"{c[0]}_{c[1]}_{c[2]}": h.terrain for c, h in state.board.items()}
+    terrain_map = {
+        f"{q}_{r}_{s}": TERRAIN_TYPES[int(t)]
+        for (q, r, s), t in zip(state.grid.coords, state.terrain)
+    }
 
     turns = []
     while not check_game_end(state, max_turns=MAX_TURNS):
-        state, turn_record = run_turn_and_log(state, agents, rng=rng)
+        state, turn_record = run_turn_and_log(
+            state, decide_buy, decide_movement, decide_cavalry, decide_target, decide_rectification, rng=rng,
+        )
         turns.append(turn_record)
 
     json_dict = {
