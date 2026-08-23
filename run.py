@@ -18,6 +18,11 @@ File shape:
   "terrain": {"q_r_s": terrain_str, ...},
   "turns": [turn_record, ...]   # see engine/turn.py:run_turn_and_log
 }
+
+Also writes terrain_gen_log.json - every individual hex placement made
+while generating the board's terrain, in order (see
+engine/setup.py:generate_terrain), for hex_gen.py to step through.
+File shape: {"radius": int, "steps": [{"q","r","s","terrain","round"}, ...]}
 """
 
 import json
@@ -33,7 +38,8 @@ from engine.state import TERRAIN_TYPES
 from engine.turn import run_turn_and_log, check_game_end
 
 OUTPUT_FILE = "board_state.json"
-RADIUS = 8
+TERRAIN_LOG_FILE = "terrain_gen_log.json"
+RADIUS = 7
 NUM_FACTIONS = 8
 MAX_TURNS = 100
 
@@ -61,7 +67,11 @@ def _build_nn_agents(state):
 
 def main():
     rng = random.Random(SEED)
-    state = create_initial_state(radius=RADIUS, num_factions=NUM_FACTIONS, seed=SEED)
+    terrain_log = []
+    state = create_initial_state(radius=RADIUS, num_factions=NUM_FACTIONS, seed=SEED, terrain_log=terrain_log)
+
+    with open(TERRAIN_LOG_FILE, "w") as f:
+        json.dump({"radius": RADIUS, "steps": terrain_log}, f)
 
     build_fns = {
         "random": lambda: make_random_agents(NUM_FACTIONS, seed=SEED),
@@ -94,7 +104,7 @@ def main():
     with open(OUTPUT_FILE, "w") as f:
         json.dump(json_dict, f)
 
-    print(f"Ran {len(turns)} turns (seed={SEED}), wrote {OUTPUT_FILE}")
+    print(f"Ran {len(turns)} turns (seed={SEED}), wrote {OUTPUT_FILE} and {TERRAIN_LOG_FILE}")
 
 
 if __name__ == "__main__":

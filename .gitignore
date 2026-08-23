@@ -1,3 +1,4 @@
 __pycache__/
 
 board_state.json
+terrain_gen_log.json
