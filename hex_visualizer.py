@@ -2,7 +2,7 @@
 Hexagon-shaped hex grid visualizer (pygame).
 
 Reads board_state.json (the diff-based format written by
-run.py / engine_v2/turn.py:run_turn_and_log) and reconstructs
+run.py / engine/turn.py:run_turn_and_log) and reconstructs
 every turn's 10 checkpoint states (start-of-turn keyframe, then after
 buy, each of the 3 movement steps, each of the 4 cavalry steps, and
 after battle) by replaying that turn's sparse deltas on top of a
@@ -32,7 +32,7 @@ from hex_common import (
 )
 
 try:
-    from engine_v2.turn import CHECKPOINT_LABELS
+    from engine.turn import CHECKPOINT_LABELS
 except ImportError:
     CHECKPOINT_LABELS = ["Start", "Buy", "Move 1", "Move 2", "Move 3",
                           "Cav 1", "Cav 2", "Cav 3", "Cav 4", "Battle"]
@@ -75,7 +75,7 @@ STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "board_sta
 
 # --- Terrain colors: washed-out / pastel so they read as background
 # texture rather than competing with faction colors. Edit freely.
-# Matches engine_v2/state.py's TERRAIN_TYPES exactly.
+# Matches engine/state.py's TERRAIN_TYPES exactly.
 TERRAIN_COLORS = {
     "plains":   (210, 232, 197),  # pale light green
     "forest":   (176, 204, 176),  # pale dark green
@@ -124,13 +124,13 @@ BATTLE_RECT_GAP = 2
 # Loading + reconstructing the log - two formats, both producing the same
 # turn_checkpoints shape the rest of this file consumes:
 #
-#   v1 (engine/turn.py's run_turn_and_log): a turn is {"keyframe": [...],
-#   "deltas": {...}} - a sparse keyframe once per turn, then a sparse diff
-#   per phase-step, reconstructed incrementally on a running board. Built
-#   to keep file size proportional to how much actually happens, for
-#   large/long games.
+# v1 (a since-removed dict-of-objects engine): a turn is
+#   {"keyframe": [...], "deltas": {...}} - a sparse keyframe once per
+#   turn, then a sparse diff per phase-step, reconstructed incrementally
+#   on a running board. Built to keep file size proportional to how much
+#   actually happens, for large/long games.
 #
-#   v2 (engine_v2/turn.py's run_turn_and_log): a turn is
+#   current engine (engine/turn.py's run_turn_and_log): a turn is
 #   {"checkpoints": [...]} - one independent sparse snapshot per
 #   checkpoint (not a diff against the previous one), each rebuilt fresh
 #   from empty every time. Simpler (no incremental reconstruction, no
@@ -139,7 +139,7 @@ BATTLE_RECT_GAP = 2
 #
 # Which format a given turn uses is detected per-turn (via which of
 # "keyframe"/"checkpoints" is present), so a file could in principle mix
-# them, though in practice a whole file will come from one engine.
+# them, though in practice a whole file will come from one engine version.
 # ---------------------------------------------------------------------------
 
 def _empty_hex():

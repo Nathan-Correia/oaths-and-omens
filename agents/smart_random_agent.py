@@ -1,5 +1,5 @@
 """
-SmartRandomAgent for engine_v2 - ported from
+SmartRandomAgent for engine - ported from
 engine/agents/smart_random_agent.py. A step up from pure random in
 exactly the same two ways as v1:
 
@@ -8,7 +8,7 @@ exactly the same two ways as v1:
      chosen randomly per token).
   2. Movement / cavalry phases: greedily moves its single largest
      eligible army one step toward whichever enemy city is currently
-     nearest to it (hex distance). engine_v2's decide_movement already
+     nearest to it (hex distance). engine's decide_movement already
      only gets to return ONE action per faction per step (see
      movement.py's SCOPE decision), so "pick the biggest army" is just
      which origin this function ranks first, not a constraint it has to
@@ -24,9 +24,9 @@ import random
 import numpy as np
 
 from .random_agent import random_rectification, random_target
-from ..buy import INFANTRY_COST
-from ..geometry import hex_distance
-from ..state import NO_FACTION
+from engine.buy import INFANTRY_COST
+from engine.geometry import hex_distance
+from engine.state import NO_FACTION
 
 
 def _enemy_city_coords(state, faction):
@@ -91,7 +91,7 @@ def smart_buy(state, faction, legal, rng):
 def make_smart_random_agents(num_factions, seed=0):
     """Returns (decide_buy, decide_movement, decide_cavalry, decide_target,
     decide_rectification) - each {faction: callable}, matching
-    engine_v2.turn.run_turn's expected signatures."""
+    engine.turn.run_turn's expected signatures."""
     rngs = {f: random.Random(seed * 1_000_003 + f) for f in range(num_factions)}
 
     def decide_buy(state, faction, legal):

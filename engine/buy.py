@@ -1,5 +1,5 @@
 """
-Buy phase for engine_v2 - ported from engine/buy.py.
+Buy phase for engine - ported from engine/buy.py.
 
 Two kinds of purchases, atomic (one unit each) same as v1: buy_infantry
 (spend 2 silver at an owned, undefended-by-adjacent-enemy city) and

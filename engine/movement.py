@@ -1,10 +1,10 @@
 """
-Movement mechanics for engine_v2 - ported from engine/movement.py to
+Movement mechanics for engine - ported from engine/movement.py to
 operate on ArrayState instead of a dict-of-HexState board.
 
 SCOPE decision: unlike engine/movement.py (which supports moving any
 partial split of a stack, to preserve RandomAgent's fuzz-testing power),
-engine_v2 actions only ever move a FIXED, phase-determined subset of a
+engine actions only ever move a FIXED, phase-determined subset of a
 hex's army: the whole thing during the movement phase, or just the
 cavalry count (leaving 100% of any infantry/archers behind) during the
 cavalry phase - never an arbitrary combinatorial split. This matches the
@@ -13,7 +13,7 @@ conversation this was scoped from, and isn't actually a behavior change
 relative to how the non-fuzzing agents (SmartRandomAgent/HeuristicAgent)
 already play: engine/movement.py's get_legal_movement_actions/
 get_legal_cavalry_actions already return exactly these two shapes (see
-that module's docstring) - engine_v2 just bakes that in as the only
+that module's docstring) - engine just bakes that in as the only
 representation, rather than a convention every agent happens to follow.
 Partial-split control (beyond the movement/cavalry distinction) can be
 added back as an extra action dimension later if it turns out to matter.

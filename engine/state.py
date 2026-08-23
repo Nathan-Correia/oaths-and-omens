@@ -1,9 +1,9 @@
 """
-Array-based game state for engine_v2.
+Array-based game state for engine.
 
 engine/state.py represents the board as {(q, r, s): HexState} - a dict of
 dataclass objects, each holding a terrain string, an optional army dict,
-etc. engine_v2 instead holds every hex's data as a slice of a handful of
+etc. engine instead holds every hex's data as a slice of a handful of
 fixed-shape numpy arrays, indexed by the HexGrid from geometry.py. This is
 what a masked/vectorized engine actually needs: dicts and variable-length
 per-hex objects don't have a "shape" a tensor op can work on, but
@@ -19,7 +19,7 @@ for v1 per turn.py's tally_final_score), so there's nothing to port.
 Battle contributions are stored padded to a fixed MAX_BATTLE_CONTRIB slots
 per hex (engine/state.py's Battle.contributions is a variable-length
 list - same fixed-shape-over-variable-length trade as everywhere else in
-engine_v2). Sized generously based on testing so far; battle resolution
+engine). Sized generously based on testing so far; battle resolution
 can extend a battle's contributions further via cavalry dismounts, so
 this cap may need revisiting if MAX_BATTLE_CONTRIB errors ever fire.
 
@@ -28,7 +28,7 @@ array: when a turn resolves more than one battle, the per-faction
 dismount infantry cap tally is *shared* across all of them (see
 engine/turn.py's _run_battle_phase), so which battle gets processed first
 can change the outcome in edge cases near the cap. v1 gets this for free
-from dict insertion order (state.battles); engine_v2 has to track it
+from dict insertion order (state.battles); engine has to track it
 explicitly. movement.py's _start_or_extend_battle appends a hex the
 moment it newly locks; turn.py's battle phase (and battle.py's
 rectify_overflow) remove a hex the moment it unlocks. Not vectorized/

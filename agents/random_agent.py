@@ -1,12 +1,12 @@
 """
-RandomAgent for engine_v2 - ported from engine/agents/random_agent.py.
+RandomAgent for engine - ported from engine/agents/random_agent.py.
 Uniformly samples from whatever legal actions/mask the engine already
 computed. Its value isn't playing well - it's exercising every code path
 in the engine (fuzzing) to surface crashes, illegal states, and rules
 ambiguities early.
 
 Unlike v1's RandomAgent (which sub-samples a random partial split of a
-chosen move), engine_v2's action representation only ever moves a fixed,
+chosen move), engine's action representation only ever moves a fixed,
 phase-determined subset of a hex's army - see movement.py's SCOPE
 decision - so there's no split left to sample: decide_movement/
 decide_cavalry just returns one (hex_index, direction) pulled from the
@@ -23,8 +23,8 @@ import random
 
 import numpy as np
 
-from ..battle import faction_totals, get_legal_target_actions
-from ..state import MAX_STACK_SIZE
+from engine.battle import faction_totals, get_legal_target_actions
+from engine.state import MAX_STACK_SIZE
 
 SKIP_CHANCE = 0.5  # chance to move nothing this step, matching v1's flavor
 
@@ -79,7 +79,7 @@ def random_buy(legal, rng, max_actions=3):
 def make_random_agents(num_factions, seed=0):
     """Returns (decide_buy, decide_movement, decide_cavalry, decide_target,
     decide_rectification) - each {faction: callable}, matching
-    engine_v2.turn.run_turn's expected signatures. Each faction gets its
+    engine.turn.run_turn's expected signatures. Each faction gets its
     own random.Random (mirrors v1's per-agent rng), keyed off `seed` so a
     whole game's agent decisions are reproducible."""
     rngs = {f: random.Random(seed * 1_000_003 + f) for f in range(num_factions)}

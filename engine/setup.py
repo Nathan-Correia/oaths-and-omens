@@ -3,7 +3,7 @@ Builds an initial ArrayState for a new game - ported from engine/setup.py's
 create_initial_state. Same algorithm (random terrain, farthest-point city
 spread, 2-hex-away second city, starting silver/kill-XP), just writing
 directly into ArrayState's numpy arrays instead of a dict-of-HexState
-board, so engine_v2 can create a game without going through v1 at all.
+board, so engine can create a game without going through v1 at all.
 """
 
 import random

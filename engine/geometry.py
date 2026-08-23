@@ -1,10 +1,10 @@
 """
-Array-based hex geometry for engine_v2.
+Array-based hex geometry for engine.
 
 engine/geometry.py represents hexes as (q, r, s) tuples and looks up
-adjacency via a dict-backed cache. engine_v2 instead assigns every hex a
+adjacency via a dict-backed cache. engine instead assigns every hex a
 fixed integer index (0..num_hexes-1) for a given board radius, and
-precomputes a [num_hexes, 6] neighbor table once. All of engine_v2's game
+precomputes a [num_hexes, 6] neighbor table once. All of engine's game
 state is then just numpy arrays indexed by that same integer, which is
 what makes it array/tensor-friendly (and eventually GPU-batchable) instead
 of dict-of-objects-friendly.
@@ -12,7 +12,7 @@ of dict-of-objects-friendly.
 The index assignment order matters for cross-checking against engine/:
 cube_hexes_in_radius below is copied verbatim from engine/geometry.py so
 that index i always corresponds to the same (q, r, s) coordinate a v1
-GameState would use, letting engine_v2.state's v1<->v2 converters line up
+GameState would use, letting engine.state's v1<->v2 converters line up
 hex-for-hex.
 """
 
@@ -28,7 +28,7 @@ NUM_DIRECTIONS = 6
 def cube_hexes_in_radius(radius):
     """Identical enumeration order to engine/geometry.py's version of
     this function - this order IS the index assignment used everywhere
-    else in engine_v2, so it must match exactly."""
+    else in engine, so it must match exactly."""
     coords = []
     for q in range(-radius, radius + 1):
         r1 = max(-radius, -q - radius)

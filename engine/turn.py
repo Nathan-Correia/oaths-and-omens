@@ -1,12 +1,12 @@
 """
-Turn orchestration for engine_v2 - ported from engine/turn.py's run_turn,
+Turn orchestration for engine - ported from engine/turn.py's run_turn,
 plus a run_turn_and_log for replay/visualization (see this module's
 run_turn_and_log docstring for how its log format differs from v1's).
 
 Agents aren't a formal class hierarchy here (unlike v1's BaseAgent) - each
 decision point takes a plain callback instead, looked up per-faction from
 a {faction: callable} dict (mirroring v1's {faction: agent}). Deliberate:
-the real "agent" for engine_v2 will eventually be a neural policy with
+the real "agent" for engine will eventually be a neural policy with
 its own natural interface (masked observation in, action out) that
 almost certainly won't look like BaseAgent's five methods - building that
 class hierarchy now would likely just be thrown away later. Callbacks

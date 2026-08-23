@@ -1,5 +1,5 @@
 """
-Observation encoding: turns an engine_v2 ArrayState into the numeric
+Observation encoding: turns an engine ArrayState into the numeric
 arrays a neural net actually reads.
 
 Two things a raw ArrayState doesn't have that a network needs:
@@ -36,7 +36,7 @@ is actually running.
 import jax.numpy as jnp
 import numpy as np
 
-from engine_v2.state import NO_FACTION, TERRAIN_TYPES
+from engine.state import NO_FACTION, TERRAIN_TYPES
 
 NUM_TERRAIN_TYPES = len(TERRAIN_TYPES)
 PER_HEX_FEATURES = NUM_TERRAIN_TYPES + 3 + 3 + 3 + 1  # = 16

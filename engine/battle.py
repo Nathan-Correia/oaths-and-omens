@@ -1,5 +1,5 @@
 """
-Battle resolution for engine_v2 - ported from engine/battle.py.
+Battle resolution for engine - ported from engine/battle.py.
 
 See that module's docstring for the full rules rationale (archer phase,
 per-round targeting/rolls/kills, cavalry dismounts, rectification). This
@@ -25,7 +25,7 @@ entries are plain dicts with string unit types ("infantry"/"cavalry"/
 "archers"), not the leaner int-indexed tuples this module uses
 internally elsewhere, specifically so this log can be handed straight to
 the existing replay/visualization code (hex_visualizer.py's
-compute_battle_table) unchanged - see engine_v2/turn.py's
+compute_battle_table) unchanged - see engine/turn.py's
 run_turn_and_log.
 """
 

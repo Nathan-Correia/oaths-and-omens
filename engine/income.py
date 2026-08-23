@@ -1,5 +1,5 @@
 """
-Income phase for engine_v2 - ported from engine/income.py.
+Income phase for engine - ported from engine/income.py.
 
 Mechanical only (no agent decisions): +3 silver/turn per faction, +1 per
 city beyond the 2nd; a faction with zero cities gets no income and loses

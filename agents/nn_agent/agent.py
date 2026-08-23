@@ -1,5 +1,5 @@
 """
-Wires the policy network into engine_v2.turn.run_turn's callback
+Wires the policy network into engine.turn.run_turn's callback
 interface, self-play style: ONE shared (network, params) plays every
 faction, each call re-encoding the board from that faction's own point
 of view (see encode.py) - not five separately-behaving closures, just
@@ -10,7 +10,7 @@ Python's `random` module has) - callers have to explicitly split a key
 every time they want fresh randomness. _KeySource is a small,
 deliberately-impure wrapper around that: it holds one "current" key and
 hands out a fresh split-off key on every call, so the rest of this file
-(and engine_v2.turn's callback interface, which knows nothing about
+(and engine.turn's callback interface, which knows nothing about
 JAX) can just ask for "the next key" instead of threading key state
 through every function signature by hand. The actual JAX computations
 underneath stay pure given whatever key they're handed - only this
@@ -33,8 +33,8 @@ pass, not encoding/decoding).
 
 import jax
 
-from engine_v2.battle import get_legal_target_actions
-from engine_v2.buy import get_legal_buy_actions  # noqa: F401 - documents the expected legal-action source
+from engine.battle import get_legal_target_actions
+from engine.buy import get_legal_buy_actions  # noqa: F401 - documents the expected legal-action source
 
 from . import actions
 from .encode import encode_observation
@@ -52,7 +52,7 @@ class _KeySource:
 def make_nn_agents(network, params, num_factions, seed=0, max_turns=100):
     """Returns (decide_buy, decide_movement, decide_cavalry,
     decide_target, decide_rectification) dicts - each {faction:
-    callable}, matching engine_v2.turn.run_turn's expected signatures,
+    callable}, matching engine.turn.run_turn's expected signatures,
     all backed by the same (network, params)."""
     keys = _KeySource(seed)
     apply_fn = jax.jit(network.apply)

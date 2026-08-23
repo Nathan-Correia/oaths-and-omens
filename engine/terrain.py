@@ -1,5 +1,5 @@
 """
-Terrain effects for engine_v2 - ported from engine/terrain.py. Applied
+Terrain effects for engine - ported from engine/terrain.py. Applied
 once at the end of each full turn (after movement, cavalry movement, and
 battles have all resolved):
 

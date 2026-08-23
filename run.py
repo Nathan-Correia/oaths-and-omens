@@ -1,23 +1,22 @@
 """
-Runs a game with random agents end-to-end, writing board_state.json in
-a diff-based format: terrain is stored once (it never changes), and
-each turn is stored as a sparse keyframe (state at turn start) plus
-the actual chosen actions and resulting board deltas for each of that
-turn's 9 phases (buy, 3 movement steps, 4 cavalry steps, battle).
+Runs a game end-to-end, writing board_state.json in the checkpoint-log
+format engine/turn.py's run_turn_and_log produces: terrain is stored
+once (it never changes), and each turn is stored as a sparse snapshot
+at each of its 10 checkpoints (start, buy, 3 movement steps, 4 cavalry
+steps, battle) - see that module's docstring for why these are
+independent snapshots rather than incremental diffs.
 
-This keeps file size proportional to how much actually happens in the
-game, rather than to board size or how many turns have passed -
-see the conversation this was designed in for the reasoning.
-
-Agent mix: every faction is a HeuristicAgent. Faction id -> color is
-fixed (see hex_visualizer.py's FACTION_COLORS: 0=red, 1=blue, 2=green,
-3=purple, 4=orange, 5=brown, 6=pink, 7=grey).
+Agent mix is configurable per faction via AGENT_ASSIGNMENT below - any
+mix of "random"/"smart_random"/"heuristic"/"nn" (a randomly-initialized,
+untrained JAX policy network; see agents/nn_agent/). Faction id -> color
+is fixed (see hex_visualizer.py's FACTION_COLORS: 0=red, 1=blue,
+2=green, 3=purple, 4=orange, 5=brown, 6=pink, 7=grey).
 
 File shape:
 {
   "radius": int, "num_factions": int,
   "terrain": {"q_r_s": terrain_str, ...},
-  "turns": [turn_record, ...]   # see engine_v2/turn.py:run_turn_and_log
+  "turns": [turn_record, ...]   # see engine/turn.py:run_turn_and_log
 }
 """
 
@@ -25,10 +24,13 @@ import json
 import random
 import time
 
-from engine_v2.setup import create_initial_state
-from engine_v2.state import TERRAIN_TYPES
-from engine_v2.turn import run_turn_and_log, check_game_end
-from engine_v2.agents.heuristic_agent import make_heuristic_agents
+from agents import compose_agents
+from agents.heuristic_agent import make_heuristic_agents
+from agents.random_agent import make_random_agents
+from agents.smart_random_agent import make_smart_random_agents
+from engine.setup import create_initial_state
+from engine.state import TERRAIN_TYPES
+from engine.turn import run_turn_and_log, check_game_end
 
 OUTPUT_FILE = "board_state.json"
 RADIUS = 8
@@ -40,12 +42,35 @@ MAX_TURNS = 100
 # hardcoding this value back in, if that's ever useful for debugging.
 SEED = int(time.time() * 1000) % (2 ** 31)
 
+# Per-faction agent choice - any of "random", "smart_random", "heuristic", "nn".
+AGENT_ASSIGNMENT = {f: "heuristic" for f in range(NUM_FACTIONS)}
+
+
+def _build_nn_agents(state):
+    """Lazily pulls in jax/agents.nn_agent - only paid for if AGENT_ASSIGNMENT
+    actually uses "nn" for at least one faction."""
+    import jax
+
+    from agents.nn_agent.agent import make_nn_agents
+    from agents.nn_agent.network import init_params
+
+    rng_key = jax.random.PRNGKey(SEED)
+    network, params = init_params(rng_key, state.num_hexes, NUM_FACTIONS)
+    return make_nn_agents(network, params, NUM_FACTIONS, seed=SEED, max_turns=MAX_TURNS)
+
 
 def main():
     rng = random.Random(SEED)
     state = create_initial_state(radius=RADIUS, num_factions=NUM_FACTIONS, seed=SEED)
-    decide_buy, decide_movement, decide_cavalry, decide_target, decide_rectification = make_heuristic_agents(
-        NUM_FACTIONS, seed=SEED,
+
+    build_fns = {
+        "random": lambda: make_random_agents(NUM_FACTIONS, seed=SEED),
+        "smart_random": lambda: make_smart_random_agents(NUM_FACTIONS, seed=SEED),
+        "heuristic": lambda: make_heuristic_agents(NUM_FACTIONS, seed=SEED),
+        "nn": lambda: _build_nn_agents(state),
+    }
+    decide_buy, decide_movement, decide_cavalry, decide_target, decide_rectification = compose_agents(
+        AGENT_ASSIGNMENT, build_fns,
     )
 
     terrain_map = {

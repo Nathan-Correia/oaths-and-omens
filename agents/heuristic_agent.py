@@ -1,5 +1,5 @@
 """
-HeuristicAgent for engine_v2 - ported from
+HeuristicAgent for engine - ported from
 engine/agents/heuristic_agent.py. Plays with real tactical judgment
 rather than pure greed or randomness, while keeping the parts that
 genuinely don't matter much (multi-battle targeting, rectification)
@@ -12,7 +12,7 @@ cavalry/archers this faction currently has fewer of, rather than a pure
 coin flip.
 
 Movement / cavalry phase: for the single army it's allowed to move this
-step (engine_v2's decide_movement only ever returns one (hex_index,
+step (engine's decide_movement only ever returns one (hex_index,
 direction) per faction per step - see movement.py's SCOPE decision, so
 "pick the biggest army" is just which origin gets tried first, not a
 separate constraint to enforce), in priority order:
@@ -33,8 +33,8 @@ import random
 import numpy as np
 
 from .random_agent import random_rectification, random_target
-from ..geometry import hex_distance
-from ..state import NO_FACTION, count_units_in_play
+from engine.geometry import hex_distance
+from engine.state import NO_FACTION, count_units_in_play
 
 RANDOM_MOVE_CHANCE = 0.12          # flavor noise: chance to ignore the heuristic and act randomly
 RETREAT_THRESHOLD = 0.85           # retreat if our army is weaker than this fraction of the threat
@@ -166,7 +166,7 @@ def heuristic_move(state, faction, legal_mask, rng):
 def make_heuristic_agents(num_factions, seed=0):
     """Returns (decide_buy, decide_movement, decide_cavalry, decide_target,
     decide_rectification) - each {faction: callable}, matching
-    engine_v2.turn.run_turn's expected signatures."""
+    engine.turn.run_turn's expected signatures."""
     rngs = {f: random.Random(seed * 1_000_003 + f) for f in range(num_factions)}
 
     def decide_buy(state, faction, legal):

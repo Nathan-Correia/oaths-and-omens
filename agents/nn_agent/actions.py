@@ -1,12 +1,12 @@
 """
 Masking, sampling, and decoding for each of the five decision types -
-turns raw network logits + an engine_v2 legality mask into an actual
-action in engine_v2's expected format (or None/[] when nothing's legal
+turns raw network logits + an engine legality mask into an actual
+action in engine's expected format (or None/[] when nothing's legal
 or nothing needs deciding).
 
-Movement/cavalry masks come straight from engine_v2.movement (already
+Movement/cavalry masks come straight from engine.movement (already
 exactly [num_hexes, 6] - no translation needed). Buy, target, and
-rectification don't have an existing fixed-shape mask in engine_v2 (v1's
+rectification don't have an existing fixed-shape mask in engine (v1's
 buy/target/rectification representations are variable-length action
 lists, ported as-is - see those modules' docstrings), so building one is
 part of this file:
@@ -32,8 +32,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from engine_v2.battle import faction_totals
-from engine_v2.state import MAX_STACK_SIZE
+from engine.battle import faction_totals
+from engine.state import MAX_STACK_SIZE
 
 
 def _masked_categorical(rng_key, logits, mask):
@@ -58,7 +58,7 @@ def decode_movement_or_cavalry(rng_key, logits, mask):
 def buy_action_mask(state, legal_buy_actions):
     """[num_hexes, 4] bool, columns = (no-op, buy_infantry,
     convert_to_cavalry, convert_to_archers). Built from
-    get_legal_buy_actions' output (engine_v2.buy) - no-op is always
+    get_legal_buy_actions' output (engine.buy) - no-op is always
     legal (a faction never has to spend everything)."""
     mask = np.zeros((state.num_hexes, 4), dtype=bool)
     mask[:, 0] = True
@@ -119,7 +119,7 @@ def rectification_origin_mask(state, hex_index, winner_faction):
 
 
 def decode_rectification(rng_key, rectify_logits, state, hex_index, winner_faction):
-    """Returns engine_v2.battle.rectify_overflow's send_back list: []
+    """Returns engine.battle.rectify_overflow's send_back list: []
     if the winner isn't actually over the stack cap, otherwise one
     entry sending the whole overflow to a single chosen origin hex
     (see module docstring)."""
