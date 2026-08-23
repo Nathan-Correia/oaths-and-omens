@@ -24,7 +24,7 @@ import sys
 import pygame
 
 from hex_common import hex_to_pixel, hex_corner, compute_hex_size, cube_hexes_in_radius
-from hex import (
+from hex_visualizer import (
     TERRAIN_COLORS, HEX_OUTLINE_COLOR, BG_COLOR, TEXT_COLOR,
     SIDEBAR_BG_COLOR, SIDEBAR_DIVIDER_COLOR, Slider,
 )
