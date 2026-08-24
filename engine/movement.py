@@ -26,6 +26,15 @@ merge with reversion on overstacking) - see that module's docstring for
 the full rules rationale. Ported quirks and all (see _revert_departure's
 docstring) since the goal is matching engine/'s actual behavior for
 parity testing, not improving on it.
+
+RULE CHANGE: capitals and outposts are no longer capturable by walking
+into them undefended - arriving at a hex owned by a foreign faction
+(city_owner set to someone other than every arriving faction) always
+forces a battle now, the same as arriving on real hostile units, even
+if the tile has no defending army at all. What happens to the winner
+afterward (evicted with nothing to show for it at a capital, or left
+standing on a now-ownerless destroyed outpost) is turn.py's
+_run_battle_phase's job, not this module's - see its docstring.
 """
 
 import numpy as np
@@ -122,13 +131,6 @@ def _start_or_extend_battle(state, hex_index, contributions):
         state.battle_order.append(hex_index)
     state.locked[hex_index] = True
     _clear_army(state, hex_index)
-
-
-def _maybe_capture_city(state, hex_index):
-    if (state.city_owner[hex_index] != NO_FACTION
-            and state.army_faction[hex_index] != NO_FACTION
-            and state.army_faction[hex_index] != state.city_owner[hex_index]):
-        state.city_owner[hex_index] = state.army_faction[hex_index]
 
 
 def _units_to_move(state, from_index, cavalry_only):
@@ -253,8 +255,10 @@ def apply_movement_step(state, actions_by_faction, cavalry_only=False):
 
         hostile_present = existing_faction is not None and existing_faction not in arrival_factions
         multiple_arrival_factions = len(arrival_factions) > 1
+        dest_owner = int(state.city_owner[dest]) if state.city_owner[dest] != NO_FACTION else None
+        foreign_structure = dest_owner is not None and dest_owner not in arrival_factions
 
-        if hostile_present or multiple_arrival_factions:
+        if hostile_present or multiple_arrival_factions or foreign_structure:
             contributions = [(a["faction"], a["from"], a["units"]) for a in arrivals]
             if existing_faction is not None:
                 contributions.append((existing_faction, dest, _units_at(state, dest)))
@@ -274,7 +278,5 @@ def apply_movement_step(state, actions_by_faction, cavalry_only=False):
 
             if state.terrain[dest] == MARSH_INDEX:
                 state.frozen[dest] = True
-
-            _maybe_capture_city(state, dest)
 
     return {int(i) for i in np.nonzero(state.locked)[0]}

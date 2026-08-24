@@ -33,7 +33,6 @@ import jax.numpy as jnp
 import numpy as np
 
 from engine.battle import faction_totals
-from engine.state import MAX_STACK_SIZE
 
 
 def _masked_categorical(rng_key, logits, mask):
@@ -59,13 +58,20 @@ def buy_action_mask(state, legal_buy_actions):
     """[num_hexes, 4] bool, columns = (no-op, buy_infantry,
     convert_to_cavalry, convert_to_archers). Built from
     get_legal_buy_actions' output (engine.buy) - no-op is always
-    legal (a faction never has to spend everything)."""
+    legal (a faction never has to spend everything).
+
+    engine.buy can also return "build_outpost" actions now; this fixed
+    4-column action space has no slot for them, so they're silently
+    skipped here rather than misread as a convert_to_special (matching
+    on "unit_type" alone would otherwise bin an infantry build_outpost
+    into the "convert to archers" column) - expanding the NN's action
+    space to actually place outposts is a separate follow-up."""
     mask = np.zeros((state.num_hexes, 4), dtype=bool)
     mask[:, 0] = True
     for a in legal_buy_actions:
         if a["type"] == "buy_infantry":
             mask[a["city_hex"], 1] = True
-        else:
+        elif a["type"] == "convert_to_special":
             mask[a["hex"], 2 if a["unit_type"] == "cavalry" else 3] = True
     return mask
 
@@ -118,13 +124,16 @@ def rectification_origin_mask(state, hex_index, winner_faction):
     return mask
 
 
-def decode_rectification(rng_key, rectify_logits, state, hex_index, winner_faction):
+def decode_rectification(rng_key, rectify_logits, state, hex_index, winner_faction, cap):
     """Returns engine.battle.rectify_overflow's send_back list: []
-    if the winner isn't actually over the stack cap, otherwise one
-    entry sending the whole overflow to a single chosen origin hex
-    (see module docstring)."""
+    if the winner isn't actually over `cap`, otherwise one entry sending
+    the whole overflow to a single chosen origin hex (see module
+    docstring). `cap` is normally MAX_STACK_SIZE, but is 0 when the
+    winner just won a battle on a foreign capital (see turn.py's
+    _run_battle_phase) - capitals are uncapturable, so the winner has to
+    send everything back."""
     totals = faction_totals(state, hex_index)[winner_faction]
-    overflow = int(totals.sum()) - MAX_STACK_SIZE
+    overflow = int(totals.sum()) - cap
     if overflow <= 0:
         return []
 

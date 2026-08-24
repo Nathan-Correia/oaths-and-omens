@@ -49,7 +49,7 @@ MAX_TURNS = 100
 SEED = int(time.time() * 1000) % (2 ** 31)
 
 # Per-faction agent choice - any of "random", "smart_random", "heuristic", "nn".
-AGENT_ASSIGNMENT = {f: "heuristic" for f in range(NUM_FACTIONS)}
+AGENT_ASSIGNMENT = {f: "random" for f in range(NUM_FACTIONS)}
 
 
 def _build_nn_agents(state):

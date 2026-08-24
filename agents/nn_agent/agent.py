@@ -80,9 +80,9 @@ def make_nn_agents(network, params, num_factions, seed=0, max_turns=100):
         mask = actions.target_mask(num_factions, legal)
         return actions.decode_target(keys.next(), out["target"], mask)
 
-    def decide_rectification(state, hex_index, winner_faction):
+    def decide_rectification(state, hex_index, winner_faction, cap):
         out = forward(state, winner_faction, battle_hex_index=hex_index)
-        return actions.decode_rectification(keys.next(), out["rectify"], state, hex_index, winner_faction)
+        return actions.decode_rectification(keys.next(), out["rectify"], state, hex_index, winner_faction, cap)
 
     factions = range(num_factions)
     return (

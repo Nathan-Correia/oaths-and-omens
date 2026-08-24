@@ -36,15 +36,14 @@ from .state import (
     NO_FACTION,
     NO_ORIGIN,
     SPAWN_CAPS,
-    TERRAIN_TO_INDEX,
     UNIT_TYPES,
     count_units_in_play,
 )
 
 DEATH_PRIORITY = (0, 1, 2)  # infantry, cavalry, archers
 MAX_ROUNDS_SAFETY_CAP = 50  # pure infinite-loop guard - real battles resolve in a handful of rounds
-TERRAIN_BONUS = 2
-FOREST_INDEX = TERRAIN_TO_INDEX["forest"]
+CAPITAL_DEFENSE_SHOTS = 2
+OUTPOST_DEFENSE_SHOTS = 1
 
 
 def _battle_faction_order(state, hex_index):
@@ -85,22 +84,6 @@ def get_legal_target_actions(state, hex_index, faction):
     get_legal_target_actions."""
     totals = faction_totals(state, hex_index)
     return [f for f in _battle_faction_order(state, hex_index) if f != faction and int(totals[f].sum()) > 0]
-
-
-def _terrain_bonus(state, hex_index, faction):
-    """+2 if any of this faction's contributions to this battle
-    originated from a forest hex, +2 if this faction owns the city on
-    the battle's hex - mirrors engine/battle.py's _terrain_bonus."""
-    bonus = 0
-    for k in range(state.battle_faction.shape[1]):
-        if state.battle_faction[hex_index, k] == faction:
-            origin = state.battle_origin[hex_index, k]
-            if origin != NO_ORIGIN and state.terrain[origin] == FOREST_INDEX:
-                bonus += TERRAIN_BONUS
-                break
-    if state.city_owner[hex_index] == faction:
-        bonus += TERRAIN_BONUS
-    return bonus
 
 
 def _kills_for_roll(roll, attacker_total_units):
@@ -153,14 +136,45 @@ def apply_archer_abilities(state, hex_index, rng):
             continue
         target = max(rivals, key=lambda f: rivals[f])
 
-        bonus = _terrain_bonus(state, hex_index, faction)
         kills = 0
         for _ in range(archers):
-            if min(20, rng.randint(1, 20) + bonus) >= 11:
+            if rng.randint(1, 20) >= 11:
                 kills += 1
         if kills > 0:
             _apply_kills_to_faction(state, hex_index, target, kills, faction, death_log)
 
+    return death_log
+
+
+def apply_structure_defense_shots(state, hex_index, rng):
+    """Runs once, before round 1 (and before real Archer units get their
+    own ability - see apply_archer_abilities). A capital or outpost gets
+    free defensive shots against whoever's attacking its tile, even if
+    its owner has no units there to defend with: 2 shots for a capital,
+    1 for an outpost, each 11-20 = 1 kill against the largest attacking
+    army, same math as the real Archers ability but a deliberately
+    separate mechanic so it can be tuned independently later. Returns a
+    death_log list in the same shape as apply_archer_abilities."""
+    owner = int(state.city_owner[hex_index])
+    if owner == NO_FACTION:
+        return []
+
+    totals = faction_totals(state, hex_index)
+    alive = {f: t for f, t in totals.items() if int(t.sum()) > 0}
+    rivals = {f: int(t.sum()) for f, t in alive.items() if f != owner}
+    if not rivals:
+        return []
+    target = max(rivals, key=lambda f: rivals[f])
+
+    shots = CAPITAL_DEFENSE_SHOTS if state.is_capital[hex_index] else OUTPOST_DEFENSE_SHOTS
+    kills = 0
+    for _ in range(shots):
+        if rng.randint(1, 20) >= 11:
+            kills += 1
+
+    death_log = []
+    if kills > 0:
+        _apply_kills_to_faction(state, hex_index, target, kills, owner, death_log)
     return death_log
 
 
@@ -211,8 +225,7 @@ def resolve_round(state, hex_index, target_choices, rng, infantry_counts):
         attacker_units = unit_counts.get(attacker, 0)
         if attacker_units <= 0:
             continue
-        bonus = _terrain_bonus(state, hex_index, attacker)
-        roll = min(20, rng.randint(1, 20) + bonus)
+        roll = rng.randint(1, 20)
         kills = _kills_for_roll(roll, attacker_units)
         rolls[attacker] = roll
         kills_dealt[attacker] = kills
@@ -276,16 +289,23 @@ def resolve_full_battle(state, hex_index, target_fn, rng, infantry_counts=None):
     real turn orchestration should share one tally across every battle
     resolved that turn - see engine/turn.py's _run_battle_phase for why).
 
-    Returns {"archer_phase": [...], "rounds": [round_log, ...]} - the
-    same shape as engine/battle.py's resolve_full_battle, for replay/
-    visualization (see module docstring). Always computed, same as v1 -
-    cheap, bounded by actual rounds fought - even if a given caller
-    (e.g. run_turn, as opposed to run_turn_and_log) doesn't keep it.
+    Returns {"structure_phase": [...], "archer_phase": [...], "rounds":
+    [round_log, ...]} - "rounds" and "archer_phase" match the shape of
+    engine/battle.py's resolve_full_battle, for replay/visualization (see
+    module docstring); "structure_phase" is new (see
+    apply_structure_defense_shots) and not yet consumed by any replay
+    viewer. Always computed, same as v1 - cheap, bounded by actual rounds
+    fought - even if a given caller (e.g. run_turn, as opposed to
+    run_turn_and_log) doesn't keep it.
     """
     if infantry_counts is None:
         infantry_counts = {f: count_units_in_play(state, f, 0) for f in _battle_faction_order(state, hex_index)}
 
     players_kill_xp = state.kill_xp
+
+    structure_phase = apply_structure_defense_shots(state, hex_index, rng)
+    for entry in structure_phase:
+        players_kill_xp[entry["killer"]] += entry["count"]
 
     archer_phase = apply_archer_abilities(state, hex_index, rng)
     for entry in archer_phase:
@@ -309,15 +329,26 @@ def resolve_full_battle(state, hex_index, target_fn, rng, infantry_counts=None):
 
         rounds_run += 1
 
-    return {"archer_phase": archer_phase, "rounds": rounds}
+    return {"structure_phase": structure_phase, "archer_phase": archer_phase, "rounds": rounds}
 
 
-def rectify_overflow(state, hex_index, winner_faction, send_back):
-    """After a battle resolves, if the winning stack exceeds 6 units,
-    the winner sends overflow back to their own contributing origin
+def rectify_overflow(state, hex_index, winner_faction, send_back, cap=MAX_STACK_SIZE):
+    """After a battle resolves, if the winning stack exceeds `cap` units,
+    the winner sends the excess back to their own contributing origin
     hexes. `send_back`: list of {"origin_hex": hex_index_or_None,
-    "units": int[3]}. Units whose origin_hex is None/invalid are lost -
-    mirrors engine/battle.py's rectify_overflow."""
+    "units": int[3]}. Units whose origin_hex is None/invalid, or that
+    `send_back` doesn't account for, are trimmed off (infantry -> cavalry
+    -> archers, same cascade used everywhere else) rather than left
+    sitting above `cap` - mirrors engine/battle.py's rectify_overflow,
+    generalized with a `cap` parameter so turn.py can force a full
+    eviction (cap=0) from a capital a foreign faction just won a battle
+    on (see turn.py's _run_battle_phase - capitals are uncapturable, so
+    an attacker who wins there is never allowed to actually occupy it).
+
+    City ownership is NOT touched here: neither a capital (uncapturable)
+    nor an outpost (destroyed rather than captured - see turn.py) ever
+    changes hands by occupation anymore, so that's turn.py's job, not
+    this generic stack-trimming function's."""
     winning_units = faction_totals(state, hex_index)[winner_faction].copy()
 
     for entry in send_back:
@@ -335,8 +366,14 @@ def rectify_overflow(state, hex_index, winner_faction, send_back):
             # else: those units are simply lost
 
     total_remaining = int(winning_units.sum())
-    if total_remaining > MAX_STACK_SIZE:
-        winning_units[0] = max(0, winning_units[0] - (total_remaining - MAX_STACK_SIZE))
+    if total_remaining > cap:
+        excess = total_remaining - cap
+        for ut in DEATH_PRIORITY:
+            take = min(int(winning_units[ut]), excess)
+            winning_units[ut] -= take
+            excess -= take
+            if excess <= 0:
+                break
 
     if int(winning_units.sum()) > 0:
         state.army_faction[hex_index] = winner_faction
@@ -346,9 +383,6 @@ def rectify_overflow(state, hex_index, winner_faction, send_back):
         state.army_units[hex_index] = 0
     state.frozen[hex_index] = False
     state.locked[hex_index] = False
-
-    if state.city_owner[hex_index] != NO_FACTION and state.army_faction[hex_index] != NO_FACTION:
-        state.city_owner[hex_index] = winner_faction
 
     state.battle_faction[hex_index] = NO_FACTION
     state.battle_origin[hex_index] = NO_ORIGIN

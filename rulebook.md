@@ -2,7 +2,7 @@
 
 ## Overview
 
-Oaths and Omens is a game of territorial conquest, betrayal, and diplomacy played on a hexagonal map. Players command armies of infantry, cavalry, and archers, capture and defend cities, and vie for the highest score by game's end. Trading, deceit, and shifting alliances are part of the game — anything goes.
+Oaths and Omens is a game of territorial conquest, betrayal, and diplomacy played on a hexagonal map. Players command armies of infantry, cavalry, and archers, defend their capital, and race to be the first to reach 50 victory points by building outposts across the map - and destroying everyone else's. Trading, deceit, and shifting alliances are part of the game — anything goes.
 
 ## Pieces
 
@@ -11,7 +11,7 @@ Each player controls one faction and begins the game with a bag containing:
 - 24 infantry
 - 12 cavalry
 - 12 archers
-- 2 cities
+- 1 city (your capital)
 - 1 D20 die
 
 ## Map Creation
@@ -20,17 +20,14 @@ The map is built from hexagonal tiles. A standard board uses 217 hexagons; the f
 
 ## Game Setup
 
-The starting player is determined by a high dice roll. That player places their first city on any tile of their choosing. Play then proceeds clockwise, with each remaining player placing their first city in turn.
+The starting player is determined by a high dice roll. That player places their capital on any tile of their choosing. Play then proceeds clockwise, with each remaining player placing their capital in turn.
 
-Once every player has placed a first city, players place their second city in counter-clockwise order, starting with whichever player placed last in the first round.
+Capital placement restrictions:
+- A capital must be at least 3 tiles from any opponent's capital.
+- With 5–7 players, capitals cannot be placed on edge tiles.
+- With 8–10 players, capitals may be placed on edge tiles.
 
-City placement restrictions:
-- A city must be at least 2 tiles from any opponent's city.
-- A city must be at least 1 tile from your own other city.
-- With 5–7 players, cities cannot be placed on edge tiles.
-- With 8–10 players, cities may be placed on edge tiles.
-
-After both cities are placed, players may rearrange their starting positions to sit closer to their own cities.
+After every capital is placed, players may rearrange their starting positions to sit closer to their own capital.
 
 Each player begins the game with 50 silver and 2 kill experience, awarded once at the very first buy phase instead of that turn's regular income.
 
@@ -38,9 +35,9 @@ Each player begins the game with 50 silver and 2 kill experience, awarded once a
 
 Each turn begins with a buy phase, right after income is collected.
 
-**Income**: every player collects 3 silver per turn. If a player controls more than 2 cities, they earn an additional 1 silver for every city beyond their second. A player with no cities remaining earns no income and instead loses 1 unit every turn.
+**Income**: every player collects 3 silver per turn. If a player controls more than 2 cities, they earn an additional 1 silver for every city beyond their second (your capital and any outposts you control both count as cities here). A player with no cities remaining earns no income and instead loses 1 unit every turn — in practice this can no longer happen, since your capital cannot be captured or destroyed (see Capitals).
 
-**Buying units**: infantry cost 2 silver each and can be purchased at any city you control, as long as no enemy units occupy a tile orthogonally adjacent to that city. Cavalry and archers cannot be purchased with silver — they can only be acquired by trading in kill experience (see below).
+**Buying units**: infantry cost 2 silver each and can be purchased at any city you control, as long as no enemy units occupy a tile orthogonally adjacent to that city. An outpost is limited to recruiting at most 1 new infantry this way per turn; your capital has no such limit (see Outposts). Cavalry and archers cannot be purchased with silver — they can only be acquired by trading in kill experience (see below).
 
 **Production limits**: each player may have at most 24 infantry, 12 cavalry, and 12 archers in play at once. This is a concurrent limit, not a lifetime total — losing a unit immediately frees up capacity to field another of that type.
 
@@ -68,11 +65,13 @@ There are three ways a battle can begin:
 - **Encounter Battle**: two or more armies simultaneously move into the same empty tile.
 - **Line Battle**: two armies simultaneously attack each other from adjacent tiles.
 
-Once triggered, all three battle types resolve the same way.
+Moving into a tile with another player's capital or outpost is always treated as an attack and triggers a battle, even if it has no defending army standing on it — see Capitals and Outposts for what happens next.
+
+Once triggered, all battle types resolve the same way.
 
 ### Reinforcements and overstacking
 
-Because armies lock in place as soon as a battle starts, additional armies are free to move into a battle on a later step of the same movement phase, joining the fight as reinforcements. This means a battle can temporarily exceed the normal 6-unit stack limit while it's ongoing. Once the battle ends, if the winning side has more than 6 units remaining, the winning player must reduce their stack back down to 6 by sending the excess units back to any tile their own units came from during that battle.
+Because armies lock in place as soon as a battle starts, additional armies are free to move into a battle on a later step of the same movement phase, joining the fight as reinforcements. This means a battle can temporarily exceed the normal 6-unit stack limit while it's ongoing. Once the battle ends, if the winning side has more than 6 units remaining, the winning player must reduce their stack back down to 6 by sending the excess units back to any tile their own units came from during that battle (see Capitals for the one case where the whole stack has to go back, not just the excess).
 
 Outside of battle, the 6-unit limit is strict: a peaceful move that would merge into a stack and push it past 6 units simply doesn't happen. The move is illegal and the army stays where it started.
 
@@ -120,24 +119,34 @@ Kill experience represents accumulated kills and cannot be hoarded indefinitely 
 | **Lake** | Impassable. |
 | **Desert** | Any army that ends its full turn on a desert tile loses 1 unit — unless that tile has a city on it, in which case the loss doesn't apply. |
 | **Marsh** | Any army that enters a marsh tile is frozen and cannot move again for the rest of that turn. |
-| **Forest** | An army attacking out of a forest tile gains +2 to all of its battle rolls. |
 | **Plains** | No special effect. |
-| **City** | Defending units on a city tile gain +2 to their battle rolls. This bonus stacks with other terrain bonuses. |
 
-## Cities
+## Capitals
 
-Cities are captured simply by occupying them: if a player moves an army into a city tile that isn't defended by another army, they immediately take ownership of that city. If the city is defended, ownership only changes hands if the attacker wins the resulting battle and occupies the tile.
+Each player has exactly one capital, placed during setup. A capital cannot be captured or destroyed by any means: entering its tile is always treated as an attack and triggers a battle, even if the capital has no defending army of its own — the capital fights back on its own (see Defense, below) regardless.
 
-## Elimination
+If an attacker somehow wins that battle, ownership never changes hands. Instead, the winner is evicted immediately: every one of their surviving units is sent straight back to wherever it came from during that battle, no matter how few units made it through. You simply cannot stand units on another player's capital, win or lose.
 
-A player is eliminated once they control no cities and have no units remaining anywhere on the board. Both conditions must be true — a player with units but no cities, or cities but no units, is not eliminated.
+**Defense**: a capital gets 2 free defensive shots the instant its tile is attacked, before the first round of combat (11–20 on a d20 = 1 kill each, aimed at the single largest attacking army) — fired even with no defending army present. This stacks with any archers actually stationed there, and is a separate mechanic from the real Archers ability above (kept independent so it can be tuned on its own later).
+
+## Outposts
+
+Outposts are smaller, disposable extensions of a player's territory — unlike a capital, they can be destroyed.
+
+**Building**: costs 3 silver and consumes 1 unit (any type) already standing on the tile you're building on. You may build as many outposts as you can afford and have the units/room for during a single buy phase, up to a maximum of 6 outposts per player at once.
+
+**Placement restrictions**: an outpost cannot be built within 2 tiles of your own capital, within 1 tile of any other player's capital, or within 1 tile of any existing outpost — yours or anyone else's.
+
+**Recruiting**: infantry may be purchased at an outpost exactly like at a capital (2 silver, same no-adjacent-enemy restriction), but at most 1 new infantry may be recruited per outpost per turn. A capital has no such limit.
+
+**Destruction**: entering a tile with an enemy outpost is always treated as an attack and triggers a battle, even if the outpost has no defending army of its own. If, once the battle ends, no other faction's units remain on that tile besides the winner's, the outpost is destroyed — its owner loses it, and the winner does not take ownership of it, but does keep standing there as normal (no forced eviction, unlike a capital).
+
+**Defense**: an outpost gets 1 free defensive shot the instant its tile is attacked, before the first round of combat (11–20 = 1 kill, aimed at the single largest attacking army) — fired even with no defending army present, the same mechanic as a capital's defense but weaker, and tracked separately from it.
 
 ## Win Condition
 
-The game ends after a fixed number of turns. Final scores are tallied from two categories: Cities and Military. In the event of a tie, the tiebreaker order is: most cities, then most units remaining.
+Victory points are the win condition. The first player to reach 50 wins.
 
-**Cities**: each player scores 1 point for every city they control at the end of the game.
+At the end of every round, each player earns 1 victory point for every outpost they currently control. Destroying another player's outpost also immediately awards the winner of that battle 2 victory points, on top of the recurring per-round total.
 
-**Military**: each player counts their remaining units at game's end. The player with the most units receives 3 points, the second-most receives 2 points, and the third-most receives 1 point.
-
-The player with the highest total score wins the game.
+If, at the end of a round, one or more players are at or above 50 victory points, whoever has the single highest total wins immediately. If the top total is exactly tied between two or more players, whoever of them placed their capital later during setup wins the tiebreak.

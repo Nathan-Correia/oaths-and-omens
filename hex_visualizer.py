@@ -11,7 +11,9 @@ checkpoint-within-turn independently.
 
 Each hex can show:
   - terrain (washed-out fill color, background context only)
-  - a city icon (top-center, square+triangle "building" glyph, faction-colored)
+  - a capital (top-center, square+triangle "building" glyph, faction-colored)
+    or an outpost (top-center, small triangle, faction-colored) - a hex
+    never has both, since city_owner is one-or-the-other per hex
   - EITHER a peaceful troop row (center, up to 3 shapes: circle=infantry,
     square=cavalry, triangle=archers, each showing its count) OR, if the
     hex is currently locked in a pending battle, a stack of small
@@ -32,10 +34,11 @@ from hex_common import (
 )
 
 try:
-    from engine.turn import CHECKPOINT_LABELS
+    from engine.turn import CHECKPOINT_LABELS, VP_TO_WIN
 except ImportError:
     CHECKPOINT_LABELS = ["Start", "Buy", "Move 1", "Move 2", "Move 3",
                           "Cav 1", "Cav 2", "Cav 3", "Cav 4", "Battle"]
+    VP_TO_WIN = 50
 
 # ---------------------------------------------------------------------------
 # Config
@@ -53,6 +56,19 @@ SLIDER_FILL_COLOR = (120, 160, 220)
 SLIDER_HANDLE_COLOR = (230, 230, 235)
 SLIDER_HANDLE_RADIUS = 9
 SLIDER_LABEL_COLOR = (220, 220, 225)
+
+# --- Score ticker: a vertical panel on the side, one column per faction
+# (so close/tied scores don't just overlap into an unreadable blob) - each
+# column is its own 0-VP_TO_WIN vertical track (0 at the bottom, climbing
+# toward VP_TO_WIN at the top, like a thermometer), a dot marking that
+# faction's current score, swatch + numeric score below the track.
+SCORE_TICKER_COLUMN_WIDTH = 40
+SCORE_TICKER_SIDE_MARGIN = 20   # left/right padding within the ticker panel
+SCORE_TICKER_TOP_PADDING = 30   # room for the title label above the tracks
+SCORE_TICKER_BOTTOM_PADDING = 46  # room for the swatch + score number below each track
+SCORE_TICKER_TRACK_COLOR = (70, 70, 78)
+SCORE_TICKER_WIN_LINE_COLOR = (200, 200, 80)
+SCORE_TICKER_HANDLE_RADIUS = 6
 
 SIDEBAR_BG_COLOR = (24, 24, 30)
 SIDEBAR_DIVIDER_COLOR = (50, 50, 58)
@@ -113,6 +129,10 @@ SQUARE_SIZE = SHAPE_SIZE - 1  # cavalry square rendered a touch smaller than the
 
 # City icon sizing (no outline on these, kept separate from troop shapes)
 CITY_ICON_SIZE = 9  # half-width of the square base
+
+# Outpost icon sizing - a small outlined triangle, distinct from (and
+# smaller than) a capital's building icon
+OUTPOST_ICON_SIZE = 6
 
 # Battle-contribution rectangle sizing (stacked when a hex is locked in a fight)
 BATTLE_RECT_WIDTH = 40
@@ -288,6 +308,20 @@ def draw_city_icon(surface, center, faction_color):
     pygame.draw.polygon(surface, faction_color, roof_points)
 
 
+def draw_outpost_icon(surface, center, faction_color):
+    """Small outlined triangle, top-center of hex - marks an outpost,
+    distinct from a capital's building icon (draw_city_icon)."""
+    cx, cy = center
+    s = OUTPOST_ICON_SIZE
+    points = [
+        (cx, cy - s),
+        (cx - s, cy + s * 0.7),
+        (cx + s, cy + s * 0.7),
+    ]
+    pygame.draw.polygon(surface, faction_color, points)
+    pygame.draw.polygon(surface, SHAPE_OUTLINE_COLOR, points, width=1)
+
+
 def _shape_positions(present, cx, cy, size):
     spacing = size * 0.78
     n = len(present)
@@ -353,8 +387,12 @@ def draw_hex(surface, center, size, terrain, hex_data, font, battle_font):
     cx, cy = center
 
     if hex_data["city"] is not None:
+        city = hex_data["city"]
         city_center = (cx, cy - size * 0.62 + 4)
-        draw_city_icon(surface, city_center, FACTION_COLORS[hex_data["city"]])
+        if city["is_capital"]:
+            draw_city_icon(surface, city_center, FACTION_COLORS[city["faction"]])
+        else:
+            draw_outpost_icon(surface, city_center, FACTION_COLORS[city["faction"]])
 
     if hex_data["battle"] is not None:
         draw_battle_rectangles(surface, center, hex_data["battle"]["contributions"], battle_font)
@@ -596,6 +634,61 @@ def draw_battle_popup(surface, window_w, window_h, table, header_font, cell_font
     surface.blit(hint_surf, (popup_x + BATTLE_POPUP_PADDING, popup_y + popup_h - 22))
 
 
+class ScoreTicker:
+    """Always-visible victory-points readout, a vertical panel with one
+    column per faction (so close/tied scores don't just overlap into an
+    unreadable blob): each column is its own 0-VP_TO_WIN vertical track
+    (0 at the bottom, VP_TO_WIN at the top), with a dot marking that
+    faction's current score and a swatch + numeric score below the
+    track. Purely a display (no drag/click handling, unlike Slider) -
+    just call draw() with whatever player_stats dict is current."""
+
+    def __init__(self, x0, y0, height, num_factions, vp_to_win=VP_TO_WIN):
+        self.x0 = x0
+        self.y0 = y0
+        self.height = height
+        self.num_factions = num_factions
+        self.vp_to_win = vp_to_win
+        self.track_y1 = y0 + SCORE_TICKER_TOP_PADDING       # VP_TO_WIN (top)
+        self.track_y2 = y0 + height - SCORE_TICKER_BOTTOM_PADDING  # 0 (bottom)
+
+    @property
+    def width(self):
+        return SCORE_TICKER_SIDE_MARGIN * 2 + self.num_factions * SCORE_TICKER_COLUMN_WIDTH
+
+    def _column_x(self, faction):
+        return self.x0 + SCORE_TICKER_SIDE_MARGIN + faction * SCORE_TICKER_COLUMN_WIDTH + SCORE_TICKER_COLUMN_WIDTH / 2
+
+    def draw(self, surface, player_stats, label_font, row_font):
+        title_surf = label_font.render("Victory", True, SLIDER_LABEL_COLOR)
+        surface.blit(title_surf, title_surf.get_rect(centerx=self.x0 + self.width / 2, top=self.y0))
+        win_surf = row_font.render(f"Points (first to {self.vp_to_win})", True, SLIDER_LABEL_COLOR)
+        surface.blit(win_surf, win_surf.get_rect(centerx=self.x0 + self.width / 2, top=self.y0 + 16))
+
+        pygame.draw.line(surface, SCORE_TICKER_WIN_LINE_COLOR,
+                          (self.x0 + SCORE_TICKER_SIDE_MARGIN / 2, self.track_y1),
+                          (self.x0 + self.width - SCORE_TICKER_SIDE_MARGIN / 2, self.track_y1), width=2)
+
+        for faction in range(self.num_factions):
+            x = self._column_x(faction)
+            color = FACTION_COLORS[faction]
+
+            pygame.draw.line(surface, SCORE_TICKER_TRACK_COLOR, (x, self.track_y1), (x, self.track_y2), width=2)
+
+            vp = player_stats.get(faction, {}).get("victory_points", 0)
+            frac = max(0.0, min(1.0, vp / self.vp_to_win))
+            handle_y = self.track_y2 - frac * (self.track_y2 - self.track_y1)
+            pygame.draw.circle(surface, color, (int(x), int(handle_y)), SCORE_TICKER_HANDLE_RADIUS)
+            pygame.draw.circle(surface, SHAPE_OUTLINE_COLOR, (int(x), int(handle_y)), SCORE_TICKER_HANDLE_RADIUS, width=1)
+
+            swatch = pygame.Rect(0, 0, 12, 12)
+            swatch.center = (int(x), int(self.track_y2 + 16))
+            pygame.draw.rect(surface, color, swatch)
+
+            score_surf = row_font.render(str(vp), True, TEXT_COLOR)
+            surface.blit(score_surf, score_surf.get_rect(centerx=int(x), top=int(self.track_y2 + 28)))
+
+
 class Slider:
     """A click/drag scrubber along one horizontal track at a fixed y.
     `label_fn(index) -> str` builds the label text shown above the track,
@@ -655,12 +748,15 @@ def main():
     radius, num_factions, terrain_map, turn_checkpoints, turn_player_stats, turn_battles_by_hex = load_game(STATE_FILE)
     num_turns = len(turn_checkpoints)
 
+    board_area_h = WINDOW_H - SLIDER_BAND_HEIGHT
+    score_ticker = ScoreTicker(WINDOW_W, y0=0, height=board_area_h, num_factions=num_factions)
+    window_w = WINDOW_W + score_ticker.width
+
     pygame.init()
-    screen = pygame.display.set_mode((WINDOW_W, WINDOW_H))
+    screen = pygame.display.set_mode((window_w, WINDOW_H))
     pygame.display.set_caption("Hex Board Visualizer")
     clock = pygame.time.Clock()
 
-    board_area_h = WINDOW_H - SLIDER_BAND_HEIGHT
     size = compute_hex_size(radius, BOARD_AREA_W, board_area_h, MARGIN)
     font = pygame.font.SysFont("arial", max(9, int(SHAPE_SIZE * 1.1)), bold=True)
     battle_font = pygame.font.SysFont("arial", 10, bold=True)
@@ -681,11 +777,11 @@ def main():
     centers = {coord: (p[0] + offset_x, p[1] + offset_y) for coord, p in raw_centers.items()}
 
     turn_slider = Slider(
-        WINDOW_W, WINDOW_H - 78, num_turns,
+        window_w, WINDOW_H - 78, num_turns,
         label_fn=lambda i: f"Turn {i + 1} / {num_turns}   (drag, or use ↑/↓)",
     )
     checkpoint_slider = Slider(
-        WINDOW_W, WINDOW_H - 28, len(CHECKPOINT_LABELS),
+        window_w, WINDOW_H - 28, len(CHECKPOINT_LABELS),
         label_fn=lambda i: f"Phase: {CHECKPOINT_LABELS[i]}   (drag, or use ←/→)",
     )
 
@@ -742,6 +838,8 @@ def main():
         unit_counts = compute_unit_counts(board_state, num_factions)
 
         screen.fill(BG_COLOR)
+        score_ticker.draw(screen, player_stats, label_font, sidebar_row_font)
+
         for coord, terrain in terrain_map.items():
             draw_hex(screen, centers[coord], size, terrain, board_state[coord], font, battle_font)
 
@@ -752,7 +850,7 @@ def main():
         checkpoint_slider.draw(screen, current_checkpoint, label_font)
 
         if open_battle_table is not None:
-            draw_battle_popup(screen, WINDOW_W, WINDOW_H, open_battle_table,
+            draw_battle_popup(screen, window_w, WINDOW_H, open_battle_table,
                                battle_header_font, battle_cell_font, battle_label_font)
 
         pygame.display.flip()

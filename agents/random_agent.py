@@ -24,7 +24,6 @@ import random
 import numpy as np
 
 from engine.battle import faction_totals, get_legal_target_actions
-from engine.state import MAX_STACK_SIZE
 
 SKIP_CHANCE = 0.5  # chance to move nothing this step, matching v1's flavor
 
@@ -46,9 +45,9 @@ def random_target(state, hex_index, faction, rng):
     return rng.choice(legal)
 
 
-def random_rectification(state, hex_index, winner_faction, rng):
+def random_rectification(state, hex_index, winner_faction, cap, rng):
     totals = faction_totals(state, hex_index)[winner_faction]
-    overflow = int(totals.sum()) - MAX_STACK_SIZE
+    overflow = int(totals.sum()) - cap
     if overflow <= 0:
         return []
     origins = [
@@ -96,8 +95,8 @@ def make_random_agents(num_factions, seed=0):
     def decide_target(state, hex_index, faction):
         return random_target(state, hex_index, faction, rngs[faction])
 
-    def decide_rectification(state, hex_index, winner_faction):
-        return random_rectification(state, hex_index, winner_faction, rngs[winner_faction])
+    def decide_rectification(state, hex_index, winner_faction, cap):
+        return random_rectification(state, hex_index, winner_faction, cap, rngs[winner_faction])
 
     factions = range(num_factions)
     return (

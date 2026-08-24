@@ -18,7 +18,10 @@ now. Callback signatures:
   decide_movement(state, faction, step, legal_mask) -> (hex_index, direction) or None
   decide_cavalry(state, faction, step, legal_mask) -> (hex_index, direction) or None
   decide_target(state, hex_index, faction) -> target_faction or None
-  decide_rectification(state, hex_index, winner_faction) -> [{"origin_hex", "units"}, ...]
+  decide_rectification(state, hex_index, winner_faction, cap) -> [{"origin_hex", "units"}, ...]
+    `cap` is normally MAX_STACK_SIZE (send back only the overflow above 6), but is 0 when
+    the winner just won a battle on a foreign capital - capitals are uncapturable, so that
+    winner has to send EVERYTHING back (see _run_battle_phase).
 """
 
 import random
@@ -29,12 +32,14 @@ from .battle import faction_totals, get_winner, rectify_overflow, resolve_full_b
 from .buy import apply_buy_phase, get_legal_buy_actions
 from .income import apply_income_phase
 from .movement import apply_movement_step, legal_cavalry_mask, legal_movement_mask
-from .state import NO_FACTION, NO_ORIGIN, count_units_in_play
+from .state import MAX_STACK_SIZE, NO_FACTION, NO_ORIGIN, count_units_in_play
 from .terrain import apply_terrain_effects
 
 MOVEMENT_STEPS = 3
 CAVALRY_STEPS = 4
-DEFAULT_MAX_TURNS = 100
+VP_TO_WIN = 50
+OUTPOST_VP_PER_ROUND = 1
+OUTPOST_DESTROY_VP = 2
 
 
 def _run_battle_phase(state, decide_target, decide_rectification, rng):
@@ -46,7 +51,18 @@ def _run_battle_phase(state, decide_target, decide_rectification, rng):
     near the cap). Returns a list of per-battle event logs, same shape
     as engine/turn.py's _run_battle_phase - always built (cheap, bounded
     by rounds actually fought), even though only run_turn_and_log ends
-    up keeping it."""
+    up keeping it.
+
+    RULE CHANGE - capitals/outposts: neither is capturable by occupation
+    anymore (see movement.py). When the winner of a battle on a hex isn't
+    that hex's city_owner:
+      - a capital evicts the winner entirely (cap=0 rectification, no
+        ownership change - "you can't stand units in another player's
+        capital").
+      - an outpost is destroyed (city_owner cleared) and the winner gets
+        OUTPOST_DESTROY_VP; the winner keeps standing there (normal
+        cap=MAX_STACK_SIZE rectification), same as any other battle hex.
+    """
     infantry_counts = {f: count_units_in_play(state, f, 0) for f in range(state.num_factions)}
     pending_hexes = list(state.battle_order)
     battle_events = []
@@ -84,12 +100,22 @@ def _run_battle_phase(state, decide_target, decide_rectification, rng):
             state.battle_round[hex_index] = 0
             state.battle_order.remove(hex_index)
         else:
-            send_back = decide_rectification[winner](state, hex_index, winner)
-            rectify_overflow(state, hex_index, winner, send_back)
+            owner = int(state.city_owner[hex_index])
+            cap = MAX_STACK_SIZE
+            if owner != NO_FACTION and owner != winner:
+                if state.is_capital[hex_index]:
+                    cap = 0
+                else:
+                    state.city_owner[hex_index] = NO_FACTION
+                    state.victory_points[winner] += OUTPOST_DESTROY_VP
+
+            send_back = decide_rectification[winner](state, hex_index, winner, cap)
+            rectify_overflow(state, hex_index, winner, send_back, cap=cap)
 
         battle_events.append({
             "hex": list(state.grid.coord_of(hex_index)),
             "contributions_start": contributions_start,
+            "structure_phase": full_log["structure_phase"],
             "archer_phase": full_log["archer_phase"],
             "rounds": full_log["rounds"],
             "winner": winner,
@@ -99,28 +125,50 @@ def _run_battle_phase(state, decide_target, decide_rectification, rng):
     return battle_events
 
 
-def _update_elimination(state):
+def apply_victory_points(state):
+    """End-of-round VP tally (the win condition - see get_game_winner):
+    1 point per outpost currently controlled, capitals don't count.
+    Destroying an enemy outpost is awarded separately, immediately, in
+    _run_battle_phase (OUTPOST_DESTROY_VP) - this only covers the
+    recurring per-round income."""
     for faction in range(state.num_factions):
-        if not state.alive[faction]:
-            continue
-        has_city = bool(np.any(state.city_owner == faction))
-        has_units = bool(np.any(state.army_faction == faction))
-        if not has_city and not has_units:
-            state.alive[faction] = False
+        outposts = int(np.sum((state.city_owner == faction) & ~state.is_capital))
+        state.victory_points[faction] += outposts * OUTPOST_VP_PER_ROUND
+
+
+def get_game_winner(state):
+    """None until some faction's VP total has reached VP_TO_WIN. Among
+    every faction at or above VP_TO_WIN, the strict highest total wins
+    outright; an exact tie for the top total should be broken by whoever
+    placed their capital later (see rulebook's Win Condition) - capital
+    placement isn't agent-driven yet (see setup.py), so there's no
+    placement order to compare, and a tied leader is instead picked
+    uniformly at random for now."""
+    top = int(np.max(state.victory_points))
+    if top < VP_TO_WIN:
+        return None
+    contenders = [f for f in range(state.num_factions) if int(state.victory_points[f]) == top]
+    if len(contenders) == 1:
+        return contenders[0]
+    # Seeded off turn_number + the tied factions themselves (not a bare
+    # random.choice off Python's global, unseeded random state) so a game
+    # replayed from the same seed reaches the same tie-break, matching
+    # every other rng use in this codebase.
+    return random.Random((state.turn_number, tuple(contenders))).choice(contenders)
 
 
 def run_turn(state, decide_buy, decide_movement, decide_cavalry, decide_target, decide_rectification, rng=None):
     """Mutates and returns `state`. Each decide_* argument is a
     {faction: callable} dict - see module docstring for each callable's
-    signature. Only alive factions are asked for decisions, same as v1."""
+    signature. Elimination doesn't exist anymore (capitals are
+    uncapturable - see movement.py/_run_battle_phase), so every faction
+    is asked for a decision every turn."""
     rng = rng or random.Random()
 
     apply_income_phase(state)
 
     buy_actions = {}
     for faction in range(state.num_factions):
-        if not state.alive[faction]:
-            continue
         legal = get_legal_buy_actions(state, faction)
         buy_actions[faction] = decide_buy[faction](state, faction, legal)
     apply_buy_phase(state, buy_actions)
@@ -128,8 +176,6 @@ def run_turn(state, decide_buy, decide_movement, decide_cavalry, decide_target, 
     for step in range(MOVEMENT_STEPS):
         actions = {}
         for faction in range(state.num_factions):
-            if not state.alive[faction]:
-                continue
             legal = legal_movement_mask(state, faction)
             actions[faction] = decide_movement[faction](state, faction, step, legal)
         apply_movement_step(state, actions, cavalry_only=False)
@@ -137,15 +183,13 @@ def run_turn(state, decide_buy, decide_movement, decide_cavalry, decide_target, 
     for step in range(CAVALRY_STEPS):
         actions = {}
         for faction in range(state.num_factions):
-            if not state.alive[faction]:
-                continue
             legal = legal_cavalry_mask(state, faction)
             actions[faction] = decide_cavalry[faction](state, faction, step, legal)
         apply_movement_step(state, actions, cavalry_only=True)
 
     _run_battle_phase(state, decide_target, decide_rectification, rng)
     apply_terrain_effects(state)
-    _update_elimination(state)
+    apply_victory_points(state)
 
     state.turn_number += 1
     return state
@@ -158,13 +202,18 @@ CHECKPOINT_LABELS = ["Start", "Buy", "Move 1", "Move 2", "Move 3",
 
 
 def _snapshot_entry(state, hex_index, coord):
-    """Per-hex log entry: {"q","r","s","city","troops","battle"} - same
-    field shape as engine/turn.py's snapshot_hexes entries, so the
-    existing visualizer code can read either engine's replay log without
-    caring which one produced it."""
+    """Per-hex log entry: {"q","r","s","city","troops","battle"}. "city"
+    is None, or {"faction", "is_capital"} - capitals and outposts share
+    city_owner but render as different icons (hex_visualizer.py's
+    draw_city_icon vs. draw_outpost_icon), so is_capital has to travel
+    with the log entry rather than being re-derived some other way."""
+    if state.city_owner[hex_index] != NO_FACTION:
+        city = {"faction": int(state.city_owner[hex_index]), "is_capital": bool(state.is_capital[hex_index])}
+    else:
+        city = None
     entry = {
         "q": coord[0], "r": coord[1], "s": coord[2],
-        "city": int(state.city_owner[hex_index]) if state.city_owner[hex_index] != NO_FACTION else None,
+        "city": city,
         "troops": None, "battle": None,
     }
     if state.locked[hex_index]:
@@ -201,7 +250,12 @@ def sparse_hexes(full_hexes):
 
 def _player_stats_snapshot(state):
     return {
-        f: {"silver": int(state.silver[f]), "kill_xp": int(state.kill_xp[f]), "alive": bool(state.alive[f])}
+        f: {
+            "silver": int(state.silver[f]),
+            "kill_xp": int(state.kill_xp[f]),
+            "victory_points": int(state.victory_points[f]),
+            "alive": bool(state.alive[f]),
+        }
         for f in range(state.num_factions)
     }
 
@@ -234,8 +288,6 @@ def run_turn_and_log(state, decide_buy, decide_movement, decide_cavalry, decide_
 
     buy_actions = {}
     for faction in range(state.num_factions):
-        if not state.alive[faction]:
-            continue
         legal = get_legal_buy_actions(state, faction)
         chosen = decide_buy[faction](state, faction, legal)
         if chosen:
@@ -247,8 +299,6 @@ def run_turn_and_log(state, decide_buy, decide_movement, decide_cavalry, decide_
     for step in range(MOVEMENT_STEPS):
         actions = {}
         for faction in range(state.num_factions):
-            if not state.alive[faction]:
-                continue
             legal = legal_movement_mask(state, faction)
             chosen = decide_movement[faction](state, faction, step, legal)
             if chosen:
@@ -260,8 +310,6 @@ def run_turn_and_log(state, decide_buy, decide_movement, decide_cavalry, decide_
     for step in range(CAVALRY_STEPS):
         actions = {}
         for faction in range(state.num_factions):
-            if not state.alive[faction]:
-                continue
             legal = legal_cavalry_mask(state, faction)
             chosen = decide_cavalry[faction](state, faction, step, legal)
             if chosen:
@@ -272,7 +320,7 @@ def run_turn_and_log(state, decide_buy, decide_movement, decide_cavalry, decide_
 
     battle_events = _run_battle_phase(state, decide_target, decide_rectification, rng)
     apply_terrain_effects(state)
-    _update_elimination(state)
+    apply_victory_points(state)
     checkpoints.append(sparse_hexes(snapshot_hexes(state)))
     player_stats.append(_player_stats_snapshot(state))
 
@@ -287,29 +335,21 @@ def run_turn_and_log(state, decide_buy, decide_movement, decide_cavalry, decide_
     return state, turn_record
 
 
-def check_game_end(state, max_turns=DEFAULT_MAX_TURNS):
-    if int(np.sum(state.alive)) <= 1:
+def check_game_end(state, max_turns=None):
+    """True once the game should stop: the VP win condition has been hit
+    (see get_game_winner) - this is a rule, checked unconditionally. If
+    `max_turns` is given, it's purely an infra safety net against a
+    runaway/no-outposts-ever-built game, NOT part of the rules (there is
+    no turn timer anymore); omit it to let the game run until someone
+    actually wins."""
+    if get_game_winner(state) is not None:
         return True
-    return state.turn_number >= max_turns
+    return max_turns is not None and state.turn_number >= max_turns
 
 
 def tally_final_score(state):
-    """3-category score, matching engine/turn.py's tally_final_score:
-    cities (1 pt each) + military (top 3 remaining unit counts score
-    3/2/1). Voting is stubbed in v1 too (0 contribution) - see that
-    module's docstring."""
-    scores = {f: 0 for f in range(state.num_factions)}
-
-    for faction in range(state.num_factions):
-        scores[faction] += int(np.sum(state.city_owner == faction))
-
-    unit_counts = {
-        faction: int(state.army_units[state.army_faction == faction].sum())
-        for faction in range(state.num_factions)
-    }
-    ranked = sorted(unit_counts.items(), key=lambda kv: -kv[1])
-    military_points = [3, 2, 1]
-    for i, (faction, _count) in enumerate(ranked[:3]):
-        scores[faction] += military_points[i]
-
-    return scores
+    """The win condition IS the score now - just victory_points per
+    faction (see get_game_winner/apply_victory_points). Kept as its own
+    function for API parity with callers that want a final {faction:
+    score} dict."""
+    return {f: int(state.victory_points[f]) for f in range(state.num_factions)}

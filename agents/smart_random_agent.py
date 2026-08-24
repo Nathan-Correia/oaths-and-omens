@@ -106,8 +106,8 @@ def make_smart_random_agents(num_factions, seed=0):
     def decide_target(state, hex_index, faction):
         return random_target(state, hex_index, faction, rngs[faction])
 
-    def decide_rectification(state, hex_index, winner_faction):
-        return random_rectification(state, hex_index, winner_faction, rngs[winner_faction])
+    def decide_rectification(state, hex_index, winner_faction, cap):
+        return random_rectification(state, hex_index, winner_faction, cap, rngs[winner_faction])
 
     factions = range(num_factions)
     return (

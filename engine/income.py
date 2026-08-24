@@ -2,8 +2,11 @@
 Income phase for engine - ported from engine/income.py.
 
 Mechanical only (no agent decisions): +3 silver/turn per faction, +1 per
-city beyond the 2nd; a faction with zero cities gets no income and loses
-one unit instead (see _remove_first_unit below).
+city beyond the 2nd (capital + outposts both count - see setup.py/buy.py);
+a faction with zero cities gets no income and loses one unit instead (see
+_remove_first_unit below) - unreachable in practice now that capitals are
+permanent/uncapturable (see movement.py), but left as-is since it's still
+correct if that ever changes.
 """
 
 import numpy as np
@@ -17,8 +20,6 @@ def apply_income_phase(state):
     in insertion order, which create_initial_state always builds as
     0..num_factions-1, so this matches."""
     for faction in range(state.num_factions):
-        if not state.alive[faction]:
-            continue
         cities = int(np.sum(state.city_owner == faction))
         if cities == 0:
             state.silver[faction] = 0

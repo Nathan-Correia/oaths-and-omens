@@ -42,7 +42,7 @@ import numpy as np
 
 from .geometry import HexGrid
 
-TERRAIN_TYPES = ["plains", "forest", "mountain", "lake", "desert", "marsh"]
+TERRAIN_TYPES = ["plains", "mountain", "lake", "desert", "marsh"]
 TERRAIN_TO_INDEX = {t: i for i, t in enumerate(TERRAIN_TYPES)}
 IMPASSABLE_TERRAIN_INDICES = np.array(
     [TERRAIN_TO_INDEX["mountain"], TERRAIN_TO_INDEX["lake"]], dtype=np.int8
@@ -61,7 +61,8 @@ NO_ORIGIN = -1
 class ArrayState:
     grid: HexGrid
     terrain: np.ndarray          # int8[N]            - index into TERRAIN_TYPES
-    city_owner: np.ndarray       # int8[N]             - NO_FACTION if no city
+    city_owner: np.ndarray       # int8[N]             - NO_FACTION if no city; a capital or an outpost
+    is_capital: np.ndarray       # bool_[N]            - only meaningful where city_owner != NO_FACTION
     army_faction: np.ndarray     # int8[N]             - NO_FACTION if no army
     army_units: np.ndarray       # int16[N, 3]         - infantry, cavalry, archers
     frozen: np.ndarray           # bool_[N]
@@ -73,7 +74,10 @@ class ArrayState:
     battle_order: list           # [hex_index, ...] in battle-creation order - see module docstring
     silver: np.ndarray           # int32[num_factions]
     kill_xp: np.ndarray          # int32[num_factions]
-    alive: np.ndarray            # bool_[num_factions]
+    victory_points: np.ndarray   # int32[num_factions] - the win condition; see turn.py's VP_TO_WIN
+    alive: np.ndarray            # bool_[num_factions] - vestigial now that elimination is gone (always
+                                  # True, never set False); kept only so encode.py/hex_visualizer.py don't
+                                  # need their own unrelated changes
     turn_number: int
     num_factions: int
 
@@ -88,6 +92,7 @@ def new_empty(grid, num_factions):
         grid=grid,
         terrain=np.zeros(n, dtype=np.int8),
         city_owner=np.full(n, NO_FACTION, dtype=np.int8),
+        is_capital=np.zeros(n, dtype=bool),
         army_faction=np.full(n, NO_FACTION, dtype=np.int8),
         army_units=np.zeros((n, 3), dtype=np.int16),
         frozen=np.zeros(n, dtype=bool),
@@ -99,6 +104,7 @@ def new_empty(grid, num_factions):
         battle_order=[],
         silver=np.zeros(num_factions, dtype=np.int32),
         kill_xp=np.zeros(num_factions, dtype=np.int32),
+        victory_points=np.zeros(num_factions, dtype=np.int32),
         alive=np.ones(num_factions, dtype=bool),
         turn_number=0,
         num_factions=num_factions,

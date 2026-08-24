@@ -12,19 +12,27 @@ Two things a raw ArrayState doesn't have that a network needs:
      that faction's own point of view, so it never has to learn
      "faction 3 behaves like X" - only "my stuff vs. everyone else's."
 
-Per-hex features (16 numbers per hex):
-  terrain one-hot (6) + city ownership relative to the acting faction
-  (3: none / mine / enemy's) + my army units here (3, infantry/cavalry/
-  archers, /6) + enemy army units here (3, /6) + locked-in-battle flag
-  (1). "Army units here" merges the peaceful army and battle-contribution
-  cases (a hex is exactly one or the other, never both) into a single
-  pair of features rather than carrying separate always-partially-zero
-  columns for each.
+Per-hex features (NUM_TERRAIN_TYPES + 10 numbers per hex, computed as
+PER_HEX_FEATURES below rather than hardcoded - terrain types have
+changed before, e.g. forest's removal, and will again):
+  terrain one-hot (NUM_TERRAIN_TYPES) + city ownership relative to the
+  acting faction (3: none / mine / enemy's - capital vs. outpost isn't
+  distinguished here, just like real vs. structural-shot-only defense
+  isn't; revisit if that turns out to matter) + my army units here (3,
+  infantry/cavalry/archers, /6) + enemy army units here (3, /6) +
+  locked-in-battle flag (1). "Army units here" merges the peaceful army
+  and battle-contribution cases (a hex is exactly one or the other,
+  never both) into a single pair of features rather than carrying
+  separate always-partially-zero columns for each.
 
-Global features (4 numbers), not tied to any one hex: my silver, my
+Global features (6 numbers), not tied to any one hex: my silver, my
 kill-XP (both normalized against a rough scale, not a hard cap - values
-can exceed 1), fraction of OTHER factions still alive, and how far
-through the game we are (turn_number / max_turns).
+can exceed 1), fraction of OTHER factions still alive (vestigial now
+that elimination is gone - see engine/state.py's alive field docstring;
+always 1.0 in practice), how far through the game we are (turn_number /
+max_turns), my victory points, and the leading rival's victory points
+(both / VP_TO_WIN) - the actual win condition, so the network needs to
+see how close everyone is to it.
 
 SIMPLIFICATION worth knowing about: enemy presence is aggregated across
 all non-self factions into one "the enemy" signal, per hex - the network
@@ -37,14 +45,16 @@ import jax.numpy as jnp
 import numpy as np
 
 from engine.state import NO_FACTION, TERRAIN_TYPES
+from engine.turn import VP_TO_WIN
 
 NUM_TERRAIN_TYPES = len(TERRAIN_TYPES)
-PER_HEX_FEATURES = NUM_TERRAIN_TYPES + 3 + 3 + 3 + 1  # = 16
-GLOBAL_FEATURES = 4
+PER_HEX_FEATURES = NUM_TERRAIN_TYPES + 3 + 3 + 3 + 1
+GLOBAL_FEATURES = 6
 
 SILVER_SCALE = 100.0
 KILL_XP_SCALE = 20.0
 UNIT_SCALE = 6.0  # MAX_STACK_SIZE
+VP_SCALE = float(VP_TO_WIN)
 
 
 def _per_hex_army_features(state, faction):
@@ -94,12 +104,18 @@ def encode_observation(state, faction, max_turns=100):
 
     alive_others = int(np.sum(state.alive)) - (1 if state.alive[faction] else 0)
     total_others = max(1, state.num_factions - 1)
+
+    rival_vp = [int(state.victory_points[f]) for f in range(state.num_factions) if f != faction]
+    best_rival_vp = max(rival_vp) if rival_vp else 0
+
     global_feats = np.array(
         [
             float(state.silver[faction]) / SILVER_SCALE,
             float(state.kill_xp[faction]) / KILL_XP_SCALE,
             alive_others / total_others,
             float(state.turn_number) / max_turns,
+            float(state.victory_points[faction]) / VP_SCALE,
+            float(best_rival_vp) / VP_SCALE,
         ],
         dtype=np.float32,
     )
