@@ -54,7 +54,7 @@ from engine.turn import run_turn_and_log, check_game_end
 OUTPUT_FILE = "board_state.json"
 TERRAIN_LOG_FILE = "terrain_gen_log.json"
 PLACEMENT_LOG_FILE = "city_placement_log.json"
-RADIUS = 6
+RADIUS = 7
 NUM_FACTIONS = 8
 MAX_TURNS = 100
 
