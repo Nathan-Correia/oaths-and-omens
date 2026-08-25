@@ -125,6 +125,8 @@ Kill experience represents accumulated kills and cannot be hoarded indefinitely 
 | **Marsh** | Any army that enters a marsh tile is frozen and cannot move again for the rest of that turn. |
 | **Plains** | No special effect. |
 
+Mountain and lake tiles can never be placed if doing so would cut off part of the map — if a tile would seal off a pocket of the board with no passable route back to the rest of it, that tile is placed somewhere else instead. Every non-mountain, non-lake tile must stay reachable by land from every other one.
+
 ## Capitals
 
 Each player has exactly one capital, placed during setup. A capital cannot be captured or destroyed by any means: entering its tile is always treated as an attack and triggers a battle, even if the capital has no defending army of its own — the capital fights back on its own (see Defense, below) regardless.
