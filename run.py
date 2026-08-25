@@ -12,6 +12,12 @@ untrained JAX policy network; see agents/nn_agent/). Faction id -> color
 is fixed (see hex_visualizer.py's FACTION_COLORS: 0=red, 1=blue,
 2=green, 3=purple, 4=orange, 5=brown, 6=pink, 7=grey).
 
+Before any turns run, engine/placement.py's run_city_setup plays out
+colourless city placement and the capital draft - agents/nn_agent/
+doesn't implement this phase, so any faction assigned "nn" falls back
+to make_random_agents' placement/draft/swap policies here (see
+_build_nn_agents below), not inside nn_agent/ itself.
+
 File shape:
 {
   "radius": int, "num_factions": int,
@@ -23,6 +29,12 @@ Also writes terrain_gen_log.json - every individual hex placement made
 while generating the board's terrain, in order (see
 engine/setup.py:generate_terrain), for hex_gen.py to step through.
 File shape: {"radius": int, "steps": [{"q","r","s","terrain","round"}, ...]}
+
+Also writes city_placement_log.json - every individual placement/draft
+step made while running engine/placement.py:run_city_setup, in order,
+for city_placement_visualizer.py to step through. File shape:
+{"radius": int, "num_factions": int, "terrain": {"q_r_s": terrain_str, ...},
+ "steps": [{"type","faction","q","r","s", ...}, ...]}  # see run_city_setup's docstring
 """
 
 import json
@@ -33,12 +45,14 @@ from agents import compose_agents
 from agents.heuristic_agent import make_heuristic_agents
 from agents.random_agent import make_random_agents
 from agents.smart_random_agent import make_smart_random_agents
+from engine.placement import run_city_setup
 from engine.setup import create_initial_state
 from engine.state import TERRAIN_TYPES
 from engine.turn import run_turn_and_log, check_game_end
 
 OUTPUT_FILE = "board_state.json"
 TERRAIN_LOG_FILE = "terrain_gen_log.json"
+PLACEMENT_LOG_FILE = "city_placement_log.json"
 RADIUS = 7
 NUM_FACTIONS = 8
 MAX_TURNS = 100
@@ -54,7 +68,10 @@ AGENT_ASSIGNMENT = {f: "random" for f in range(NUM_FACTIONS)}
 
 def _build_nn_agents(state):
     """Lazily pulls in jax/agents.nn_agent - only paid for if AGENT_ASSIGNMENT
-    actually uses "nn" for at least one faction."""
+    actually uses "nn" for at least one faction. nn_agent doesn't
+    implement the placement/draft/swap setup phase, so those three are
+    padded on here from make_random_agents instead - keeps nn_agent/
+    itself untouched by engine/placement.py entirely."""
     import jax
 
     from agents.nn_agent.agent import make_nn_agents
@@ -62,7 +79,9 @@ def _build_nn_agents(state):
 
     rng_key = jax.random.PRNGKey(SEED)
     network, params = init_params(rng_key, state.num_hexes, NUM_FACTIONS)
-    return make_nn_agents(network, params, NUM_FACTIONS, seed=SEED, max_turns=MAX_TURNS)
+    nn_five = make_nn_agents(network, params, NUM_FACTIONS, seed=SEED, max_turns=MAX_TURNS)
+    setup_three = make_random_agents(NUM_FACTIONS, seed=SEED)[5:]
+    return nn_five + setup_three
 
 
 def main():
@@ -73,20 +92,28 @@ def main():
     with open(TERRAIN_LOG_FILE, "w") as f:
         json.dump({"radius": RADIUS, "steps": terrain_log}, f)
 
+    terrain_map = {
+        f"{q}_{r}_{s}": TERRAIN_TYPES[int(t)]
+        for (q, r, s), t in zip(state.grid.coords, state.terrain)
+    }
+
     build_fns = {
         "random": lambda: make_random_agents(NUM_FACTIONS, seed=SEED),
         "smart_random": lambda: make_smart_random_agents(NUM_FACTIONS, seed=SEED),
         "heuristic": lambda: make_heuristic_agents(NUM_FACTIONS, seed=SEED),
         "nn": lambda: _build_nn_agents(state),
     }
-    decide_buy, decide_movement, decide_cavalry, decide_target, decide_rectification = compose_agents(
-        AGENT_ASSIGNMENT, build_fns,
-    )
+    (decide_buy, decide_movement, decide_cavalry, decide_target, decide_rectification,
+     decide_placement, decide_draft, decide_swap) = compose_agents(AGENT_ASSIGNMENT, build_fns)
 
-    terrain_map = {
-        f"{q}_{r}_{s}": TERRAIN_TYPES[int(t)]
-        for (q, r, s), t in zip(state.grid.coords, state.terrain)
-    }
+    placement_log = []
+    state = run_city_setup(state, decide_placement, decide_draft, decide_swap, rng, log=placement_log)
+
+    with open(PLACEMENT_LOG_FILE, "w") as f:
+        json.dump({
+            "radius": RADIUS, "num_factions": NUM_FACTIONS,
+            "terrain": terrain_map, "steps": placement_log,
+        }, f)
 
     turns = []
     while not check_game_end(state, max_turns=MAX_TURNS):
@@ -104,7 +131,7 @@ def main():
     with open(OUTPUT_FILE, "w") as f:
         json.dump(json_dict, f)
 
-    print(f"Ran {len(turns)} turns (seed={SEED}), wrote {OUTPUT_FILE} and {TERRAIN_LOG_FILE}")
+    print(f"Ran {len(turns)} turns (seed={SEED}), wrote {OUTPUT_FILE}, {TERRAIN_LOG_FILE}, and {PLACEMENT_LOG_FILE}")
 
 
 if __name__ == "__main__":

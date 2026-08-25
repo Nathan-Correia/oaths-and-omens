@@ -17,6 +17,16 @@ exactly the same two ways as v1:
 
 Battle targeting and rectification are reused unchanged from
 random_agent.py, matching v1's inheritance chain.
+
+  3. Setup phase (see engine/placement.py): places its colourless city on
+     whichever legal hex is farthest from the nearest already-placed
+     city (the same "farthest point" idea engine/setup.py used to apply
+     automatically, now expressed as an agent choice), drafts whichever
+     legal pool city is farthest from the nearest already-claimed
+     capital (a simple defensibility-flavored greedy pick), and swaps
+     only when that's a strict improvement over the leftover. All three
+     are single-shot greedy picks, same "greedy, not globally optimal"
+     spirit as greedy_move_largest_army above.
 """
 
 import random
@@ -88,10 +98,45 @@ def smart_buy(state, faction, legal, rng):
     return chosen
 
 
+def _nearest_dist(grid, hex_index, other_hexes):
+    """Hex distance from hex_index to the nearest hex in other_hexes."""
+    coord = grid.coord_of(hex_index)
+    return min(hex_distance(coord, grid.coord_of(h)) for h in other_hexes)
+
+
+def smart_placement(state, legal_mask):
+    grid = state.grid
+    candidates = np.nonzero(legal_mask)[0].tolist()
+    placed = np.nonzero(state.city_placer != NO_FACTION)[0].tolist()
+    if not placed:
+        return candidates[0]
+    return max(candidates, key=lambda h: _nearest_dist(grid, h, placed))
+
+
+def smart_draft(state, legal_pool):
+    grid = state.grid
+    claimed = np.nonzero(state.city_owner != NO_FACTION)[0].tolist()
+    if not claimed:
+        return legal_pool[0]
+    return max(legal_pool, key=lambda h: _nearest_dist(grid, h, claimed))
+
+
+def smart_swap(state, leftover_hex, placer_hex):
+    grid = state.grid
+    others = [
+        h for h in np.nonzero(state.city_owner != NO_FACTION)[0].tolist()
+        if h not in (leftover_hex, placer_hex)
+    ]
+    if not others:
+        return False
+    return _nearest_dist(grid, placer_hex, others) > _nearest_dist(grid, leftover_hex, others)
+
+
 def make_smart_random_agents(num_factions, seed=0):
     """Returns (decide_buy, decide_movement, decide_cavalry, decide_target,
-    decide_rectification) - each {faction: callable}, matching
-    engine.turn.run_turn's expected signatures."""
+    decide_rectification, decide_placement, decide_draft, decide_swap) -
+    each {faction: callable}, matching engine.turn.run_turn's and
+    engine.placement.run_city_setup's expected signatures."""
     rngs = {f: random.Random(seed * 1_000_003 + f) for f in range(num_factions)}
 
     def decide_buy(state, faction, legal):
@@ -109,6 +154,15 @@ def make_smart_random_agents(num_factions, seed=0):
     def decide_rectification(state, hex_index, winner_faction, cap):
         return random_rectification(state, hex_index, winner_faction, cap, rngs[winner_faction])
 
+    def decide_placement(state, faction, legal_mask):
+        return smart_placement(state, legal_mask)
+
+    def decide_draft(state, faction, legal_pool):
+        return smart_draft(state, legal_pool)
+
+    def decide_swap(state, faction, leftover_hex, placer_faction, placer_hex):
+        return smart_swap(state, leftover_hex, placer_hex)
+
     factions = range(num_factions)
     return (
         {f: decide_buy for f in factions},
@@ -116,4 +170,7 @@ def make_smart_random_agents(num_factions, seed=0):
         {f: decide_cavalry for f in factions},
         {f: decide_target for f in factions},
         {f: decide_rectification for f in factions},
+        {f: decide_placement for f in factions},
+        {f: decide_draft for f in factions},
+        {f: decide_swap for f in factions},
     )

@@ -20,14 +20,18 @@ The map is built from hexagonal tiles. A standard board uses 217 hexagons; the f
 
 ## Game Setup
 
-The starting player is determined by a high dice roll. That player places their capital on any tile of their choosing. Play then proceeds clockwise, with each remaining player placing their capital in turn.
+Capitals are placed and assigned in two steps: placement, then a draft.
 
-Capital placement restrictions:
-- A capital must be at least 3 tiles from any opponent's capital.
-- With 5–7 players, capitals cannot be placed on edge tiles.
-- With 8–10 players, capitals may be placed on edge tiles.
+**Placement**: randomize a placement order. In that order, each player places one colourless (unowned) city on any tile of their choosing, subject to the usual restrictions:
+- A colourless city must be at least 3 tiles from any other colourless city already placed.
+- With 5–7 players, cities cannot be placed on edge tiles.
+- With 8–10 players, cities may be placed on edge tiles.
 
-After every capital is placed, players may rearrange their starting positions to sit closer to their own capital.
+**Draft**: once every city is placed, randomize a separate draft order (independent of the placement order). In that order, each player claims one already-placed city as their capital — never the one they placed themselves.
+
+When only one player and one city are left: if it's the city that player placed, they simply get it — there's no decision to make. Otherwise, that leftover city was placed by some other player who already drafted a different city earlier. The last player chooses: keep the leftover city, or force a swap — take the city the placer already drafted, bumping the placer onto the leftover instead.
+
+After every capital is settled, players may rearrange their starting positions to sit closer to their own capital.
 
 Each player begins the game with 50 silver and 2 kill experience, awarded once at the very first buy phase instead of that turn's regular income.
 

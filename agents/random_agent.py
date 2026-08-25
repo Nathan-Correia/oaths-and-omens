@@ -17,6 +17,14 @@ smart_random_agent.py and heuristic_agent.py, mirroring v1's
 SmartRandomAgent/HeuristicAgent inheriting these two unchanged from
 RandomAgent - neither battle targeting nor rectification needs to be
 smart.
+
+decide_placement/decide_draft/decide_swap (see engine/placement.py's
+module docstring for the full setup process and each signature) are
+genuinely uniform-random here, same spirit as everything else in this
+file - and, since agents/nn_agent/ doesn't implement this phase at all,
+these three are also what run.py/profile_engine.py fall back to for any
+faction assigned "nn", wired at the driver-script level rather than
+inside nn_agent/.
 """
 
 import random
@@ -75,12 +83,26 @@ def random_buy(legal, rng, max_actions=3):
     return rng.sample(legal, n) if n > 0 else []
 
 
+def random_placement(rng, legal_mask):
+    candidates = np.nonzero(legal_mask)[0]
+    return int(rng.choice(candidates.tolist()))
+
+
+def random_draft(rng, legal_pool):
+    return rng.choice(legal_pool)
+
+
+def random_swap(rng):
+    return rng.random() < 0.5
+
+
 def make_random_agents(num_factions, seed=0):
     """Returns (decide_buy, decide_movement, decide_cavalry, decide_target,
-    decide_rectification) - each {faction: callable}, matching
-    engine.turn.run_turn's expected signatures. Each faction gets its
-    own random.Random (mirrors v1's per-agent rng), keyed off `seed` so a
-    whole game's agent decisions are reproducible."""
+    decide_rectification, decide_placement, decide_draft, decide_swap) -
+    each {faction: callable}, matching engine.turn.run_turn's and
+    engine.placement.run_city_setup's expected signatures. Each faction
+    gets its own random.Random (mirrors v1's per-agent rng), keyed off
+    `seed` so a whole game's agent decisions are reproducible."""
     rngs = {f: random.Random(seed * 1_000_003 + f) for f in range(num_factions)}
 
     def decide_buy(state, faction, legal):
@@ -98,6 +120,15 @@ def make_random_agents(num_factions, seed=0):
     def decide_rectification(state, hex_index, winner_faction, cap):
         return random_rectification(state, hex_index, winner_faction, cap, rngs[winner_faction])
 
+    def decide_placement(state, faction, legal_mask):
+        return random_placement(rngs[faction], legal_mask)
+
+    def decide_draft(state, faction, legal_pool):
+        return random_draft(rngs[faction], legal_pool)
+
+    def decide_swap(state, faction, leftover_hex, placer_faction, placer_hex):
+        return random_swap(rngs[faction])
+
     factions = range(num_factions)
     return (
         {f: decide_buy for f in factions},
@@ -105,4 +136,7 @@ def make_random_agents(num_factions, seed=0):
         {f: decide_cavalry for f in factions},
         {f: decide_target for f in factions},
         {f: decide_rectification for f in factions},
+        {f: decide_placement for f in factions},
+        {f: decide_draft for f in factions},
+        {f: decide_swap for f in factions},
     )

@@ -80,6 +80,13 @@ class HexGrid:
     def coord_of(self, index):
         return self.coords[index]
 
+    def is_edge(self, index):
+        """True iff hex `index` sits on the outer ring of the board - the
+        max absolute cube coordinate equals the board radius. Used by
+        setup.py's terrain generation (picks an edge hex to start from)
+        and placement.py's edge-tile placement ban."""
+        return max(abs(c) for c in self.coords[index]) == self.radius
+
     def direction_between(self, from_index, to_index):
         """Which of the 6 directions leads from from_index to to_index,
         or None if they aren't neighbors. Only used by tests/tools that

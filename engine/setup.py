@@ -1,32 +1,28 @@
 """
 Builds an initial ArrayState for a new game - ported from engine/setup.py's
-create_initial_state. Same algorithm (random terrain, farthest-point
-capital spread, starting silver/kill-XP), just writing directly into
-ArrayState's numpy arrays instead of a dict-of-HexState board, so engine
-can create a game without going through v1 at all.
+create_initial_state. Same terrain-generation algorithm, just writing
+directly into ArrayState's numpy arrays instead of a dict-of-HexState
+board, so engine can create a game without going through v1 at all.
 
-Each faction gets exactly one city (its capital) now, not two - real
-placement-quality decision-making (letting agents choose where to settle)
-is a separate milestone; for now this just keeps the existing
-farthest-point spread heuristic, with CAPITAL_MIN_DIST enforced as a hard
-floor on top of it (see the home_indices loop below); a placement-order
-tiebreak for the VP win condition would build on top of this once that
-milestone lands (see turn.py's get_game_winner).
+Capital placement is NOT done here - create_initial_state only generates
+terrain and seeds starting silver/kill-XP, leaving city_owner/is_capital/
+city_placer untouched (all NO_FACTION/False) for placement.py's
+run_city_setup to fill in as a real agent-driven decision (colourless
+placement, then a draft) rather than the farthest-point heuristic this
+module used to apply automatically. See placement.py's module docstring
+for that process, and turn.py's get_game_winner for the placement-order
+tiebreak it unlocks.
 """
 
 import random
 
 import numpy as np
 
-from .geometry import HexGrid, hex_distance
-from .state import TERRAIN_TYPES, TERRAIN_TO_INDEX, NO_FACTION, new_empty
+from .geometry import HexGrid
+from .state import TERRAIN_TO_INDEX, new_empty
 
 STARTING_SILVER = 50
 STARTING_KILL_XP = 2
-CAPITAL_MIN_DIST = 3  # minimum hex distance between any two players' capitals
-
-_IMPASSABLE = ("mountain", "lake")
-_PASSABLE_TERRAIN = [t for t in TERRAIN_TYPES if t not in _IMPASSABLE]
 
 _UNSET = -1
 
@@ -128,10 +124,7 @@ def generate_terrain(grid, rng, log=None):
     unset = set(range(grid.num_hexes))
     bag = dict(BAG_COUNTS)
 
-    edge_hexes = [
-        i for i in unset
-        if max(abs(c) for c in grid.coords[i]) == grid.radius
-    ]
+    edge_hexes = [i for i in unset if grid.is_edge(i)]
     start = rng.choice(edge_hexes)
 
     round_index = 0
@@ -162,29 +155,7 @@ def create_initial_state(radius=8, num_factions=8, seed=42, terrain_log=None):
 
     state.terrain[:] = generate_terrain(grid, rng, log=terrain_log)
 
-    def ensure_passable(i):
-        if TERRAIN_TYPES[state.terrain[i]] in _IMPASSABLE:
-            state.terrain[i] = TERRAIN_TO_INDEX[rng.choice(_PASSABLE_TERRAIN)]
-
-    all_indices = list(range(grid.num_hexes))
-    home_indices = [rng.choice(all_indices)]
-    for _ in range(num_factions - 1):
-        def min_dist_to_homes(i):
-            return min(hex_distance(grid.coord_of(i), grid.coord_of(h)) for h in home_indices)
-
-        # Enforce CAPITAL_MIN_DIST as a hard floor, not just something the
-        # farthest-point heuristic below usually happens to satisfy; if the
-        # board's too small/crowded for every faction to clear it, fall back
-        # to picking among every hex (still farthest-point, just no floor).
-        candidates = [i for i in all_indices if min_dist_to_homes(i) >= CAPITAL_MIN_DIST] or all_indices
-        best_index = max(candidates, key=lambda i: min_dist_to_homes(i) + rng.random() * 0.01)
-        home_indices.append(best_index)
-
-    for faction, home in enumerate(home_indices):
-        ensure_passable(home)
-        state.city_owner[home] = faction
-        state.is_capital[home] = True
-
+    for faction in range(num_factions):
         state.silver[faction] = STARTING_SILVER
         state.kill_xp[faction] = STARTING_KILL_XP
 

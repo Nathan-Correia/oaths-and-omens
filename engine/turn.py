@@ -139,22 +139,19 @@ def apply_victory_points(state):
 def get_game_winner(state):
     """None until some faction's VP total has reached VP_TO_WIN. Among
     every faction at or above VP_TO_WIN, the strict highest total wins
-    outright; an exact tie for the top total should be broken by whoever
-    placed their capital later (see rulebook's Win Condition) - capital
-    placement isn't agent-driven yet (see setup.py), so there's no
-    placement order to compare, and a tied leader is instead picked
-    uniformly at random for now."""
+    outright; an exact tie for the top total is broken by whoever placed
+    their capital later (see rulebook's Win Condition), using
+    state.capital_settle_order - set once per faction by
+    placement.py's run_city_setup, a single incrementing counter, so no
+    two factions can ever tie on it and no further randomness is needed
+    here."""
     top = int(np.max(state.victory_points))
     if top < VP_TO_WIN:
         return None
     contenders = [f for f in range(state.num_factions) if int(state.victory_points[f]) == top]
     if len(contenders) == 1:
         return contenders[0]
-    # Seeded off turn_number + the tied factions themselves (not a bare
-    # random.choice off Python's global, unseeded random state) so a game
-    # replayed from the same seed reaches the same tie-break, matching
-    # every other rng use in this codebase.
-    return random.Random((state.turn_number, tuple(contenders))).choice(contenders)
+    return max(contenders, key=lambda f: int(state.capital_settle_order[f]))
 
 
 def run_turn(state, decide_buy, decide_movement, decide_cavalry, decide_target, decide_rectification, rng=None):

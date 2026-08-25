@@ -63,6 +63,14 @@ class ArrayState:
     terrain: np.ndarray          # int8[N]            - index into TERRAIN_TYPES
     city_owner: np.ndarray       # int8[N]             - NO_FACTION if no city; a capital or an outpost
     is_capital: np.ndarray       # bool_[N]            - only meaningful where city_owner != NO_FACTION
+    city_placer: np.ndarray      # int8[N]             - which faction placed the colourless city here
+                                  # during setup (see placement.py's run_city_setup); NO_FACTION if no
+                                  # city was ever placed on this hex. Left populated (harmless) once
+                                  # setup finishes - city_owner/is_capital are authoritative from then on.
+    capital_settle_order: np.ndarray  # int32[num_factions] - the order (0, 1, 2, ...) each faction's
+                                  # final capital was settled in during the draft (see
+                                  # placement.py's run_city_setup); -1 before setup runs. Used by
+                                  # turn.py's get_game_winner to break a tied-VP finish.
     army_faction: np.ndarray     # int8[N]             - NO_FACTION if no army
     army_units: np.ndarray       # int16[N, 3]         - infantry, cavalry, archers
     frozen: np.ndarray           # bool_[N]
@@ -93,6 +101,8 @@ def new_empty(grid, num_factions):
         terrain=np.zeros(n, dtype=np.int8),
         city_owner=np.full(n, NO_FACTION, dtype=np.int8),
         is_capital=np.zeros(n, dtype=bool),
+        city_placer=np.full(n, NO_FACTION, dtype=np.int8),
+        capital_settle_order=np.full(num_factions, -1, dtype=np.int32),
         army_faction=np.full(n, NO_FACTION, dtype=np.int8),
         army_units=np.zeros((n, 3), dtype=np.int16),
         frozen=np.zeros(n, dtype=bool),

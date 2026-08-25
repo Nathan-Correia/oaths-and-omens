@@ -17,16 +17,22 @@ five dicts run_turn expects.
 def compose_agents(assignment, build_fns):
     """assignment: {faction: agent_key}. build_fns: {agent_key: () ->
     (decide_buy, decide_movement, decide_cavalry, decide_target,
-    decide_rectification)}, one zero-arg builder per agent kind - called
-    at most once each, and only for kinds actually referenced in
+    decide_rectification, ...)}, one zero-arg builder per agent kind -
+    called at most once each, and only for kinds actually referenced in
     `assignment` (so e.g. picking "nn" for zero factions never imports
-    jax). Returns the same 5-tuple shape, stitched together faction by
-    faction from whichever kind that faction was assigned."""
-    combined = ({}, {}, {}, {}, {})
+    jax). Returns the same tuple shape every build_fns[key]() returns
+    (arity inferred from whichever kind gets built first - callers use
+    this both for the original 5-tuple of turn.py decisions and for an
+    8-tuple that also covers placement.py's setup-phase decisions),
+    stitched together faction by faction from whichever kind that
+    faction was assigned."""
+    combined = None
     built = {}
     for faction, key in assignment.items():
         if key not in built:
             built[key] = build_fns[key]()
+        if combined is None:
+            combined = tuple({} for _ in built[key])
         for combined_dict, source_dict in zip(combined, built[key]):
             combined_dict[faction] = source_dict[faction]
     return combined

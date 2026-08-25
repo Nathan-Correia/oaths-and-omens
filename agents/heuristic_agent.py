@@ -26,6 +26,17 @@ separate constraint to enforce), in priority order:
 
 A small amount of randomness is mixed in for flavor (RANDOM_MOVE_CHANCE)
 so games don't all look mechanically identical.
+
+Setup phase (see engine/placement.py): unlike targeting/rectification,
+placement/draft genuinely matters tactically, so this gets real judgment
+rather than reusing random_agent.py or smart_random_agent.py wholesale.
+Shares smart_random_agent's "farthest from the nearest other city" core
+(placement: farthest from every already-placed city; draft: farthest
+from every already-claimed capital) but adds a defensibility tie-break on
+top: among equally-far options, prefers the hex with fewer passable
+neighbors - a corner/coastline position with fewer open approaches is
+genuinely harder to attack. Swap uses the same (distance, tie-break)
+comparison between the leftover and what the placer currently holds.
 """
 
 import random
@@ -34,7 +45,7 @@ import numpy as np
 
 from .random_agent import random_rectification, random_target
 from engine.geometry import hex_distance
-from engine.state import NO_FACTION, count_units_in_play
+from engine.state import IMPASSABLE_TERRAIN_INDICES, NO_FACTION, count_units_in_play
 
 RANDOM_MOVE_CHANCE = 0.12          # flavor noise: chance to ignore the heuristic and act randomly
 RETREAT_THRESHOLD = 0.85           # retreat if our army is weaker than this fraction of the threat
@@ -163,10 +174,66 @@ def heuristic_move(state, faction, legal_mask, rng):
     return None
 
 
+def _nearest_dist(grid, hex_index, other_hexes):
+    """Hex distance from hex_index to the nearest hex in other_hexes."""
+    coord = grid.coord_of(hex_index)
+    return min(hex_distance(coord, grid.coord_of(h)) for h in other_hexes)
+
+
+def _passable_neighbor_count(state, hex_index):
+    """How many of hex_index's on-board neighbors are passable terrain -
+    fewer means a more defensible corner/coastline position. Mirrors
+    movement.py's terrain-passable check."""
+    grid = state.grid
+    neighbors = grid.neighbor_table[hex_index]
+    valid = neighbors[neighbors != -1]
+    if len(valid) == 0:
+        return 0
+    return int(np.isin(state.terrain[valid], IMPASSABLE_TERRAIN_INDICES, invert=True).sum())
+
+
+def heuristic_placement(state, legal_mask):
+    grid = state.grid
+    candidates = np.nonzero(legal_mask)[0].tolist()
+    placed = np.nonzero(state.city_placer != NO_FACTION)[0].tolist()
+    if not placed:
+        return min(candidates, key=lambda h: _passable_neighbor_count(state, h))
+    return max(
+        candidates,
+        key=lambda h: (_nearest_dist(grid, h, placed), -_passable_neighbor_count(state, h)),
+    )
+
+
+def heuristic_draft(state, legal_pool):
+    grid = state.grid
+    claimed = np.nonzero(state.city_owner != NO_FACTION)[0].tolist()
+    if not claimed:
+        return min(legal_pool, key=lambda h: _passable_neighbor_count(state, h))
+    return max(
+        legal_pool,
+        key=lambda h: (_nearest_dist(grid, h, claimed), -_passable_neighbor_count(state, h)),
+    )
+
+
+def heuristic_swap(state, leftover_hex, placer_hex):
+    grid = state.grid
+    others = [
+        h for h in np.nonzero(state.city_owner != NO_FACTION)[0].tolist()
+        if h not in (leftover_hex, placer_hex)
+    ]
+
+    def score(h):
+        dist = _nearest_dist(grid, h, others) if others else 0
+        return dist, -_passable_neighbor_count(state, h)
+
+    return score(placer_hex) > score(leftover_hex)
+
+
 def make_heuristic_agents(num_factions, seed=0):
     """Returns (decide_buy, decide_movement, decide_cavalry, decide_target,
-    decide_rectification) - each {faction: callable}, matching
-    engine.turn.run_turn's expected signatures."""
+    decide_rectification, decide_placement, decide_draft, decide_swap) -
+    each {faction: callable}, matching engine.turn.run_turn's and
+    engine.placement.run_city_setup's expected signatures."""
     rngs = {f: random.Random(seed * 1_000_003 + f) for f in range(num_factions)}
 
     def decide_buy(state, faction, legal):
@@ -184,6 +251,15 @@ def make_heuristic_agents(num_factions, seed=0):
     def decide_rectification(state, hex_index, winner_faction, cap):
         return random_rectification(state, hex_index, winner_faction, cap, rngs[winner_faction])
 
+    def decide_placement(state, faction, legal_mask):
+        return heuristic_placement(state, legal_mask)
+
+    def decide_draft(state, faction, legal_pool):
+        return heuristic_draft(state, legal_pool)
+
+    def decide_swap(state, faction, leftover_hex, placer_faction, placer_hex):
+        return heuristic_swap(state, leftover_hex, placer_hex)
+
     factions = range(num_factions)
     return (
         {f: decide_buy for f in factions},
@@ -191,4 +267,7 @@ def make_heuristic_agents(num_factions, seed=0):
         {f: decide_cavalry for f in factions},
         {f: decide_target for f in factions},
         {f: decide_rectification for f in factions},
+        {f: decide_placement for f in factions},
+        {f: decide_draft for f in factions},
+        {f: decide_swap for f in factions},
     )

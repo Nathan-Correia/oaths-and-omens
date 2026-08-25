@@ -22,6 +22,7 @@ from agents import compose_agents
 from agents.heuristic_agent import make_heuristic_agents
 from agents.random_agent import make_random_agents
 from agents.smart_random_agent import make_smart_random_agents
+from engine.placement import run_city_setup
 from engine.setup import create_initial_state
 from engine.turn import run_turn, run_turn_and_log, check_game_end
 
@@ -42,7 +43,9 @@ def _build_nn_agents(state):
 
     rng_key = jax.random.PRNGKey(SEED)
     network, params = init_params(rng_key, state.num_hexes, NUM_FACTIONS)
-    return make_nn_agents(network, params, NUM_FACTIONS, seed=SEED, max_turns=MAX_TURNS)
+    nn_five = make_nn_agents(network, params, NUM_FACTIONS, seed=SEED, max_turns=MAX_TURNS)
+    setup_three = make_random_agents(NUM_FACTIONS, seed=SEED)[5:]
+    return nn_five + setup_three
 
 
 def make_game():
@@ -55,7 +58,8 @@ def make_game():
     }
     agents = compose_agents(AGENT_ASSIGNMENT, build_fns)
     rng = random.Random(SEED + 1)
-    return state, agents, rng
+    state = run_city_setup(state, *agents[5:], rng)
+    return state, agents[:5], rng
 
 
 def run_plain():
