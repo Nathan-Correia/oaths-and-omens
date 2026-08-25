@@ -3,21 +3,26 @@ Buy phase for engine - ported from engine/buy.py, plus a new third
 purchase kind (build_outpost) for the outposts/VP ruleset.
 
 Three kinds of purchases, atomic (one unit each): buy_infantry (spend 2
-silver at an owned, undefended-by-adjacent-enemy city - capital or
-outpost, both use city_owner the same way), convert_to_special (spend 1
-kill-XP + 1 silver to convert an existing infantry unit into
-cavalry/archers), and build_outpost (spend 3 silver + consume 1 unit
-already standing on the target hex to found a new outpost there). The
-first two are subject to the 24/12/12 concurrent SPAWN_CAPS;
-build_outpost is subject to OUTPOST_CAP instead (how many outposts one
-faction may have standing at once) plus the placement-distance rules in
-_can_build_outpost.
+silver at an owned city - capital or outpost, both use city_owner the
+same way), convert_to_special (spend 1 kill-XP + 1 silver to convert an
+existing infantry unit into cavalry/archers), and build_outpost (spend 3
+silver + consume 1 unit already standing on the target hex to found a
+new outpost there). The first two are subject to the 24/12/12 concurrent
+SPAWN_CAPS; build_outpost is subject to OUTPOST_CAP instead (how many
+outposts one faction may have standing at once) plus the
+placement-distance rules in _can_build_outpost.
+
+RULE CHANGE - siege: buy_infantry's undefended-by-adjacent-enemy
+requirement only applies at an outpost now, not a capital - a capital
+can always recruit infantry regardless of what's adjacent to it (see
+_adjacent_enemy_present's call sites below, both now gated on
+`not is_capital`).
 
 Recruiting at an outpost (buy_infantry there) is capped at 1 per turn -
 enforced in apply_buy_phase, not here, since it's a per-turn-batch
 property rather than a single action's own legality. Capitals have no
-such cap (buy_infantry there is limited only by silver/SPAWN_CAPS/
-adjacency, same as before this ruleset existed).
+such cap (buy_infantry there is limited only by silver/SPAWN_CAPS, not
+even adjacency anymore - see the RULE CHANGE note above).
 
 SCOPE: actions use the same atomic representation as v1 (hex identified
 by index instead of coordinate) rather than the fixed/masked action-space
@@ -108,7 +113,7 @@ def get_legal_buy_actions(state, faction):
         city_hexes = np.nonzero((state.city_owner == faction) & ~state.locked)[0]
         for hex_index in city_hexes:
             hex_index = int(hex_index)
-            if not _adjacent_enemy_present(state, hex_index, faction):
+            if state.is_capital[hex_index] or not _adjacent_enemy_present(state, hex_index, faction):
                 actions.append({"type": "buy_infantry", "city_hex": hex_index})
 
     if state.kill_xp[faction] > 0 and state.silver[faction] >= 1:
@@ -138,12 +143,13 @@ def _apply_one(state, faction, action, counts, enemy_adjacent_cache):
         if state.city_owner[hex_index] != faction or state.locked[hex_index]:
             return False
 
-        adjacent_enemy = enemy_adjacent_cache.get(hex_index)
-        if adjacent_enemy is None:
-            adjacent_enemy = _adjacent_enemy_present(state, hex_index, faction)
-            enemy_adjacent_cache[hex_index] = adjacent_enemy
-        if adjacent_enemy:
-            return False
+        if not state.is_capital[hex_index]:
+            adjacent_enemy = enemy_adjacent_cache.get(hex_index)
+            if adjacent_enemy is None:
+                adjacent_enemy = _adjacent_enemy_present(state, hex_index, faction)
+                enemy_adjacent_cache[hex_index] = adjacent_enemy
+            if adjacent_enemy:
+                return False
 
         if state.silver[faction] < INFANTRY_COST or _remaining_cap(counts, 0) <= 0:
             return False

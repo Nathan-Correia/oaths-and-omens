@@ -41,7 +41,7 @@ Each turn begins with a buy phase, right after income is collected.
 
 **Income**: every player collects 3 silver per turn. If a player controls more than 2 cities, they earn an additional 1 silver for every city beyond their second (your capital and any outposts you control both count as cities here). A player with no cities remaining earns no income and instead loses 1 unit every turn — in practice this can no longer happen, since your capital cannot be captured or destroyed (see Capitals).
 
-**Buying units**: infantry cost 2 silver each and can be purchased at any city you control, as long as no enemy units occupy a tile orthogonally adjacent to that city. An outpost is limited to recruiting at most 1 new infantry this way per turn; your capital has no such limit (see Outposts). Cavalry and archers cannot be purchased with silver — they can only be acquired by trading in kill experience (see below).
+**Buying units**: infantry cost 2 silver each. Your capital can always recruit infantry, no matter what's adjacent to it. An outpost can only recruit infantry if no enemy units occupy a tile orthogonally adjacent to it, and is limited to at most 1 new infantry this way per turn; your capital has neither restriction (see Outposts). Cavalry and archers cannot be purchased with silver — they can only be acquired by trading in kill experience (see below).
 
 **Production limits**: each player may have at most 24 infantry, 12 cavalry, and 12 archers in play at once. This is a concurrent limit, not a lifetime total — losing a unit immediately frees up capacity to field another of that type.
 
@@ -143,7 +143,7 @@ Outposts are smaller, disposable extensions of a player's territory — unlike a
 
 **Placement restrictions**: an outpost cannot be built within 2 tiles of your own capital, within 1 tile of any other player's capital, or within 1 tile of any existing outpost — yours or anyone else's.
 
-**Recruiting**: infantry may be purchased at an outpost exactly like at a capital (2 silver, same no-adjacent-enemy restriction), but at most 1 new infantry may be recruited per outpost per turn. A capital has no such limit.
+**Recruiting**: infantry may be purchased at an outpost for 2 silver, same as at a capital, but only if no enemy units occupy a tile orthogonally adjacent to it, and at most 1 new infantry may be recruited per outpost per turn. A capital has neither restriction.
 
 **Destruction**: entering a tile with an enemy outpost is always treated as an attack and triggers a battle, even if the outpost has no defending army of its own. If, once the battle ends, no other faction's units remain on that tile besides the winner's, the outpost is destroyed — its owner loses it, and the winner does not take ownership of it, but does keep standing there as normal (no forced eviction, unlike a capital).
 
