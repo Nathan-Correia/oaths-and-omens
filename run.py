@@ -7,8 +7,8 @@ steps, battle) - see that module's docstring for why these are
 independent snapshots rather than incremental diffs.
 
 Agent mix is configurable per faction via AGENT_ASSIGNMENT below - any
-mix of "random"/"smart_random"/"heuristic"/"nn" (a randomly-initialized,
-untrained JAX policy network; see agents/nn_agent/). Faction id -> color
+mix of "random"/"smart_random"/"heuristic"/"greedy"/"nn" (a randomly-
+initialized, untrained JAX policy network; see agents/nn_agent/). Faction id -> color
 is fixed (see hex_visualizer.py's FACTION_COLORS: 0=red, 1=blue,
 2=green, 3=purple, 4=orange, 5=brown, 6=pink, 7=grey).
 
@@ -42,6 +42,7 @@ import random
 import time
 
 from agents import compose_agents
+from agents.greedy_agent import make_greedy_agents
 from agents.heuristic_agent import make_heuristic_agents
 from agents.random_agent import make_random_agents
 from agents.smart_random_agent import make_smart_random_agents
@@ -53,7 +54,7 @@ from engine.turn import run_turn_and_log, check_game_end
 OUTPUT_FILE = "board_state.json"
 TERRAIN_LOG_FILE = "terrain_gen_log.json"
 PLACEMENT_LOG_FILE = "city_placement_log.json"
-RADIUS = 7
+RADIUS = 6
 NUM_FACTIONS = 8
 MAX_TURNS = 100
 
@@ -62,8 +63,8 @@ MAX_TURNS = 100
 # hardcoding this value back in, if that's ever useful for debugging.
 SEED = int(time.time() * 1000) % (2 ** 31)
 
-# Per-faction agent choice - any of "random", "smart_random", "heuristic", "nn".
-AGENT_ASSIGNMENT = {f: "random" for f in range(NUM_FACTIONS)}
+# Per-faction agent choice - any of "random", "smart_random", "heuristic", "greedy", "nn".
+AGENT_ASSIGNMENT = {f: "greedy" for f in range(NUM_FACTIONS)}
 
 
 def _build_nn_agents(state):
@@ -101,6 +102,7 @@ def main():
         "random": lambda: make_random_agents(NUM_FACTIONS, seed=SEED),
         "smart_random": lambda: make_smart_random_agents(NUM_FACTIONS, seed=SEED),
         "heuristic": lambda: make_heuristic_agents(NUM_FACTIONS, seed=SEED),
+        "greedy": lambda: make_greedy_agents(NUM_FACTIONS, seed=SEED),
         "nn": lambda: _build_nn_agents(state),
     }
     (decide_buy, decide_movement, decide_cavalry, decide_target, decide_rectification,

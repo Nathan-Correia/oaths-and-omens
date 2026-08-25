@@ -336,14 +336,18 @@ def rectify_overflow(state, hex_index, winner_faction, send_back, cap=MAX_STACK_
     """After a battle resolves, if the winning stack exceeds `cap` units,
     the winner sends the excess back to their own contributing origin
     hexes. `send_back`: list of {"origin_hex": hex_index_or_None,
-    "units": int[3]}. Units whose origin_hex is None/invalid, or that
-    `send_back` doesn't account for, are trimmed off (infantry -> cavalry
-    -> archers, same cascade used everywhere else) rather than left
-    sitting above `cap` - mirrors engine/battle.py's rectify_overflow,
-    generalized with a `cap` parameter so turn.py can force a full
-    eviction (cap=0) from a capital a foreign faction just won a battle
-    on (see turn.py's _run_battle_phase - capitals are uncapturable, so
-    an attacker who wins there is never allowed to actually occupy it).
+    "units": int[3]}. Units whose origin_hex is None/invalid, that
+    `send_back` doesn't account for, or that would push the origin hex
+    itself above MAX_STACK_SIZE (the 6-unit limit is strict outside of
+    battle - a returning unit that doesn't fit at its origin simply
+    doesn't make it back, same as a peaceful move that would overstack
+    is just illegal) are trimmed off (infantry -> cavalry -> archers,
+    same cascade used everywhere else) rather than left sitting above
+    `cap` - mirrors engine/battle.py's rectify_overflow, generalized with
+    a `cap` parameter so turn.py can force a full eviction (cap=0) from a
+    capital a foreign faction just won a battle on (see turn.py's
+    _run_battle_phase - capitals are uncapturable, so an attacker who
+    wins there is never allowed to actually occupy it).
 
     City ownership is NOT touched here: neither a capital (uncapturable)
     nor an outpost (destroyed rather than captured - see turn.py) ever
@@ -358,11 +362,16 @@ def rectify_overflow(state, hex_index, winner_faction, send_back, cap=MAX_STACK_
         for ut in range(3):
             take = min(int(units[ut]), int(winning_units[ut]))
             winning_units[ut] -= take
-            if valid_origin:
+            if valid_origin and take > 0:
                 if state.army_faction[origin] == NO_FACTION:
                     state.army_faction[origin] = winner_faction
                 if state.army_faction[origin] == winner_faction:
-                    state.army_units[origin, ut] += take
+                    room = MAX_STACK_SIZE - int(state.army_units[origin].sum())
+                    deposit = max(0, min(take, room))
+                    state.army_units[origin, ut] += deposit
+                # else: origin is held by another faction (shouldn't
+                # normally happen for your own origin hex) or has no
+                # room left - either way, those units are simply lost
             # else: those units are simply lost
 
     total_remaining = int(winning_units.sum())
