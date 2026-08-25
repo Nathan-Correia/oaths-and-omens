@@ -54,6 +54,26 @@ construction: buy's no-op column is always legal; decode_movement_or_
 cavalry/decode_rectification explicitly check for an all-False mask and
 return early (None/[]) before ever sampling; engine/placement.py
 guarantees legal_mask/legal_pool/the swap pair are always non-empty.
+
+Every decode_* function returns (action, log_prob) - log_prob is the
+log-probability of the sampled action under the masked distribution that
+produced it, needed by training/ppo.py's PPO update (the ratio between
+this "old" log-prob and a "new" one recomputed under the current weights
+at update time). It's nearly free once the masked distribution is
+already built for sampling, so it's always computed and returned rather
+than behind a training-only flag - one sampling code path serves both
+plain inference (callers that don't care just unpack and discard it) and
+rollout recording (agent.py's recorder), so they can never drift out of
+sync. log_prob is None exactly when nothing was sampled (an early-return
+path - no legal move this step, or no overflow to rectify).
+
+buy_action_to_choice_vector is the inverse of decode_buy's action-list
+parsing - given the actions list decode_buy returned, reconstructs the
+per-hex [num_hexes] choice vector that was actually sampled. Needed
+because buy's "action" is a joint draw over num_hexes independent
+per-hex categoricals, not a single index - training/ppo.py needs this
+vector (not the parsed action dicts) to recompute the buy log-prob/
+entropy against a stored decision later.
 """
 
 import numpy as np
@@ -73,24 +93,25 @@ def _masked_categorical(rng_gen, logits, mask):
     """logits: torch tensor (1-D). mask: bool array-like, same length.
     Samples one index from the masked (illegal -> -inf) distribution
     using rng_gen (a torch.Generator on the same device as logits -
-    required by torch.multinomial)."""
+    required by torch.multinomial). Returns (index, log_prob)."""
     mask_t = torch.as_tensor(np.asarray(mask), dtype=torch.bool, device=logits.device)
     masked_logits = torch.where(mask_t, logits, torch.full_like(logits, float("-inf")))
-    probs = torch.softmax(masked_logits, dim=-1)
-    return int(torch.multinomial(probs, 1, generator=rng_gen).item())
+    log_probs = torch.log_softmax(masked_logits, dim=-1)
+    idx = int(torch.multinomial(log_probs.exp(), 1, generator=rng_gen).item())
+    return idx, log_probs[idx]
 
 
 def decode_movement_or_cavalry(rng_gen, logits, mask):
     """logits: [num_hexes, 6] torch tensor. mask: [num_hexes, 6] bool.
-    Returns (hex_index, direction) or None if nothing's legal this step
-    (mirrors RandomAgent's "pass")."""
+    Returns ((hex_index, direction), log_prob), or (None, None) if
+    nothing's legal this step (mirrors RandomAgent's "pass")."""
     if not bool(np.any(mask)):
-        return None
+        return None, None
     flat_logits = logits.reshape(-1)
     flat_mask = np.asarray(mask).reshape(-1)
-    idx = _masked_categorical(rng_gen, flat_logits, flat_mask)
+    idx, log_prob = _masked_categorical(rng_gen, flat_logits, flat_mask)
     hex_index, direction = divmod(idx, 6)
-    return hex_index, direction
+    return (hex_index, direction), log_prob
 
 
 def buy_action_mask(state, legal_buy_actions):
@@ -134,11 +155,17 @@ def decode_buy(rng_gen, buy_logits, mask, legal_buy_actions):
     torch.multinomial call over the whole board rather than num_hexes
     separate calls. legal_buy_actions: the same list buy_action_mask was
     built from - needed again here to resolve build_outpost's sacrificed
-    unit_type (see _outpost_unit_type_by_hex)."""
+    unit_type (see _outpost_unit_type_by_hex). Returns (actions,
+    log_prob) - log_prob is the *joint* log-probability across all
+    num_hexes independent per-hex choices (summed, not averaged - see
+    module docstring), since the buy decision as a whole is one draw
+    from the product of those num_hexes distributions."""
     mask_t = torch.as_tensor(np.asarray(mask), dtype=torch.bool, device=buy_logits.device)
     masked_logits = torch.where(mask_t, buy_logits, torch.full_like(buy_logits, float("-inf")))
-    probs = torch.softmax(masked_logits, dim=-1)
-    choices = torch.multinomial(probs, 1, generator=rng_gen).squeeze(-1).tolist()
+    log_probs = torch.log_softmax(masked_logits, dim=-1)
+    choices_t = torch.multinomial(log_probs.exp(), 1, generator=rng_gen).squeeze(-1)
+    log_prob = log_probs.gather(1, choices_t.unsqueeze(-1)).squeeze(-1).sum()
+    choices = choices_t.tolist()
     outpost_unit_type = _outpost_unit_type_by_hex(legal_buy_actions)
 
     actions = []
@@ -154,7 +181,25 @@ def decode_buy(rng_gen, buy_logits, mask, legal_buy_actions):
             unit_type = outpost_unit_type.get(hex_index)
             if unit_type is not None:  # always set given mask[hex, 4] - defensive
                 actions.append({"type": "build_outpost", "hex": int(hex_index), "unit_type": unit_type})
-    return actions
+    return actions, log_prob
+
+
+def buy_action_to_choice_vector(num_hexes, actions):
+    """int64[num_hexes] in {0..4} - the inverse of decode_buy's action-
+    list parsing, reconstructing the per-hex choice vector that was
+    actually sampled. Not used by decode_buy itself - only by
+    training/agent-recording code that needs to recompute the buy
+    log-prob/entropy against a stored decision later (see module
+    docstring)."""
+    choices = np.zeros(num_hexes, dtype=np.int64)
+    for a in actions:
+        if a["type"] == "buy_infantry":
+            choices[a["city_hex"]] = 1
+        elif a["type"] == "convert_to_special":
+            choices[a["hex"]] = 2 if a["unit_type"] == "cavalry" else 3
+        else:  # build_outpost
+            choices[a["hex"]] = 4
+    return choices
 
 
 def target_mask(num_factions, legal_targets):
@@ -167,11 +212,12 @@ def target_mask(num_factions, legal_targets):
 
 
 def decode_target(rng_gen, target_logits, mask):
-    """target_logits, mask: [num_factions + 1]. Returns a faction id, or
-    None (abstain)."""
-    choice = _masked_categorical(rng_gen, target_logits, mask)
+    """target_logits, mask: [num_factions + 1]. Returns (faction_id_or_
+    None, log_prob) - None means abstain. Always samples (the abstain
+    slot is always legal), so log_prob is never None here."""
+    choice, log_prob = _masked_categorical(rng_gen, target_logits, mask)
     abstain_index = target_logits.shape[0] - 1
-    return None if choice == abstain_index else choice
+    return (None if choice == abstain_index else choice), log_prob
 
 
 def rectification_origin_mask(state, hex_index, winner_faction):
@@ -186,22 +232,23 @@ def rectification_origin_mask(state, hex_index, winner_faction):
 
 
 def decode_rectification(rng_gen, rectify_logits, state, hex_index, winner_faction, cap):
-    """Returns engine.battle.rectify_overflow's send_back list: [] if
-    the winner isn't actually over `cap`, otherwise one entry sending
-    the whole overflow to a single chosen origin hex (see module
-    docstring). `cap` is normally MAX_STACK_SIZE, but is 0 when the
-    winner just won a battle on a foreign capital (see turn.py's
-    _run_battle_phase) - capitals are uncapturable, so the winner has to
-    send everything back."""
+    """Returns (send_back, log_prob). send_back is engine.battle.
+    rectify_overflow's send_back list: [] if the winner isn't actually
+    over `cap`, otherwise one entry sending the whole overflow to a
+    single chosen origin hex (see module docstring); log_prob is None
+    exactly when send_back is [] (nothing was sampled). `cap` is
+    normally MAX_STACK_SIZE, but is 0 when the winner just won a battle
+    on a foreign capital (see turn.py's _run_battle_phase) - capitals
+    are uncapturable, so the winner has to send everything back."""
     totals = faction_totals(state, hex_index)[winner_faction]
     overflow = int(totals.sum()) - cap
     if overflow <= 0:
-        return []
+        return [], None
 
     mask = rectification_origin_mask(state, hex_index, winner_faction)
     if not np.any(mask):
-        return []
-    chosen_hex = _masked_categorical(rng_gen, rectify_logits, mask)
+        return [], None
+    chosen_hex, log_prob = _masked_categorical(rng_gen, rectify_logits, mask)
 
     units = [0, 0, 0]
     remaining = overflow
@@ -212,7 +259,7 @@ def decode_rectification(rng_gen, rectify_logits, state, hex_index, winner_facti
         if remaining <= 0:
             break
 
-    return [{"origin_hex": chosen_hex, "units": units}]
+    return [{"origin_hex": chosen_hex, "units": units}], log_prob
 
 
 def capital_choice_mask_from_pool(num_hexes, legal_pool):
@@ -237,5 +284,7 @@ def decode_capital_choice(rng_gen, capital_pref_logits, mask):
     """capital_pref_logits: [num_hexes]. mask: [num_hexes] bool. Shared
     decode step for decide_placement/decide_draft/decide_swap (see
     agent.py) - all three sample from the same per-hex "how much do I
-    want this hex" score, masked to that decision's candidate set."""
+    want this hex" score, masked to that decision's candidate set.
+    Returns (chosen_hex, log_prob) - always samples (every caller's mask
+    is guaranteed non-empty)."""
     return _masked_categorical(rng_gen, capital_pref_logits, mask)

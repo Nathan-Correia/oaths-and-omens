@@ -25,6 +25,20 @@ unbatched, one-decision-at-a-time inference on a small network, where
 torch.compile's per-shape compile overhead (and, on native Windows, a
 less mature Triton backend) would be a bad trade. Worth revisiting once
 a batched training loop actually makes throughput matter.
+
+`recorder` (optional): when given a training.buffer.RolloutBuffer, every
+decide_* closure pushes a step record into it as a side effect (per_hex/
+global_feats actually used, the mask, the sampled action, its log-prob,
+and the value-head estimate) while still returning exactly what the
+engine's callback contract expects - so the exact same closures serve
+both plain inference (recorder=None, e.g. run.py) and training rollout
+collection. Deliberately uses plain string literals for each decision's
+`decision_kind` ("movement"/"buy"/... - see each closure below) rather
+than importing constants from training.buffer: agents/ has no import
+dependency on training/ anywhere else, and shouldn't gain one just for
+a handful of string constants - training/buffer.py defines the matching
+constants for ITS OWN callers (gae.py/ppo.py) to use instead of
+retyping string literals there.
 """
 
 import numpy as np
@@ -36,25 +50,31 @@ from . import actions
 from .encode import encode_observation
 
 
-def make_nn_agents(network, num_factions, seed=0, max_turns=100, device=None):
+def make_nn_agents(network, num_factions, seed=0, max_turns=100, device=None, recorder=None):
     """Returns (decide_buy, decide_movement, decide_cavalry,
     decide_target, decide_rectification, decide_placement, decide_draft,
     decide_swap) dicts - each {faction: callable}, matching
     engine.turn.run_turn's and engine.placement.run_city_setup's
-    expected signatures, all backed by the same shared `network`."""
+    expected signatures, all backed by the same shared `network`.
+
+    `recorder`: optional training.buffer.RolloutBuffer - see module
+    docstring."""
     device = device or torch.device("cpu")
     network = network.to(device).eval()
     generator = torch.Generator(device=device)
     generator.manual_seed(seed)
 
-    # HexGrid never changes within a game (see engine/geometry.py) - the
-    # int64 neighbor-table tensor is cheap to build but not free, and
-    # every decision this turn/game needs the same one, so cache it per
-    # grid instance rather than reconverting every call.
+    # HexGrid(radius) is a pure function of radius (see engine/geometry.py)
+    # - keying by radius rather than id(state.grid) means this stays
+    # correct AND bounded (one entry per distinct radius ever seen) across
+    # a long-running process that creates many fresh HexGrid instances
+    # (e.g. one per rollout game), unlike id()-keying, which would grow
+    # forever and risks a stale/wrong tensor if a garbage-collected grid's
+    # id() gets reused by an unrelated object.
     neighbor_table_cache = {}
 
     def _neighbor_table(state):
-        key = id(state.grid)
+        key = state.grid.radius
         cached = neighbor_table_cache.get(key)
         if cached is None:
             cached = torch.from_numpy(state.grid.neighbor_table.astype(np.int64)).to(device)
@@ -63,47 +83,116 @@ def make_nn_agents(network, num_factions, seed=0, max_turns=100, device=None):
 
     @torch.inference_mode()
     def forward(state, faction, battle_hex_index=0):
+        """network(...) always expects a batch dimension (see network.py's
+        module docstring) - this wraps the single decision being made
+        right now as a batch of 1, then immediately unwraps the result,
+        so every decide_* closure below and all of actions.py can keep
+        working with the same unbatched shapes as before."""
         per_hex, global_feats = encode_observation(state, faction, max_turns=max_turns)
-        per_hex_t = torch.from_numpy(per_hex).to(device)
-        global_feats_t = torch.from_numpy(global_feats).to(device)
-        return network(per_hex_t, global_feats_t, _neighbor_table(state), battle_hex_index)
+        per_hex_t = torch.from_numpy(per_hex).to(device).unsqueeze(0)
+        global_feats_t = torch.from_numpy(global_feats).to(device).unsqueeze(0)
+        battle_hex_t = torch.tensor([battle_hex_index], dtype=torch.long, device=device)
+        out = network(per_hex_t, global_feats_t, _neighbor_table(state), battle_hex_t)
+        out = {k: v.squeeze(0) for k, v in out.items()}
+        return out, per_hex, global_feats
 
     def decide_buy(state, faction, legal):
-        out = forward(state, faction)
+        out, per_hex, global_feats = forward(state, faction)
         mask = actions.buy_action_mask(state, legal)
-        return actions.decode_buy(generator, out["buy"], mask, legal)
+        parsed, log_prob = actions.decode_buy(generator, out["buy"], mask, legal)
+        if recorder is not None:
+            recorder.record_step(
+                faction=faction, decision_kind="buy", per_hex=per_hex, global_feats=global_feats,
+                battle_hex_index=0, mask=mask,
+                action_repr=actions.buy_action_to_choice_vector(state.num_hexes, parsed),
+                log_prob=float(log_prob.item()), value=float(out["value"].item()),
+            )
+        return parsed
 
     def decide_movement(state, faction, step, legal_mask):
-        out = forward(state, faction)
-        return actions.decode_movement_or_cavalry(generator, out["movement"], legal_mask)
+        out, per_hex, global_feats = forward(state, faction)
+        parsed, log_prob = actions.decode_movement_or_cavalry(generator, out["movement"], legal_mask)
+        if recorder is not None and log_prob is not None:
+            hex_index, direction = parsed
+            recorder.record_step(
+                faction=faction, decision_kind="movement", per_hex=per_hex, global_feats=global_feats,
+                battle_hex_index=0, mask=legal_mask, action_repr=hex_index * 6 + direction,
+                log_prob=float(log_prob.item()), value=float(out["value"].item()),
+            )
+        return parsed
 
     def decide_cavalry(state, faction, step, legal_mask):
-        out = forward(state, faction)
-        return actions.decode_movement_or_cavalry(generator, out["cavalry"], legal_mask)
+        out, per_hex, global_feats = forward(state, faction)
+        parsed, log_prob = actions.decode_movement_or_cavalry(generator, out["cavalry"], legal_mask)
+        if recorder is not None and log_prob is not None:
+            hex_index, direction = parsed
+            recorder.record_step(
+                faction=faction, decision_kind="cavalry", per_hex=per_hex, global_feats=global_feats,
+                battle_hex_index=0, mask=legal_mask, action_repr=hex_index * 6 + direction,
+                log_prob=float(log_prob.item()), value=float(out["value"].item()),
+            )
+        return parsed
 
     def decide_target(state, hex_index, faction):
-        out = forward(state, faction, battle_hex_index=hex_index)
+        out, per_hex, global_feats = forward(state, faction, battle_hex_index=hex_index)
         legal = get_legal_target_actions(state, hex_index, faction)
         mask = actions.target_mask(num_factions, legal)
-        return actions.decode_target(generator, out["target"], mask)
+        action, log_prob = actions.decode_target(generator, out["target"], mask)
+        if recorder is not None:
+            recorder.record_step(
+                faction=faction, decision_kind="target", per_hex=per_hex, global_feats=global_feats,
+                battle_hex_index=hex_index, mask=mask,
+                action_repr=num_factions if action is None else action,
+                log_prob=float(log_prob.item()), value=float(out["value"].item()),
+            )
+        return action
 
     def decide_rectification(state, hex_index, winner_faction, cap):
-        out = forward(state, winner_faction, battle_hex_index=hex_index)
-        return actions.decode_rectification(generator, out["rectify"], state, hex_index, winner_faction, cap)
+        out, per_hex, global_feats = forward(state, winner_faction, battle_hex_index=hex_index)
+        send_back, log_prob = actions.decode_rectification(generator, out["rectify"], state, hex_index,
+                                                             winner_faction, cap)
+        if recorder is not None and log_prob is not None:
+            mask = actions.rectification_origin_mask(state, hex_index, winner_faction)
+            recorder.record_step(
+                faction=winner_faction, decision_kind="rectify", per_hex=per_hex, global_feats=global_feats,
+                battle_hex_index=hex_index, mask=mask, action_repr=send_back[0]["origin_hex"],
+                log_prob=float(log_prob.item()), value=float(out["value"].item()),
+            )
+        return send_back
 
     def decide_placement(state, faction, legal_mask):
-        out = forward(state, faction)
-        return actions.decode_capital_choice(generator, out["capital_pref"], legal_mask)
+        out, per_hex, global_feats = forward(state, faction)
+        chosen, log_prob = actions.decode_capital_choice(generator, out["capital_pref"], legal_mask)
+        if recorder is not None:
+            recorder.record_step(
+                faction=faction, decision_kind="placement", per_hex=per_hex, global_feats=global_feats,
+                battle_hex_index=0, mask=legal_mask, action_repr=chosen,
+                log_prob=float(log_prob.item()), value=float(out["value"].item()),
+            )
+        return chosen
 
     def decide_draft(state, faction, legal_pool):
-        out = forward(state, faction)
+        out, per_hex, global_feats = forward(state, faction)
         mask = actions.capital_choice_mask_from_pool(state.num_hexes, legal_pool)
-        return actions.decode_capital_choice(generator, out["capital_pref"], mask)
+        chosen, log_prob = actions.decode_capital_choice(generator, out["capital_pref"], mask)
+        if recorder is not None:
+            recorder.record_step(
+                faction=faction, decision_kind="draft", per_hex=per_hex, global_feats=global_feats,
+                battle_hex_index=0, mask=mask, action_repr=chosen,
+                log_prob=float(log_prob.item()), value=float(out["value"].item()),
+            )
+        return chosen
 
     def decide_swap(state, faction, leftover_hex, placer_faction, placer_hex):
-        out = forward(state, faction)
+        out, per_hex, global_feats = forward(state, faction)
         mask = actions.capital_choice_mask_pair(state.num_hexes, leftover_hex, placer_hex)
-        chosen = actions.decode_capital_choice(generator, out["capital_pref"], mask)
+        chosen, log_prob = actions.decode_capital_choice(generator, out["capital_pref"], mask)
+        if recorder is not None:
+            recorder.record_step(
+                faction=faction, decision_kind="swap", per_hex=per_hex, global_feats=global_feats,
+                battle_hex_index=0, mask=mask, action_repr=chosen,
+                log_prob=float(log_prob.item()), value=float(out["value"].item()),
+            )
         return chosen == placer_hex
 
     factions = range(num_factions)

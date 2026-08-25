@@ -62,16 +62,43 @@ MAX_TURNS = 100
 SEED = int(time.time() * 1000) % (2 ** 31)
 
 # Per-faction agent choice - any of "random", "greedy", "nn".
-AGENT_ASSIGNMENT = {f: "nn" for f in range(NUM_FACTIONS)}
+AGENT_ASSIGNMENT = {
+    0: "nn",
+    1: "nn",
+    2: "nn",
+    3: "nn",
+    4: "greedy",
+    5: "greedy",
+    6: "greedy",
+    7: "greedy",
+}
+
+# Path to a training/checkpoint.py checkpoint (e.g. "checkpoints/iter_190.pt")
+# to load "nn" faction(s) from - the trained weights actually play, instead
+# of a fresh random-init network. None (the default) plays random-init, same
+# as before checkpoints existed. The checkpoint's own saved num_factions/
+# hidden_dim/num_mp_rounds are used to rebuild the network (see
+# training/checkpoint.py's load_checkpoint) - NUM_FACTIONS above must match
+# what it was trained with, or loading its state_dict will fail with a shape
+# mismatch; RADIUS doesn't have to match (the network is board-size-agnostic
+# - see network.py - but matching whatever it actually trained on is the
+# fairest/most representative game to watch).
+NN_CHECKPOINT = "checkpoints/iter_190.pt"
 
 
 def _build_nn_agents():
     """Lazily pulls in torch/agents.nn_agent - only paid for if
     AGENT_ASSIGNMENT actually uses "nn" for at least one faction."""
     from agents.nn_agent.agent import make_nn_agents
-    from agents.nn_agent.network import build_network
 
-    network = build_network(NUM_FACTIONS, seed=SEED)
+    if NN_CHECKPOINT is not None:
+        from training.checkpoint import load_checkpoint
+        network, payload = load_checkpoint(NN_CHECKPOINT)
+        print(f"Loaded {NN_CHECKPOINT} (trained for {payload.get('iteration', '?')} iterations)")
+    else:
+        from agents.nn_agent.network import build_network
+        network = build_network(NUM_FACTIONS, seed=SEED)
+
     return make_nn_agents(network, NUM_FACTIONS, seed=SEED, max_turns=MAX_TURNS)
 
 

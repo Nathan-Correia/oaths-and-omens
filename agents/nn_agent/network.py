@@ -41,6 +41,19 @@ exists, sharing would let gradient signal from one corrupt the other.
 `battle_hex_index` is always required (not optional) so every call has
 the same shape/trace signature - pass 0 when it's not relevant (the
 target head's output just goes unused in that case).
+
+forward() always expects a leading batch dimension (per_hex:
+[B, num_hexes, F], global_feats: [B, G], battle_hex_index: int64[B]) -
+there's no separate unbatched code path. agents/nn_agent/agent.py's
+single-decision inference calls wrap a lone decision as a batch of 1
+(unsqueeze before, squeeze after) rather than this file branching on
+whether a batch dim is present, and training/ppo.py's PPO update stacks
+an entire minibatch (potentially mixing every decision kind - the
+forward pass itself doesn't care, only which head gets read afterward
+does) into one real forward call instead of one per sample. neighbor_table
+is never batched (state.grid.neighbor_table is fixed per training run -
+board size doesn't vary mid-run - so the same [num_hexes, 6] table is
+shared across every item in a batch).
 """
 
 import torch
@@ -60,13 +73,16 @@ class HexMessagePassing(nn.Module):
         self.combine = nn.Linear(hidden_dim * 2, hidden_dim)
 
     def forward(self, embeddings, neighbor_table):
-        """embeddings: float[num_hexes, hidden_dim]. neighbor_table:
-        int64[num_hexes, 6], -1 for off-board."""
+        """embeddings: float[B, num_hexes, hidden_dim]. neighbor_table:
+        int64[num_hexes, 6], -1 for off-board - shared across the whole
+        batch (never batched itself, see module docstring)."""
         valid = neighbor_table >= 0  # [num_hexes, 6]
-        neighbor_embed = embeddings[neighbor_table.clamp(min=0)] * valid.unsqueeze(-1)
-        neighbor_count = valid.sum(dim=1, keepdim=True).clamp(min=1)  # every real board
-        # hex has >=1 neighbor, so this floor is defensive insurance, not a real case
-        neighbor_mean = neighbor_embed.sum(dim=1) / neighbor_count
+        # embeddings[:, idx, :] with idx shape [num_hexes, 6] broadcasts the
+        # batch dim through untouched, giving [B, num_hexes, 6, hidden_dim].
+        neighbor_embed = embeddings[:, neighbor_table.clamp(min=0), :] * valid.unsqueeze(-1)
+        neighbor_count = valid.sum(dim=1, keepdim=True).clamp(min=1)  # [num_hexes, 1] - every
+        # real board hex has >=1 neighbor, so this floor is defensive insurance, not a real case
+        neighbor_mean = neighbor_embed.sum(dim=2) / neighbor_count  # [B, num_hexes, hidden_dim]
         return F.relu(self.combine(torch.cat([embeddings, neighbor_mean], dim=-1)))
 
 
@@ -94,26 +110,30 @@ class PolicyNetwork(nn.Module):
         self.value_head = nn.Linear(hidden_dim, 1)
 
     def forward(self, per_hex, global_feats, neighbor_table, battle_hex_index):
-        """per_hex: float[num_hexes, encode.PER_HEX_FEATURES]
-        global_feats: float[encode.GLOBAL_FEATURES]
-        neighbor_table: int64[num_hexes, 6], -1 for off-board
-        battle_hex_index: int, which hex's embedding the target head
-          should look at (irrelevant/unused outside battle decisions).
+        """per_hex: float[B, num_hexes, encode.PER_HEX_FEATURES]
+        global_feats: float[B, encode.GLOBAL_FEATURES]
+        neighbor_table: int64[num_hexes, 6], -1 for off-board (not batched)
+        battle_hex_index: int64[B], which hex's embedding the target head
+          should look at per sample (irrelevant/unused outside battle
+          decisions, conventionally 0 then).
 
-        Returns a dict of logits (and one plain value), all raw/unmasked
-        - see actions.py for turning these into legal moves.
+        Returns a dict of logits (and one plain value), all raw/unmasked,
+        every tensor's leading dim is B - see actions.py for turning a
+        single (already-unbatched, see agent.py) decision's slice into a
+        legal move, and training/ppo.py for how the batch dim gets used
+        during a PPO update.
         """
-        num_hexes = per_hex.shape[0]
-        broadcast_global = global_feats.unsqueeze(0).expand(num_hexes, -1)
+        batch_size, num_hexes, _ = per_hex.shape
+        broadcast_global = global_feats.unsqueeze(1).expand(-1, num_hexes, -1)
         x = torch.cat([per_hex, broadcast_global], dim=-1)
 
         embeddings = F.relu(self.input_proj(x))
         for mp_round in self.mp_rounds:
             embeddings = mp_round(embeddings, neighbor_table)
 
-        pooled = embeddings.mean(dim=0)
-
-        target_input = torch.cat([embeddings[battle_hex_index], pooled], dim=-1)
+        pooled = embeddings.mean(dim=1)  # [B, hidden_dim]
+        battle_embedding = embeddings[torch.arange(batch_size, device=embeddings.device), battle_hex_index]
+        target_input = torch.cat([battle_embedding, pooled], dim=-1)  # [B, 2*hidden_dim]
 
         return {
             "movement": self.movement_head(embeddings),
