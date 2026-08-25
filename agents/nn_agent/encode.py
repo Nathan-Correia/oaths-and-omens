@@ -12,18 +12,31 @@ Two things a raw ArrayState doesn't have that a network needs:
      that faction's own point of view, so it never has to learn
      "faction 3 behaves like X" - only "my stuff vs. everyone else's."
 
-Per-hex features (NUM_TERRAIN_TYPES + 10 numbers per hex, computed as
+Per-hex features (NUM_TERRAIN_TYPES + 13 numbers per hex, computed as
 PER_HEX_FEATURES below rather than hardcoded - terrain types have
 changed before, e.g. forest's removal, and will again):
   terrain one-hot (NUM_TERRAIN_TYPES) + city ownership relative to the
   acting faction (3: none / mine / enemy's - capital vs. outpost isn't
   distinguished here, just like real vs. structural-shot-only defense
-  isn't; revisit if that turns out to matter) + my army units here (3,
+  isn't; revisit if that turns out to matter) + colourless-city-placement
+  relative to the acting faction (3: none / placed by me / placed by
+  someone else - see engine/placement.py's run_city_setup and
+  engine/state.py's city_placer field; this is what gives
+  decide_placement/decide_draft/decide_swap any visibility into the
+  board at all during setup, since city_owner is NO_FACTION for
+  everyone until the draft finalizes) + my army units here (3,
   infantry/cavalry/archers, /6) + enemy army units here (3, /6) +
   locked-in-battle flag (1). "Army units here" merges the peaceful army
   and battle-contribution cases (a hex is exactly one or the other,
   never both) into a single pair of features rather than carrying
   separate always-partially-zero columns for each.
+
+  city_placer stays populated (but static and no longer authoritative)
+  for the rest of the game once setup finishes - see its own docstring
+  in engine/state.py - so this feature block is harmless outside setup
+  too: at worst the network learns to treat it as a fixed per-hex bias
+  during turn-phase decisions, never a source of live/confusing signal,
+  the same precedent as state.py's `alive` field.
 
 Global features (6 numbers), not tied to any one hex: my silver, my
 kill-XP (both normalized against a rough scale, not a hard cap - values
@@ -41,14 +54,13 @@ for a first version; revisit if that turns out to matter once training
 is actually running.
 """
 
-import jax.numpy as jnp
 import numpy as np
 
 from engine.state import NO_FACTION, TERRAIN_TYPES
 from engine.turn import VP_TO_WIN
 
 NUM_TERRAIN_TYPES = len(TERRAIN_TYPES)
-PER_HEX_FEATURES = NUM_TERRAIN_TYPES + 3 + 3 + 3 + 1
+PER_HEX_FEATURES = NUM_TERRAIN_TYPES + 3 + 3 + 3 + 3 + 1
 GLOBAL_FEATURES = 6
 
 SILVER_SCALE = 100.0
@@ -82,8 +94,10 @@ def _per_hex_army_features(state, faction):
 
 def encode_observation(state, faction, max_turns=100):
     """Returns (per_hex: float32[num_hexes, PER_HEX_FEATURES],
-    global_feats: float32[GLOBAL_FEATURES]), both jnp arrays, from
-    `faction`'s point of view."""
+    global_feats: float32[GLOBAL_FEATURES]), plain numpy arrays, from
+    `faction`'s point of view. Framework-agnostic on purpose - callers
+    (agent.py) own converting these to torch tensors and placing them on
+    whatever device the network lives on."""
     n = state.num_hexes
 
     terrain_onehot = np.eye(NUM_TERRAIN_TYPES, dtype=np.float32)[state.terrain]
@@ -93,12 +107,17 @@ def encode_observation(state, faction, max_turns=100):
     city_rel[state.city_owner == faction, 1] = 1.0
     city_rel[(state.city_owner != NO_FACTION) & (state.city_owner != faction), 2] = 1.0
 
+    placer_rel = np.zeros((n, 3), dtype=np.float32)
+    placer_rel[state.city_placer == NO_FACTION, 0] = 1.0
+    placer_rel[state.city_placer == faction, 1] = 1.0
+    placer_rel[(state.city_placer != NO_FACTION) & (state.city_placer != faction), 2] = 1.0
+
     my_units, enemy_units = _per_hex_army_features(state, faction)
 
     locked_flag = state.locked.astype(np.float32)[:, None]
 
     per_hex = np.concatenate(
-        [terrain_onehot, city_rel, my_units / UNIT_SCALE, enemy_units / UNIT_SCALE, locked_flag],
+        [terrain_onehot, city_rel, placer_rel, my_units / UNIT_SCALE, enemy_units / UNIT_SCALE, locked_flag],
         axis=1,
     )
 
@@ -120,4 +139,4 @@ def encode_observation(state, faction, max_turns=100):
         dtype=np.float32,
     )
 
-    return jnp.asarray(per_hex), jnp.asarray(global_feats)
+    return per_hex, global_feats

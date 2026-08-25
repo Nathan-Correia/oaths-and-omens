@@ -18,10 +18,7 @@ neither battle targeting nor rectification needs to be smart.
 decide_placement/decide_draft/decide_swap (see engine/placement.py's
 module docstring for the full setup process and each signature) are
 genuinely uniform-random here, same spirit as everything else in this
-file - and, since agents/nn_agent/ doesn't implement this phase at all,
-these three are also what run.py/profile_engine.py fall back to for any
-faction assigned "nn", wired at the driver-script level rather than
-inside nn_agent/.
+file.
 """
 
 import random

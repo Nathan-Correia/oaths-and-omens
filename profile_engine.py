@@ -34,17 +34,12 @@ SEED = 1
 AGENT_ASSIGNMENT = {f: "greedy" for f in range(NUM_FACTIONS)}
 
 
-def _build_nn_agents(state):
-    import jax
-
+def _build_nn_agents():
     from agents.nn_agent.agent import make_nn_agents
-    from agents.nn_agent.network import init_params
+    from agents.nn_agent.network import build_network
 
-    rng_key = jax.random.PRNGKey(SEED)
-    network, params = init_params(rng_key, state.num_hexes, NUM_FACTIONS)
-    nn_five = make_nn_agents(network, params, NUM_FACTIONS, seed=SEED, max_turns=MAX_TURNS)
-    setup_three = make_random_agents(NUM_FACTIONS, seed=SEED)[5:]
-    return nn_five + setup_three
+    network = build_network(NUM_FACTIONS, seed=SEED)
+    return make_nn_agents(network, NUM_FACTIONS, seed=SEED, max_turns=MAX_TURNS)
 
 
 def make_game():
@@ -52,7 +47,7 @@ def make_game():
     build_fns = {
         "random": lambda: make_random_agents(NUM_FACTIONS, seed=SEED),
         "greedy": lambda: make_greedy_agents(NUM_FACTIONS, seed=SEED),
-        "nn": lambda: _build_nn_agents(state),
+        "nn": lambda: _build_nn_agents(),
     }
     agents = compose_agents(AGENT_ASSIGNMENT, build_fns)
     rng = random.Random(SEED + 1)

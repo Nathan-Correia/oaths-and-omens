@@ -1,91 +1,148 @@
 """
-The policy network: one shared trunk + six heads (movement, cavalry, buy,
-target, rectification, value).
+The policy network: one shared trunk + seven heads (movement, cavalry, buy,
+target, rectification, capital preference, value).
 
-Trunk: a per-hex MLP - each hex's features (plus the global features,
-broadcast to every hex) go through the same two-layer network
-independently, producing one embedding vector per hex. There's no
-cross-hex mixing (no attention, no message-passing along
-neighbor_table) - a hex's embedding only knows about itself and the
-game-wide globals, not what's happening at neighboring hexes. That's a
-real ceiling on how sophisticated the resulting policy can get (it can't
-directly reason "there's a threat two hexes away"), but it's a
-deliberate simplification for getting the plumbing (masking, decoding,
-self-play wiring) correct first - training quality is a separate,
-later concern. A graph/attention layer over neighbor_table is the
-natural upgrade when that starts to matter.
+Trunk: a per-hex projection (each hex's features, plus the global features
+broadcast to every hex, through one Linear+ReLU) followed by a few rounds
+of message-passing over the board's hex-adjacency graph
+(state.grid.neighbor_table) - each round lets a hex's embedding absorb a
+summary of its neighbors', so after N rounds a hex "knows about" roughly
+its radius-N neighborhood, not just itself. This replaces the old
+pure-per-hex-MLP trunk (no cross-hex mixing at all), which structurally
+couldn't compare "this spot vs. that spot" - a real limitation for
+placement/draft (farthest-point reasoning) and tactical movement alike.
+No attention/transformer, no torch_geometric dependency - just plain
+tensor ops over the neighbor table the engine already computes, which is
+the right level of complexity for a ~150-300 hex board with 6 neighbors
+per hex.
 
 Heads read off the trunk's output:
-  - movement/cavalry/buy/rectify: one small Dense layer applied
-    independently to every hex's embedding (shared weights across
+  - movement/cavalry/buy/rectify/capital_pref: one small Dense layer
+    applied independently to every hex's embedding (shared weights across
     hexes) - same shape as the corresponding legal-action mask, so
     logits and mask always line up 1:1.
   - target: only meaningful for one specific hex (the battle being
     decided) - takes that hex's embedding plus the pooled whole-board
     summary.
   - value: takes the pooled whole-board summary (mean over all hex
-    embeddings) - a single number, not tied to any hex.
+    embeddings) - a single number, not tied to any hex. Unused this
+    milestone (no training loop exists yet) - present so a future PPO
+    value function doesn't need an architecture change to appear.
+
+capital_pref is a new head, shared across the three setup-phase
+decisions (see actions.py's capital_choice_* functions) - placement,
+draft, and swap are all fundamentally "how much do I want this hex as my
+capital," just over different candidate subsets. It's deliberately its
+own head rather than reusing rectify_head: those answer different
+questions (which of my own battle-contribution origins gets overflow,
+vs. how much I want a hex as my capital), and once a training loop
+exists, sharing would let gradient signal from one corrupt the other.
 
 `battle_hex_index` is always required (not optional) so every call has
 the same shape/trace signature - pass 0 when it's not relevant (the
-target head's output just goes unused in that case). Not jitted yet;
-that's part of the later batching work, not this milestone.
+target head's output just goes unused in that case).
 """
 
-import flax.linen as nn
-import jax.numpy as jnp
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class HexMessagePassing(nn.Module):
+    """One round of GraphSAGE-mean-style message passing: every hex's new
+    embedding is a function of its own current embedding plus the mean of
+    its on-board neighbors' embeddings (off-board neighbor slots, marked
+    -1 in neighbor_table, are excluded from that mean rather than treated
+    as a real zero-embedding neighbor)."""
+
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.combine = nn.Linear(hidden_dim * 2, hidden_dim)
+
+    def forward(self, embeddings, neighbor_table):
+        """embeddings: float[num_hexes, hidden_dim]. neighbor_table:
+        int64[num_hexes, 6], -1 for off-board."""
+        valid = neighbor_table >= 0  # [num_hexes, 6]
+        neighbor_embed = embeddings[neighbor_table.clamp(min=0)] * valid.unsqueeze(-1)
+        neighbor_count = valid.sum(dim=1, keepdim=True).clamp(min=1)  # every real board
+        # hex has >=1 neighbor, so this floor is defensive insurance, not a real case
+        neighbor_mean = neighbor_embed.sum(dim=1) / neighbor_count
+        return F.relu(self.combine(torch.cat([embeddings, neighbor_mean], dim=-1)))
 
 
 class PolicyNetwork(nn.Module):
-    num_factions: int
-    hidden_dim: int = 128
+    def __init__(self, num_factions, hidden_dim=128, num_mp_rounds=2):
+        super().__init__()
+        self.num_factions = num_factions
+        self.hidden_dim = hidden_dim
 
-    @nn.compact
-    def __call__(self, per_hex, global_feats, battle_hex_index):
+        # Imported here (not at module level) to avoid a hard import-time
+        # dependency loop: encode.py doesn't need network.py, but
+        # PER_HEX_FEATURES/GLOBAL_FEATURES are the source of truth for
+        # this layer's input width.
+        from .encode import GLOBAL_FEATURES, PER_HEX_FEATURES
+
+        self.input_proj = nn.Linear(PER_HEX_FEATURES + GLOBAL_FEATURES, hidden_dim)
+        self.mp_rounds = nn.ModuleList([HexMessagePassing(hidden_dim) for _ in range(num_mp_rounds)])
+
+        self.movement_head = nn.Linear(hidden_dim, 6)
+        self.cavalry_head = nn.Linear(hidden_dim, 6)
+        self.buy_head = nn.Linear(hidden_dim, 5)
+        self.rectify_head = nn.Linear(hidden_dim, 1)
+        self.capital_pref_head = nn.Linear(hidden_dim, 1)
+        self.target_head = nn.Linear(hidden_dim * 2, num_factions + 1)
+        self.value_head = nn.Linear(hidden_dim, 1)
+
+    def forward(self, per_hex, global_feats, neighbor_table, battle_hex_index):
         """per_hex: float[num_hexes, encode.PER_HEX_FEATURES]
         global_feats: float[encode.GLOBAL_FEATURES]
+        neighbor_table: int64[num_hexes, 6], -1 for off-board
         battle_hex_index: int, which hex's embedding the target head
           should look at (irrelevant/unused outside battle decisions).
 
-        Returns a dict of logits (and one plain value), all raw/
-        unmasked - see actions.py for turning these into legal moves.
+        Returns a dict of logits (and one plain value), all raw/unmasked
+        - see actions.py for turning these into legal moves.
         """
         num_hexes = per_hex.shape[0]
-        broadcast_global = jnp.broadcast_to(global_feats, (num_hexes, global_feats.shape[0]))
-        x = jnp.concatenate([per_hex, broadcast_global], axis=-1)
+        broadcast_global = global_feats.unsqueeze(0).expand(num_hexes, -1)
+        x = torch.cat([per_hex, broadcast_global], dim=-1)
 
-        x = nn.relu(nn.Dense(self.hidden_dim, name="trunk_1")(x))
-        per_hex_embedding = nn.relu(nn.Dense(self.hidden_dim, name="trunk_2")(x))
-        pooled = jnp.mean(per_hex_embedding, axis=0)
+        embeddings = F.relu(self.input_proj(x))
+        for mp_round in self.mp_rounds:
+            embeddings = mp_round(embeddings, neighbor_table)
 
-        movement_logits = nn.Dense(6, name="movement_head")(per_hex_embedding)
-        cavalry_logits = nn.Dense(6, name="cavalry_head")(per_hex_embedding)
-        buy_logits = nn.Dense(4, name="buy_head")(per_hex_embedding)
-        rectify_logits = jnp.squeeze(nn.Dense(1, name="rectify_head")(per_hex_embedding), axis=-1)
-        value = jnp.squeeze(nn.Dense(1, name="value_head")(pooled), axis=-1)
+        pooled = embeddings.mean(dim=0)
 
-        target_input = jnp.concatenate([per_hex_embedding[battle_hex_index], pooled], axis=-1)
-        target_logits = nn.Dense(self.num_factions + 1, name="target_head")(target_input)
+        target_input = torch.cat([embeddings[battle_hex_index], pooled], dim=-1)
 
         return {
-            "movement": movement_logits,
-            "cavalry": cavalry_logits,
-            "buy": buy_logits,
-            "rectify": rectify_logits,
-            "target": target_logits,
-            "value": value,
+            "movement": self.movement_head(embeddings),
+            "cavalry": self.cavalry_head(embeddings),
+            "buy": self.buy_head(embeddings),
+            "rectify": self.rectify_head(embeddings).squeeze(-1),
+            "capital_pref": self.capital_pref_head(embeddings).squeeze(-1),
+            "target": self.target_head(target_input),
+            "value": self.value_head(pooled).squeeze(-1),
         }
 
 
-def init_params(rng_key, num_hexes, num_factions, hidden_dim=128):
-    """Random-initialized params for a given board size/faction count -
-    the "random weights" starting point. Uses dummy zero inputs of the
-    right shape purely to trace the network's structure; the actual
-    values don't matter for initialization."""
-    from . import encode
+def build_network(num_factions, hidden_dim=128, num_mp_rounds=2, seed=None, device=None):
+    """Constructs a randomly-initialized PolicyNetwork. Unlike Flax's
+    explicit-key .init() (which needed a dummy forward pass to discover
+    shapes), torch Linear layers have static dims - PER_HEX_FEATURES/
+    GLOBAL_FEATURES/hidden_dim, independent of num_hexes - so no
+    num_hexes argument or dummy input is needed here.
 
-    network = PolicyNetwork(num_factions=num_factions, hidden_dim=hidden_dim)
-    dummy_per_hex = jnp.zeros((num_hexes, encode.PER_HEX_FEATURES))
-    dummy_global = jnp.zeros((encode.GLOBAL_FEATURES,))
-    params = network.init(rng_key, dummy_per_hex, dummy_global, 0)
-    return network, params
+    `seed`, if given, is applied via torch.manual_seed() immediately
+    before construction for reproducible initial weights - nn.Linear's
+    reset_parameters() doesn't take a per-call generator the way Flax's
+    .init() took an explicit key, so this is a narrow, deliberate touch
+    of torch's global RNG scoped to just this one call. The actual
+    per-decision RNG (see agent.py) uses its own torch.Generator and
+    never touches global state."""
+    if seed is not None:
+        torch.manual_seed(seed)
+    network = PolicyNetwork(num_factions=num_factions, hidden_dim=hidden_dim, num_mp_rounds=num_mp_rounds)
+    if device is not None:
+        network = network.to(device)
+    return network

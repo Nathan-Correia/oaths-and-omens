@@ -7,16 +7,16 @@ steps, battle) - see that module's docstring for why these are
 independent snapshots rather than incremental diffs.
 
 Agent mix is configurable per faction via AGENT_ASSIGNMENT below - any
-mix of "random"/"greedy"/"nn" (a randomly-initialized, untrained JAX
+mix of "random"/"greedy"/"nn" (a randomly-initialized, untrained PyTorch
 policy network; see agents/nn_agent/). Faction id -> color
 is fixed (see hex_visualizer.py's FACTION_COLORS: 0=red, 1=blue,
 2=green, 3=purple, 4=orange, 5=brown, 6=pink, 7=grey).
 
 Before any turns run, engine/placement.py's run_city_setup plays out
-colourless city placement and the capital draft - agents/nn_agent/
-doesn't implement this phase, so any faction assigned "nn" falls back
-to make_random_agents' placement/draft/swap policies here (see
-_build_nn_agents below), not inside nn_agent/ itself.
+colourless city placement and the capital draft - every agent kind,
+including "nn", implements all eight decision points (the five
+turn-phase ones plus placement/draft/swap), so no per-faction fallback
+wiring is needed here.
 
 File shape:
 {
@@ -62,25 +62,17 @@ MAX_TURNS = 100
 SEED = int(time.time() * 1000) % (2 ** 31)
 
 # Per-faction agent choice - any of "random", "greedy", "nn".
-AGENT_ASSIGNMENT = {f: "greedy" for f in range(NUM_FACTIONS)}
+AGENT_ASSIGNMENT = {f: "nn" for f in range(NUM_FACTIONS)}
 
 
-def _build_nn_agents(state):
-    """Lazily pulls in jax/agents.nn_agent - only paid for if AGENT_ASSIGNMENT
-    actually uses "nn" for at least one faction. nn_agent doesn't
-    implement the placement/draft/swap setup phase, so those three are
-    padded on here from make_random_agents instead - keeps nn_agent/
-    itself untouched by engine/placement.py entirely."""
-    import jax
-
+def _build_nn_agents():
+    """Lazily pulls in torch/agents.nn_agent - only paid for if
+    AGENT_ASSIGNMENT actually uses "nn" for at least one faction."""
     from agents.nn_agent.agent import make_nn_agents
-    from agents.nn_agent.network import init_params
+    from agents.nn_agent.network import build_network
 
-    rng_key = jax.random.PRNGKey(SEED)
-    network, params = init_params(rng_key, state.num_hexes, NUM_FACTIONS)
-    nn_five = make_nn_agents(network, params, NUM_FACTIONS, seed=SEED, max_turns=MAX_TURNS)
-    setup_three = make_random_agents(NUM_FACTIONS, seed=SEED)[5:]
-    return nn_five + setup_three
+    network = build_network(NUM_FACTIONS, seed=SEED)
+    return make_nn_agents(network, NUM_FACTIONS, seed=SEED, max_turns=MAX_TURNS)
 
 
 def main():
@@ -99,7 +91,7 @@ def main():
     build_fns = {
         "random": lambda: make_random_agents(NUM_FACTIONS, seed=SEED),
         "greedy": lambda: make_greedy_agents(NUM_FACTIONS, seed=SEED),
-        "nn": lambda: _build_nn_agents(state),
+        "nn": lambda: _build_nn_agents(),
     }
     (decide_buy, decide_movement, decide_cavalry, decide_target, decide_rectification,
      decide_placement, decide_draft, decide_swap) = compose_agents(AGENT_ASSIGNMENT, build_fns)

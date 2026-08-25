@@ -19,7 +19,7 @@ def compose_agents(assignment, build_fns):
     decide_rectification, ...)}, one zero-arg builder per agent kind -
     called at most once each, and only for kinds actually referenced in
     `assignment` (so e.g. picking "nn" for zero factions never imports
-    jax). Returns the same tuple shape every build_fns[key]() returns
+    torch). Returns the same tuple shape every build_fns[key]() returns
     (arity inferred from whichever kind gets built first - callers use
     this both for the original 5-tuple of turn.py decisions and for an
     8-tuple that also covers placement.py's setup-phase decisions),
