@@ -36,7 +36,7 @@ from .state import MAX_STACK_SIZE, NO_FACTION, NO_ORIGIN, count_units_in_play
 from .terrain import apply_terrain_effects
 
 MOVEMENT_STEPS = 3
-CAVALRY_STEPS = 4
+CAVALRY_STEPS = 2
 VP_TO_WIN = 50
 OUTPOST_VP_PER_ROUND = 1
 OUTPOST_DESTROY_VP = 2
@@ -192,10 +192,11 @@ def run_turn(state, decide_buy, decide_movement, decide_cavalry, decide_target, 
     return state
 
 
-# Labels for the 10 checkpoints a logged turn produces - same meaning as
+# Labels for the checkpoints a logged turn produces (1 start + 1 buy +
+# MOVEMENT_STEPS move + CAVALRY_STEPS cav + 1 battle) - same meaning as
 # engine/turn.py's CHECKPOINT_LABELS, reused as-is by hex_visualizer.py.
 CHECKPOINT_LABELS = ["Start", "Buy", "Move 1", "Move 2", "Move 3",
-                      "Cav 1", "Cav 2", "Cav 3", "Cav 4", "Battle"]
+                      "Cav 1", "Cav 2", "Battle"]
 
 
 def _snapshot_entry(state, hex_index, coord):
@@ -261,8 +262,8 @@ def run_turn_and_log(state, decide_buy, decide_movement, decide_cavalry, decide_
                       rng=None):
     """Same as run_turn, but also returns a turn_record capturing enough
     to replay/visualize the turn: a full board snapshot at every one of
-    the turn's 10 checkpoints, the battle events, and player stats at
-    each checkpoint.
+    the turn's checkpoints (see CHECKPOINT_LABELS), the battle events,
+    and player stats at each checkpoint.
 
     Deliberately simpler than engine/turn.py's run_turn_and_log: that
     version stores a sparse keyframe once per turn plus a diff per

@@ -3,11 +3,11 @@ Hexagon-shaped hex grid visualizer (pygame).
 
 Reads board_state.json (the diff-based format written by
 run.py / engine/turn.py:run_turn_and_log) and reconstructs
-every turn's 10 checkpoint states (start-of-turn keyframe, then after
-buy, each of the 3 movement steps, each of the 4 cavalry steps, and
-after battle) by replaying that turn's sparse deltas on top of a
-running full board. Two sliders let you scrub by turn and by
-checkpoint-within-turn independently.
+every turn's checkpoint states (start-of-turn keyframe, then after
+buy, each of the 3 movement steps, each of the 2 cavalry steps, and
+after battle - see engine/turn.py's CHECKPOINT_LABELS) by replaying that
+turn's sparse deltas on top of a running full board. Two sliders let
+you scrub by turn and by checkpoint-within-turn independently.
 
 Each hex can show:
   - terrain (washed-out fill color, background context only)
@@ -37,7 +37,7 @@ try:
     from engine.turn import CHECKPOINT_LABELS, VP_TO_WIN
 except ImportError:
     CHECKPOINT_LABELS = ["Start", "Buy", "Move 1", "Move 2", "Move 3",
-                          "Cav 1", "Cav 2", "Cav 3", "Cav 4", "Battle"]
+                          "Cav 1", "Cav 2", "Battle"]
     VP_TO_WIN = 50
 
 # ---------------------------------------------------------------------------

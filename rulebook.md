@@ -57,7 +57,7 @@ Movement happens in two parts each turn:
 
 **Regular movement phase**: 3 steps. Each step, every player may move exactly one army 1 hex — even if you control several eligible armies, only one of them may act per step. Any number of units may be split off from that army and moved independently — you don't have to move a whole stack together.
 
-**Cavalry movement phase**: an additional 4 steps, usable only by cavalry units, and subject to the same one-army-per-step rule. Each individual cavalry unit may move up to 2 hexes total during this phase, and a player may not use more than 4 total cavalry steps across their whole cavalry force.
+**Cavalry movement phase**: an additional 2 steps, usable only by cavalry units, and subject to the same one-army-per-step rule. Each individual cavalry unit may move up to 2 hexes total during this phase.
 
 If multiple armies end up moving into the same tile, or attack each other, a battle begins. All armies involved in a battle are locked in place — they cannot move again — until the battle phase resolves the fight.
 

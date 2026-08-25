@@ -2,7 +2,7 @@
 Runs a game end-to-end, writing board_state.json in the checkpoint-log
 format engine/turn.py's run_turn_and_log produces: terrain is stored
 once (it never changes), and each turn is stored as a sparse snapshot
-at each of its 10 checkpoints (start, buy, 3 movement steps, 4 cavalry
+at each of its 8 checkpoints (start, buy, 3 movement steps, 2 cavalry
 steps, battle) - see that module's docstring for why these are
 independent snapshots rather than incremental diffs.
 
