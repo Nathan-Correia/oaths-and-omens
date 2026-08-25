@@ -6,8 +6,10 @@ run.py / engine/turn.py:run_turn_and_log) and reconstructs
 every turn's checkpoint states (start-of-turn keyframe, then after
 buy, each of the 3 movement steps, each of the 2 cavalry steps, and
 after battle - see engine/turn.py's CHECKPOINT_LABELS) by replaying that
-turn's sparse deltas on top of a running full board. Two sliders let
-you scrub by turn and by checkpoint-within-turn independently.
+turn's sparse deltas on top of a running full board. A single slider
+scrubs through every checkpoint of every turn as one continuous
+timeline (turn * len(CHECKPOINT_LABELS) + checkpoint), since every turn
+always produces the same fixed number of checkpoints.
 
 Each hex can show:
   - terrain (washed-out fill color, background context only)
@@ -50,7 +52,7 @@ WINDOW_W = BOARD_AREA_W + SIDEBAR_WIDTH
 WINDOW_H = 1010
 MARGIN = 20  # pixels of padding around the board
 
-SLIDER_BAND_HEIGHT = 110  # reserved band at the bottom for both sliders
+SLIDER_BAND_HEIGHT = 70  # reserved band at the bottom for the slider
 SLIDER_TRACK_COLOR = (70, 70, 78)
 SLIDER_FILL_COLOR = (120, 160, 220)
 SLIDER_HANDLE_COLOR = (230, 230, 235)
@@ -776,21 +778,26 @@ def main():
     offset_y = board_area_h / 2 - board_cy
     centers = {coord: (p[0] + offset_x, p[1] + offset_y) for coord, p in raw_centers.items()}
 
-    turn_slider = Slider(
-        window_w, WINDOW_H - 78, num_turns,
-        label_fn=lambda i: f"Turn {i + 1} / {num_turns}   (drag, or use ↑/↓)",
-    )
-    checkpoint_slider = Slider(
-        window_w, WINDOW_H - 28, len(CHECKPOINT_LABELS),
-        label_fn=lambda i: f"Phase: {CHECKPOINT_LABELS[i]}   (drag, or use ←/→)",
-    )
+    # Single continuous timeline: every turn contributes the same
+    # len(CHECKPOINT_LABELS) checkpoints (run_turn_and_log always builds
+    # that many, one per phase), so a flat step index maps to
+    # (turn, checkpoint) via divmod - no separate turn/checkpoint sliders
+    # to keep in sync.
+    steps_per_turn = len(CHECKPOINT_LABELS)
+    total_steps = num_turns * steps_per_turn
 
-    current_turn = 0
-    current_checkpoint = 0
+    def label_fn(i):
+        turn_idx, checkpoint_idx = divmod(i, steps_per_turn)
+        return (f"Turn {turn_idx + 1} / {num_turns}   "
+                f"Phase: {CHECKPOINT_LABELS[checkpoint_idx]}   (drag, or use ←/→)")
+
+    timeline_slider = Slider(window_w, WINDOW_H - 28, total_steps, label_fn=label_fn)
+
+    current_step = 0
     open_battle_table = None  # None, or a table dict from compute_battle_table
 
     running = True
-    dragging = None  # None | "turn" | "checkpoint"
+    dragging = False
     while running:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
@@ -802,37 +809,29 @@ def main():
                     else:
                         running = False
                 elif event.key in (pygame.K_LEFT, pygame.K_a):
-                    current_checkpoint = max(0, current_checkpoint - 1)
+                    current_step = max(0, current_step - 1)
                 elif event.key in (pygame.K_RIGHT, pygame.K_d):
-                    current_checkpoint = min(len(CHECKPOINT_LABELS) - 1, current_checkpoint + 1)
-                elif event.key in (pygame.K_UP, pygame.K_w):
-                    current_turn = min(num_turns - 1, current_turn + 1)
-                elif event.key in (pygame.K_DOWN, pygame.K_s):
-                    current_turn = max(0, current_turn - 1)
+                    current_step = min(total_steps - 1, current_step + 1)
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 if open_battle_table is not None:
                     # any click closes the popup, per the "(click anywhere to close)" hint
                     open_battle_table = None
-                elif turn_slider.hit_test(event.pos):
-                    dragging = "turn"
-                    current_turn = turn_slider.index_at(event.pos[0])
-                elif checkpoint_slider.hit_test(event.pos):
-                    dragging = "checkpoint"
-                    current_checkpoint = checkpoint_slider.index_at(event.pos[0])
+                elif timeline_slider.hit_test(event.pos):
+                    dragging = True
+                    current_step = timeline_slider.index_at(event.pos[0])
                 elif event.pos[0] < BOARD_AREA_W and event.pos[1] < board_area_h:
                     clicked_hex = find_hex_at_pixel(centers, size, event.pos)
                     if clicked_hex is not None:
+                        current_turn, _ = divmod(current_step, steps_per_turn)
                         battle_event = turn_battles_by_hex[current_turn].get(clicked_hex)
                         if battle_event is not None:
                             open_battle_table = compute_battle_table(battle_event)
             elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
-                dragging = None
+                dragging = False
             elif event.type == pygame.MOUSEMOTION and dragging:
-                if dragging == "turn":
-                    current_turn = turn_slider.index_at(event.pos[0])
-                elif dragging == "checkpoint":
-                    current_checkpoint = checkpoint_slider.index_at(event.pos[0])
+                current_step = timeline_slider.index_at(event.pos[0])
 
+        current_turn, current_checkpoint = divmod(current_step, steps_per_turn)
         board_state = turn_checkpoints[current_turn][current_checkpoint]
         player_stats = turn_player_stats[current_turn][current_checkpoint]
         unit_counts = compute_unit_counts(board_state, num_factions)
@@ -846,8 +845,7 @@ def main():
         draw_sidebar(screen, BOARD_AREA_W, 0, board_area_h, num_factions,
                      player_stats, unit_counts, sidebar_header_font, sidebar_row_font)
 
-        turn_slider.draw(screen, current_turn, label_font)
-        checkpoint_slider.draw(screen, current_checkpoint, label_font)
+        timeline_slider.draw(screen, current_step, label_font)
 
         if open_battle_table is not None:
             draw_battle_popup(screen, window_w, WINDOW_H, open_battle_table,
