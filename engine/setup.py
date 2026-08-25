@@ -19,12 +19,14 @@ import random
 import numpy as np
 
 from .geometry import HexGrid
-from .state import TERRAIN_TO_INDEX, new_empty
+from .state import IMPASSABLE_TERRAIN_INDICES, TERRAIN_TO_INDEX, new_empty
 
 STARTING_SILVER = 50
 STARTING_KILL_XP = 2
 
 _UNSET = -1
+_IMPASSABLE_TYPES = ("mountain", "lake")
+_IMPASSABLE_INDEX_SET = {int(x) for x in IMPASSABLE_TERRAIN_INDICES}
 
 # (min, max) hexes placed per round, inclusive - one entry per terrain type.
 _ROUND_COUNTS = {
@@ -58,7 +60,37 @@ def _same_type_neighbor_count(grid, terrain, index, type_index):
     return count
 
 
-def _can_place(grid, terrain, index, type_name, type_index, placed_so_far):
+def _would_disconnect(grid, terrain, candidate):
+    """True if marking hex `candidate` impassable would split the rest of
+    the board's non-impassable hexes into more than one connected
+    component - i.e. would wall part of the board off into an
+    unreachable island. Unset hexes count as non-impassable here too:
+    every unset hex is guaranteed to end up as some terrain type before
+    generation finishes, and "impassable" only ever means mountain/lake
+    (see IMPASSABLE_TERRAIN_INDICES), so "currently non-impassable" is
+    exactly "will end up passable, eventually." A plain BFS/DFS over a
+    ~150-300 hex board is cheap enough to just rerun from scratch each
+    time this is called - this only runs during one-off map generation,
+    never in the per-turn hot path."""
+    passable = [
+        i for i in range(grid.num_hexes)
+        if i != candidate and int(terrain[i]) not in _IMPASSABLE_INDEX_SET
+    ]
+    if not passable:
+        return False
+    passable_set = set(passable)
+    seen = {passable[0]}
+    stack = [passable[0]]
+    while stack:
+        h = stack.pop()
+        for j in grid.neighbor_table[h]:
+            if j != -1 and j in passable_set and j not in seen:
+                seen.add(j)
+                stack.append(j)
+    return len(seen) != len(passable_set)
+
+
+def _can_place(grid, terrain, index, type_name, type_index, placed_so_far, check_disconnect=True):
     """Whether `index` may become the (placed_so_far + 1)-th hex placed
     this round, given the hexes of this type already on the board
     (including ones placed earlier this round)."""
@@ -66,19 +98,36 @@ def _can_place(grid, terrain, index, type_name, type_index, placed_so_far):
         # First mountain of a round is free; every one after it must
         # extend the chain by exactly one link, keeping mountains linear.
         if placed_so_far == 0:
-            return True
-        return _same_type_neighbor_count(grid, terrain, index, type_index) == 1
-    if type_name in ("lake", "marsh", "desert"):
+            shape_ok = True
+        else:
+            shape_ok = _same_type_neighbor_count(grid, terrain, index, type_index) == 1
+    elif type_name in ("lake", "marsh", "desert"):
         # First two hexes of a round are free; from the third on, the
         # hex must be growing an existing body rather than sprouting a
         # new one.
         if placed_so_far < 2:
-            return True
-        return _same_type_neighbor_count(grid, terrain, index, type_index) >= 2
+            shape_ok = True
+        else:
+            shape_ok = _same_type_neighbor_count(grid, terrain, index, type_index) >= 2
+    else:
+        shape_ok = True
+
+    if not shape_ok:
+        return False
+    if check_disconnect and type_name in _IMPASSABLE_TYPES and _would_disconnect(grid, terrain, index):
+        return False
     return True
 
 
-def _place_round(grid, terrain, rng, start, type_name, round_index, log, bag):
+def _place_round(grid, terrain, rng, start, type_name, round_index, log, bag, check_disconnect=True):
+    """Returns [] without touching `bag` if `start` itself (the round's
+    seed hex, which - unlike every later hex in the blob - isn't run
+    through _can_place's shape rules either, by design) would disconnect
+    the board; generate_terrain's loop just tries a fresh random type/
+    start combo next iteration when that happens."""
+    if check_disconnect and type_name in _IMPASSABLE_TYPES and _would_disconnect(grid, terrain, start):
+        return []
+
     type_index = TERRAIN_TO_INDEX[type_name]
     lo, hi = _ROUND_COUNTS[type_name]
     target = min(rng.randint(lo, hi), bag[type_name])
@@ -99,7 +148,7 @@ def _place_round(grid, terrain, rng, start, type_name, round_index, log, bag):
                     candidates.add(int(j))
         candidates = [
             c for c in candidates
-            if _can_place(grid, terrain, c, type_name, type_index, len(placed))
+            if _can_place(grid, terrain, c, type_name, type_index, len(placed), check_disconnect=check_disconnect)
         ]
         if not candidates:
             break
@@ -115,7 +164,24 @@ def generate_terrain(grid, rng, log=None):
     from a shrinking "bag" (weighted by how many of that type are left,
     see BAG_COUNTS) and grows a random-sized blob of it out from a spot
     touching the already-generated board (or, for the very first round,
-    a random edge hex), subject to that type's placement rules.
+    a random edge hex), subject to that type's placement rules - which
+    now includes never letting a mountain/lake hex wall part of the
+    board off into an unreachable island (see _would_disconnect):
+    _can_place rejects any such hex mid-blob, and _place_round refuses
+    to even seed a round on one, in which case this loop just tries a
+    different random type/start combo next iteration - `start` gets
+    redrawn from the same "adjacent to whatever's already placed"
+    candidate pool every iteration regardless of whether anything
+    actually got placed, so a blocked attempt costs nothing but a retry.
+
+    Only genuinely pathological bag exhaustion (every passable-type
+    entry spent while unset hexes remain, forcing mountain/lake attempts
+    that keep landing somewhere disconnecting) could make that retry
+    loop drag on; `max_stuck_rounds` is a generous, board-size-scaled
+    circuit breaker that just stops enforcing the island check for the
+    rest of generation if it's ever actually hit - an occasional island
+    beats a hang, and this is orders of magnitude more attempts than the
+    default BAG_COUNTS/RADIUS should ever need.
 
     If `log` is given (a list), every individual hex placement is
     appended to it in placement order as {"q","r","s","terrain","round"}
@@ -128,13 +194,23 @@ def generate_terrain(grid, rng, log=None):
     start = rng.choice(edge_hexes)
 
     round_index = 0
+    stuck_rounds = 0
+    max_stuck_rounds = grid.num_hexes * 4
+    check_disconnect = True
     while unset:
         types = [t for t, count in bag.items() if count > 0]
         weights = [bag[t] for t in types]
         type_name = rng.choices(types, weights=weights, k=1)[0]
-        placed = _place_round(grid, terrain, rng, start, type_name, round_index, log, bag)
+        placed = _place_round(grid, terrain, rng, start, type_name, round_index, log, bag,
+                               check_disconnect=check_disconnect)
         round_index += 1
-        unset.difference_update(placed)
+        if placed:
+            stuck_rounds = 0
+            unset.difference_update(placed)
+        else:
+            stuck_rounds += 1
+            if stuck_rounds >= max_stuck_rounds:
+                check_disconnect = False
         if unset:
             candidates = [
                 i for i in unset
