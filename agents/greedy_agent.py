@@ -2,10 +2,9 @@
 GreedyAgent for engine: a single-minded outpost rush.
 
 Buy phase prioritizes building as many outposts as it can afford and has
-units for, then spends whatever's left the same aggressive way as
-heuristic_agent/smart_random_agent - infantry with leftover silver, all
-banked kill-XP converted toward whichever of cavalry/archers it currently
-has fewer of.
+units for, then spends whatever's left aggressively - infantry with
+leftover silver, all banked kill-XP converted toward whichever of
+cavalry/archers it currently has fewer of.
 
 Movement/cavalry phases have two priorities, strictly ordered: while this
 faction still has room for more outposts (under OUTPOST_CAP) and at
@@ -21,19 +20,16 @@ denies that opponent their per-round outpost VP going forward), or, if
 none exist yet, the nearest enemy capital instead, just to keep units
 advancing rather than sitting idle.
 
-Deliberately blunter than heuristic_agent: no retreat logic, no threat-
-aware pathing around stronger armies en route - always takes whichever
-legal step most closes distance to the current target, for better or
-worse. That single-mindedness is what "greedy" means here, not tactical
-caution.
+No retreat logic, no threat-aware pathing around stronger armies en
+route - always takes whichever legal step most closes distance to the
+current target, for better or worse. That single-mindedness is what
+"greedy" means here, not tactical caution.
 
 decide_target/decide_rectification are reused as-is from random_agent.py
-(neither needs to be smart for this agent's strategy to work, same as
-every other scripted agent in this package), and the setup-phase
-decisions (placement/draft/swap) aren't part of this agent's stated
-strategy either, so those are borrowed from smart_random_agent.py's
-farthest-point-greedy policies instead of plain random - a better
-thematic fit for "greedy" than a uniform coin flip.
+- neither needs to be smart for this agent's strategy to work. Setup-
+phase decisions (placement/draft/swap) get their own greedy policy
+below: farthest-point placement/drafting, since a uniform coin flip
+would be an odd fit for an agent named "greedy".
 """
 
 import random
@@ -41,7 +37,6 @@ import random
 import numpy as np
 
 from .random_agent import random_rectification, random_target
-from .smart_random_agent import smart_draft, smart_placement, smart_swap
 from engine.buy import INFANTRY_COST, OUTPOST_CAP, _can_build_outpost, _outpost_count
 from engine.geometry import hex_distance
 from engine.state import IMPASSABLE_TERRAIN_INDICES, NO_FACTION, count_units_in_play
@@ -196,6 +191,47 @@ def greedy_rush_move(state, faction, legal_mask):
     return _move_toward(grid, ranked, legal_mask, targets)
 
 
+def _nearest_dist(grid, hex_index, other_hexes):
+    """Hex distance from hex_index to the nearest hex in other_hexes."""
+    coord = grid.coord_of(hex_index)
+    return min(hex_distance(coord, grid.coord_of(h)) for h in other_hexes)
+
+
+def greedy_placement(state, legal_mask):
+    """Places on whichever legal hex is farthest from the nearest
+    already-placed city - the same "farthest point" idea
+    engine/setup.py used to apply automatically, now an agent choice."""
+    grid = state.grid
+    candidates = np.nonzero(legal_mask)[0].tolist()
+    placed = np.nonzero(state.city_placer != NO_FACTION)[0].tolist()
+    if not placed:
+        return candidates[0]
+    return max(candidates, key=lambda h: _nearest_dist(grid, h, placed))
+
+
+def greedy_draft(state, legal_pool):
+    """Drafts whichever legal pool city is farthest from the nearest
+    already-claimed capital - a simple defensibility-flavored pick."""
+    grid = state.grid
+    claimed = np.nonzero(state.city_owner != NO_FACTION)[0].tolist()
+    if not claimed:
+        return legal_pool[0]
+    return max(legal_pool, key=lambda h: _nearest_dist(grid, h, claimed))
+
+
+def greedy_swap(state, leftover_hex, placer_hex):
+    """Swaps only if placer_hex is a strict improvement over leftover_hex -
+    farther from the nearest other already-claimed capital."""
+    grid = state.grid
+    others = [
+        h for h in np.nonzero(state.city_owner != NO_FACTION)[0].tolist()
+        if h not in (leftover_hex, placer_hex)
+    ]
+    if not others:
+        return False
+    return _nearest_dist(grid, placer_hex, others) > _nearest_dist(grid, leftover_hex, others)
+
+
 def make_greedy_agents(num_factions, seed=0):
     """Returns (decide_buy, decide_movement, decide_cavalry, decide_target,
     decide_rectification, decide_placement, decide_draft, decide_swap) -
@@ -219,13 +255,13 @@ def make_greedy_agents(num_factions, seed=0):
         return random_rectification(state, hex_index, winner_faction, cap, rngs[winner_faction])
 
     def decide_placement(state, faction, legal_mask):
-        return smart_placement(state, legal_mask)
+        return greedy_placement(state, legal_mask)
 
     def decide_draft(state, faction, legal_pool):
-        return smart_draft(state, legal_pool)
+        return greedy_draft(state, legal_pool)
 
     def decide_swap(state, faction, leftover_hex, placer_faction, placer_hex):
-        return smart_swap(state, leftover_hex, placer_hex)
+        return greedy_swap(state, leftover_hex, placer_hex)
 
     factions = range(num_factions)
     return (

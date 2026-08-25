@@ -12,11 +12,8 @@ decision - so there's no split left to sample: decide_movement/
 decide_cavalry just returns one (hex_index, direction) pulled from the
 legal mask, or None.
 
-decide_target/decide_rectification are reused as-is by
-smart_random_agent.py and heuristic_agent.py, mirroring v1's
-SmartRandomAgent/HeuristicAgent inheriting these two unchanged from
-RandomAgent - neither battle targeting nor rectification needs to be
-smart.
+decide_target/decide_rectification are reused as-is by greedy_agent.py -
+neither battle targeting nor rectification needs to be smart.
 
 decide_placement/decide_draft/decide_swap (see engine/placement.py's
 module docstring for the full setup process and each signature) are

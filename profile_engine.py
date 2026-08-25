@@ -20,9 +20,7 @@ import time
 
 from agents import compose_agents
 from agents.greedy_agent import make_greedy_agents
-from agents.heuristic_agent import make_heuristic_agents
 from agents.random_agent import make_random_agents
-from agents.smart_random_agent import make_smart_random_agents
 from engine.placement import run_city_setup
 from engine.setup import create_initial_state
 from engine.turn import run_turn, run_turn_and_log, check_game_end
@@ -32,8 +30,8 @@ NUM_FACTIONS = 8
 MAX_TURNS = 100
 SEED = 1
 
-# Per-faction agent choice - any of "random", "smart_random", "heuristic", "greedy", "nn".
-AGENT_ASSIGNMENT = {f: "heuristic" for f in range(NUM_FACTIONS)}
+# Per-faction agent choice - any of "random", "greedy", "nn".
+AGENT_ASSIGNMENT = {f: "greedy" for f in range(NUM_FACTIONS)}
 
 
 def _build_nn_agents(state):
@@ -53,8 +51,6 @@ def make_game():
     state = create_initial_state(radius=RADIUS, num_factions=NUM_FACTIONS, seed=SEED)
     build_fns = {
         "random": lambda: make_random_agents(NUM_FACTIONS, seed=SEED),
-        "smart_random": lambda: make_smart_random_agents(NUM_FACTIONS, seed=SEED),
-        "heuristic": lambda: make_heuristic_agents(NUM_FACTIONS, seed=SEED),
         "greedy": lambda: make_greedy_agents(NUM_FACTIONS, seed=SEED),
         "nn": lambda: _build_nn_agents(state),
     }

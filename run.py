@@ -7,8 +7,8 @@ steps, battle) - see that module's docstring for why these are
 independent snapshots rather than incremental diffs.
 
 Agent mix is configurable per faction via AGENT_ASSIGNMENT below - any
-mix of "random"/"smart_random"/"heuristic"/"greedy"/"nn" (a randomly-
-initialized, untrained JAX policy network; see agents/nn_agent/). Faction id -> color
+mix of "random"/"greedy"/"nn" (a randomly-initialized, untrained JAX
+policy network; see agents/nn_agent/). Faction id -> color
 is fixed (see hex_visualizer.py's FACTION_COLORS: 0=red, 1=blue,
 2=green, 3=purple, 4=orange, 5=brown, 6=pink, 7=grey).
 
@@ -43,9 +43,7 @@ import time
 
 from agents import compose_agents
 from agents.greedy_agent import make_greedy_agents
-from agents.heuristic_agent import make_heuristic_agents
 from agents.random_agent import make_random_agents
-from agents.smart_random_agent import make_smart_random_agents
 from engine.placement import run_city_setup
 from engine.setup import create_initial_state
 from engine.state import TERRAIN_TYPES
@@ -63,7 +61,7 @@ MAX_TURNS = 100
 # hardcoding this value back in, if that's ever useful for debugging.
 SEED = int(time.time() * 1000) % (2 ** 31)
 
-# Per-faction agent choice - any of "random", "smart_random", "heuristic", "greedy", "nn".
+# Per-faction agent choice - any of "random", "greedy", "nn".
 AGENT_ASSIGNMENT = {f: "greedy" for f in range(NUM_FACTIONS)}
 
 
@@ -100,8 +98,6 @@ def main():
 
     build_fns = {
         "random": lambda: make_random_agents(NUM_FACTIONS, seed=SEED),
-        "smart_random": lambda: make_smart_random_agents(NUM_FACTIONS, seed=SEED),
-        "heuristic": lambda: make_heuristic_agents(NUM_FACTIONS, seed=SEED),
         "greedy": lambda: make_greedy_agents(NUM_FACTIONS, seed=SEED),
         "nn": lambda: _build_nn_agents(state),
     }
