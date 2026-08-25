@@ -127,13 +127,16 @@ def _run_battle_phase(state, decide_target, decide_rectification, rng):
 
 def apply_victory_points(state):
     """End-of-round VP tally (the win condition - see get_game_winner):
-    1 point per outpost currently controlled, capitals don't count.
-    Destroying an enemy outpost is awarded separately, immediately, in
-    _run_battle_phase (OUTPOST_DESTROY_VP) - this only covers the
-    recurring per-round income."""
+    your first outpost earns nothing, and each additional one beyond
+    that earns OUTPOST_VP_PER_ROUND more - so 1 outpost is worth 0/round,
+    2 is worth 1, 3 is worth 2, and so on (max(0, outposts - 1), not a
+    flat per-outpost rate). Capitals don't count. Destroying an enemy
+    outpost is awarded separately, immediately, in _run_battle_phase
+    (OUTPOST_DESTROY_VP) - this only covers the recurring per-round
+    income."""
     for faction in range(state.num_factions):
         outposts = int(np.sum((state.city_owner == faction) & ~state.is_capital))
-        state.victory_points[faction] += outposts * OUTPOST_VP_PER_ROUND
+        state.victory_points[faction] += max(0, outposts - 1) * OUTPOST_VP_PER_ROUND
 
 
 def get_game_winner(state):

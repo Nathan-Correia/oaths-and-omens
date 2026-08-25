@@ -153,6 +153,6 @@ Outposts are smaller, disposable extensions of a player's territory — unlike a
 
 Victory points are the win condition. The first player to reach 50 wins.
 
-At the end of every round, each player earns 1 victory point for every outpost they currently control. Destroying another player's outpost also immediately awards the winner of that battle 2 victory points, on top of the recurring per-round total.
+At the end of every round, each player earns victory points based on how many outposts they currently control — the first one earns nothing, and each additional outpost beyond that earns 1 more point per round: 2 outposts earns 1 VP/round, 3 earns 2 VP/round, 4 earns 3 VP/round, and so on. Destroying another player's outpost also immediately awards the winner of that battle 2 victory points, on top of the recurring per-round total.
 
 If, at the end of a round, one or more players are at or above 50 victory points, whoever has the single highest total wins immediately. If the top total is exactly tied between two or more players, whoever of them placed their capital later during setup wins the tiebreak.
