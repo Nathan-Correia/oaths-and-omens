@@ -37,11 +37,17 @@ class TrainingSample:
         self.return_ = return_
 
 
-def compute_gae(buffer, gamma, lam):
+def compute_gae(trajectories, gamma, lam):
     """Returns a flat list[TrainingSample] built from every trajectory in
-    `buffer` (see training/buffer.py's RolloutBuffer.trajectories)."""
+    `trajectories` - an iterable of (steps, bootstrap_value) pairs, e.g. a
+    single RolloutBuffer.trajectories() or, when rollout collection was
+    split across multiple worker processes (see rollout.collect_parallel),
+    itertools.chain.from_iterable(b.trajectories() for b in buffers).
+    Buffers themselves are never merged - each worker's internal game-id
+    numbering starts at 0 independently, so trajectories() is the correct
+    point to combine them, not the buffers' internal dicts."""
     samples = []
-    for steps, bootstrap_value in buffer.trajectories():
+    for steps, bootstrap_value in trajectories:
         if not steps:
             continue
 

@@ -129,12 +129,19 @@ def update(network, optimizer, samples, neighbor_table_t, device, clip_eps=0.2, 
     `epochs` passes with freshly-shuffled minibatches each pass. Each
     minibatch gets exactly one network(...) forward call (see module
     docstring) and one backward()/optimizer.step(). `verbose`: print one
-    line per epoch with that epoch's mean minibatch loss."""
+    line per epoch with the combined loss and its policy/value/entropy
+    components separately - the combined number alone can look flat/stuck
+    while actually being dominated by one term (e.g. an unnormalized
+    value loss, since rewards are raw VP-delta swings), so the breakdown
+    is what actually shows which piece is or isn't improving."""
     network.train()
     indices = list(range(len(samples)))
     for epoch in range(epochs):
         random.shuffle(indices)
         epoch_losses = []
+        epoch_policy_losses = []
+        epoch_value_losses = []
+        epoch_entropies = []
         for start in range(0, len(indices), minibatch_size):
             batch_idx = indices[start:start + minibatch_size]
             batch = [samples[i] for i in batch_idx]
@@ -165,8 +172,15 @@ def update(network, optimizer, samples, neighbor_table_t, device, clip_eps=0.2, 
             torch.nn.utils.clip_grad_norm_(network.parameters(), max_grad_norm)
             optimizer.step()
             epoch_losses.append(loss.item())
+            epoch_policy_losses.append(policy_loss.mean().item())
+            epoch_value_losses.append(value_loss.mean().item())
+            epoch_entropies.append(entropy.mean().item())
 
         if verbose:
-            avg_loss = sum(epoch_losses) / len(epoch_losses) if epoch_losses else float("nan")
-            print(f"  ppo epoch {epoch + 1}/{epochs}: mean minibatch loss = {avg_loss:.4f}")
+            def _mean(xs):
+                return sum(xs) / len(xs) if xs else float("nan")
+            print(f"  ppo epoch {epoch + 1}/{epochs}: loss={_mean(epoch_losses):.4f} "
+                  f"(policy={_mean(epoch_policy_losses):.4f}, "
+                  f"value={_mean(epoch_value_losses):.4f}, "
+                  f"entropy={_mean(epoch_entropies):.4f})")
     network.eval()
