@@ -72,6 +72,22 @@ def faction_totals(state, hex_index):
     return totals
 
 
+def faction_moved_totals(state, hex_index):
+    """{faction: int[3]} in first-appearance order, like faction_totals,
+    but summed only over contribution slots flagged battle_moved=True -
+    i.e. units that actually moved to join this fight (attacker,
+    encounter/line-battle participant, or a later reinforcement), not a
+    stationary occupant the battle triggered against. Used to gate the
+    real Archers ability (see apply_archer_abilities) to the attacking
+    side - see state.py's battle_moved field docstring for why this
+    can't just be inferred from battle_origin."""
+    totals = {}
+    for f in _battle_faction_order(state, hex_index):
+        mask = (state.battle_faction[hex_index] == f) & state.battle_moved[hex_index]
+        totals[f] = state.battle_units[hex_index][mask].sum(axis=0)
+    return totals
+
+
 def faction_alive_totals(state, hex_index):
     """{faction: total_units} for factions still alive in this battle -
     mirrors engine/battle.py's faction_alive_totals()."""
@@ -118,17 +134,53 @@ def _apply_kills_to_faction(state, hex_index, target_faction, num_kills, killer_
                 )
 
 
-def apply_archer_abilities(state, hex_index, rng):
-    """Runs once, before round 1. Returns a death_log list of
-    {"faction", "unit_type", "count", "killer"} dicts - mirrors
-    engine/battle.py's apply_archer_abilities."""
+def _apply_kills_and_dismounts(state, hex_index, target_faction, num_kills, killer_faction,
+                                rng, infantry_counts, death_log, dismount_log):
+    """Applies num_kills to target_faction (see _apply_kills_to_faction),
+    then rolls the cavalry dismount ability (rulebook: "whenever a
+    cavalry unit dies in battle") for each cavalry unit that died in
+    that application - mirrors the dismount block resolve_round runs
+    for ordinary combat rounds, but for the pre-round structure/archer
+    phases, which used to apply their kills without ever giving cavalry
+    a chance to dismount. Appends {"faction", "success", ["reason"]}
+    dicts to dismount_log, same shape as resolve_round's."""
+    cav_before = int(state.battle_units[hex_index, state.battle_faction[hex_index] == target_faction, 1].sum())
+    _apply_kills_to_faction(state, hex_index, target_faction, num_kills, killer_faction, death_log)
+    cav_after = int(state.battle_units[hex_index, state.battle_faction[hex_index] == target_faction, 1].sum())
+
+    for _ in range(cav_before - cav_after):
+        if rng.randint(1, 20) < 14:
+            dismount_log.append({"faction": target_faction, "success": False})
+            continue
+        if infantry_counts.get(target_faction, 0) >= int(SPAWN_CAPS[0]):
+            dismount_log.append({"faction": target_faction, "success": False, "reason": "cap"})
+            continue
+        for k in range(state.battle_faction.shape[1]):
+            if state.battle_faction[hex_index, k] == target_faction:
+                state.battle_units[hex_index, k, 0] += 1
+                break
+        infantry_counts[target_faction] = infantry_counts.get(target_faction, 0) + 1
+        dismount_log.append({"faction": target_faction, "success": True})
+
+
+def apply_archer_abilities(state, hex_index, rng, infantry_counts):
+    """Runs once, before round 1. Only archers that actually moved to
+    join this battle get to fire - a stationary defender's archers
+    don't roll at all (see faction_moved_totals / state.py's
+    battle_moved docstring); targeting still weighs each side's full
+    strength, moved or not. Returns (death_log, dismount_log), each a
+    list of dicts in the same shape as resolve_round's "deaths"/
+    "dismounts" - mirrors engine/battle.py's apply_archer_abilities,
+    now also covering cavalry dismounts (see _apply_kills_and_dismounts)."""
     order = _battle_faction_order(state, hex_index)
     totals = faction_totals(state, hex_index)
+    moved_totals = faction_moved_totals(state, hex_index)
     alive = {f: t for f, t in totals.items() if int(t.sum()) > 0}
     death_log = []
+    dismount_log = []
 
     for faction in order:
-        archers = int(totals[faction][2])
+        archers = int(moved_totals.get(faction, np.zeros(3))[2])
         if archers <= 0 or faction not in alive:
             continue
         rivals = {f: int(alive[f].sum()) for f in order if f != faction and f in alive}
@@ -141,29 +193,30 @@ def apply_archer_abilities(state, hex_index, rng):
             if rng.randint(1, 20) >= 11:
                 kills += 1
         if kills > 0:
-            _apply_kills_to_faction(state, hex_index, target, kills, faction, death_log)
+            _apply_kills_and_dismounts(state, hex_index, target, kills, faction, rng, infantry_counts,
+                                        death_log, dismount_log)
 
-    return death_log
+    return death_log, dismount_log
 
 
-def apply_structure_defense_shots(state, hex_index, rng):
+def apply_structure_defense_shots(state, hex_index, rng, infantry_counts):
     """Runs once, before round 1 (and before real Archer units get their
     own ability - see apply_archer_abilities). A capital or outpost gets
     free defensive shots against whoever's attacking its tile, even if
     its owner has no units there to defend with: 2 shots for a capital,
     1 for an outpost, each 11-20 = 1 kill against the largest attacking
     army, same math as the real Archers ability but a deliberately
-    separate mechanic so it can be tuned independently later. Returns a
-    death_log list in the same shape as apply_archer_abilities."""
+    separate mechanic so it can be tuned independently later. Returns
+    (death_log, dismount_log) - see apply_archer_abilities."""
     owner = int(state.city_owner[hex_index])
     if owner == NO_FACTION:
-        return []
+        return [], []
 
     totals = faction_totals(state, hex_index)
     alive = {f: t for f, t in totals.items() if int(t.sum()) > 0}
     rivals = {f: int(t.sum()) for f, t in alive.items() if f != owner}
     if not rivals:
-        return []
+        return [], []
     target = max(rivals, key=lambda f: rivals[f])
 
     shots = CAPITAL_DEFENSE_SHOTS if state.is_capital[hex_index] else OUTPOST_DEFENSE_SHOTS
@@ -173,9 +226,11 @@ def apply_structure_defense_shots(state, hex_index, rng):
             kills += 1
 
     death_log = []
+    dismount_log = []
     if kills > 0:
-        _apply_kills_to_faction(state, hex_index, target, kills, owner, death_log)
-    return death_log
+        _apply_kills_and_dismounts(state, hex_index, target, kills, owner, rng, infantry_counts,
+                                    death_log, dismount_log)
+    return death_log, dismount_log
 
 
 def _resolve_targets(state, hex_index, target_choices):
@@ -289,25 +344,28 @@ def resolve_full_battle(state, hex_index, target_fn, rng, infantry_counts=None):
     real turn orchestration should share one tally across every battle
     resolved that turn - see engine/turn.py's _run_battle_phase for why).
 
-    Returns {"structure_phase": [...], "archer_phase": [...], "rounds":
-    [round_log, ...]} - "rounds" and "archer_phase" match the shape of
-    engine/battle.py's resolve_full_battle, for replay/visualization (see
-    module docstring); "structure_phase" is new (see
-    apply_structure_defense_shots) and not yet consumed by any replay
-    viewer. Always computed, same as v1 - cheap, bounded by actual rounds
-    fought - even if a given caller (e.g. run_turn, as opposed to
-    run_turn_and_log) doesn't keep it.
+    Returns {"structure_phase": [...], "structure_phase_dismounts": [...],
+    "archer_phase": [...], "archer_phase_dismounts": [...], "rounds":
+    [round_log, ...]} - "rounds", "structure_phase" and "archer_phase"
+    match the shape of engine/battle.py's resolve_full_battle, for
+    replay/visualization (see module docstring); the two
+    "*_dismounts" keys are new (see _apply_kills_and_dismounts - cavalry
+    killed by a structure's defense shots or the real Archers ability
+    used to never get a chance to dismount) and not yet consumed by any
+    replay viewer. Always computed, same as v1 - cheap, bounded by
+    actual rounds fought - even if a given caller (e.g. run_turn, as
+    opposed to run_turn_and_log) doesn't keep it.
     """
     if infantry_counts is None:
         infantry_counts = {f: count_units_in_play(state, f, 0) for f in _battle_faction_order(state, hex_index)}
 
     players_kill_xp = state.kill_xp
 
-    structure_phase = apply_structure_defense_shots(state, hex_index, rng)
+    structure_phase, structure_phase_dismounts = apply_structure_defense_shots(state, hex_index, rng, infantry_counts)
     for entry in structure_phase:
         players_kill_xp[entry["killer"]] += entry["count"]
 
-    archer_phase = apply_archer_abilities(state, hex_index, rng)
+    archer_phase, archer_phase_dismounts = apply_archer_abilities(state, hex_index, rng, infantry_counts)
     for entry in archer_phase:
         players_kill_xp[entry["killer"]] += entry["count"]
 
@@ -329,7 +387,13 @@ def resolve_full_battle(state, hex_index, target_fn, rng, infantry_counts=None):
 
         rounds_run += 1
 
-    return {"structure_phase": structure_phase, "archer_phase": archer_phase, "rounds": rounds}
+    return {
+        "structure_phase": structure_phase,
+        "structure_phase_dismounts": structure_phase_dismounts,
+        "archer_phase": archer_phase,
+        "archer_phase_dismounts": archer_phase_dismounts,
+        "rounds": rounds,
+    }
 
 
 def rectify_overflow(state, hex_index, winner_faction, send_back, cap=MAX_STACK_SIZE):
@@ -396,6 +460,7 @@ def rectify_overflow(state, hex_index, winner_faction, send_back, cap=MAX_STACK_
     state.battle_faction[hex_index] = NO_FACTION
     state.battle_origin[hex_index] = NO_ORIGIN
     state.battle_units[hex_index] = 0
+    state.battle_moved[hex_index] = False
     state.battle_round[hex_index] = 0
     state.battle_order.remove(hex_index)
 

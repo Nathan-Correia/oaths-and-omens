@@ -97,6 +97,7 @@ def _run_battle_phase(state, decide_target, decide_rectification, rng):
             state.battle_faction[hex_index] = NO_FACTION
             state.battle_origin[hex_index] = NO_ORIGIN
             state.battle_units[hex_index] = 0
+            state.battle_moved[hex_index] = False
             state.battle_round[hex_index] = 0
             state.battle_order.remove(hex_index)
         else:
@@ -116,7 +117,9 @@ def _run_battle_phase(state, decide_target, decide_rectification, rng):
             "hex": list(state.grid.coord_of(hex_index)),
             "contributions_start": contributions_start,
             "structure_phase": full_log["structure_phase"],
+            "structure_phase_dismounts": full_log["structure_phase_dismounts"],
             "archer_phase": full_log["archer_phase"],
+            "archer_phase_dismounts": full_log["archer_phase_dismounts"],
             "rounds": full_log["rounds"],
             "winner": winner,
             "rectification": send_back,
@@ -178,14 +181,14 @@ def run_turn(state, decide_buy, decide_movement, decide_cavalry, decide_target, 
         for faction in range(state.num_factions):
             legal = legal_movement_mask(state, faction)
             actions[faction] = decide_movement[faction](state, faction, step, legal)
-        apply_movement_step(state, actions, cavalry_only=False)
+        apply_movement_step(state, actions, rng, cavalry_only=False)
 
     for step in range(CAVALRY_STEPS):
         actions = {}
         for faction in range(state.num_factions):
             legal = legal_cavalry_mask(state, faction)
             actions[faction] = decide_cavalry[faction](state, faction, step, legal)
-        apply_movement_step(state, actions, cavalry_only=True)
+        apply_movement_step(state, actions, rng, cavalry_only=True)
 
     _run_battle_phase(state, decide_target, decide_rectification, rng)
     apply_terrain_effects(state)
@@ -304,7 +307,7 @@ def run_turn_and_log(state, decide_buy, decide_movement, decide_cavalry, decide_
             chosen = decide_movement[faction](state, faction, step, legal)
             if chosen:
                 actions[faction] = chosen
-        apply_movement_step(state, actions, cavalry_only=False)
+        apply_movement_step(state, actions, rng, cavalry_only=False)
         checkpoints.append(sparse_hexes(snapshot_hexes(state)))
         player_stats.append(_player_stats_snapshot(state))
 
@@ -315,7 +318,7 @@ def run_turn_and_log(state, decide_buy, decide_movement, decide_cavalry, decide_
             chosen = decide_cavalry[faction](state, faction, step, legal)
             if chosen:
                 actions[faction] = chosen
-        apply_movement_step(state, actions, cavalry_only=True)
+        apply_movement_step(state, actions, rng, cavalry_only=True)
         checkpoints.append(sparse_hexes(snapshot_hexes(state)))
         player_stats.append(_player_stats_snapshot(state))
 

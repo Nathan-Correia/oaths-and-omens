@@ -113,19 +113,26 @@ def _first_empty_battle_slot(state, hex_index):
 
 
 def _start_or_extend_battle(state, hex_index, contributions):
-    """contributions: list of (faction, origin_index, units[3]). Mirrors
-    engine/movement.py's _start_or_extend_battle: appends to whatever's
-    already there (round number untouched if the hex was already
-    locked, reset to 0 the moment it newly becomes locked), and clears/
-    locks the hex's peaceful-army slot. Also records the hex into
-    state.battle_order the moment it newly locks - see state.py's
-    module docstring for why battle processing order matters."""
+    """contributions: list of (faction, origin_index, units[3], moved).
+    `moved` is True iff this slot's units moved into hex_index to join
+    the fight (attacker, encounter/line-battle participant, or a later
+    reinforcement) - False only for a stationary occupant a battle
+    triggered against without them going anywhere. See state.py's
+    battle_moved field docstring for why this is tracked separately
+    from origin_index. Mirrors engine/movement.py's
+    _start_or_extend_battle: appends to whatever's already there (round
+    number untouched if the hex was already locked, reset to 0 the
+    moment it newly becomes locked), and clears/locks the hex's
+    peaceful-army slot. Also records the hex into state.battle_order the
+    moment it newly locks - see state.py's module docstring for why
+    battle processing order matters."""
     was_locked = bool(state.locked[hex_index])
-    for faction, origin_index, units in contributions:
+    for faction, origin_index, units, moved in contributions:
         slot = _first_empty_battle_slot(state, hex_index)
         state.battle_faction[hex_index, slot] = faction
         state.battle_origin[hex_index, slot] = origin_index
         state.battle_units[hex_index, slot] = units
+        state.battle_moved[hex_index, slot] = moved
     if not was_locked:
         state.battle_round[hex_index] = 0
         state.battle_order.append(hex_index)
@@ -180,7 +187,7 @@ def _validate_and_collect(state, actions_by_faction, cavalry_only):
     return collected
 
 
-def apply_movement_step(state, actions_by_faction, cavalry_only=False):
+def apply_movement_step(state, actions_by_faction, rng, cavalry_only=False):
     """Applies one simultaneous movement step in place. Returns the set
     of hex indices with a battle pending after this step (new or
     reinforced) - same contract as engine/movement.py's
@@ -188,7 +195,10 @@ def apply_movement_step(state, actions_by_faction, cavalry_only=False):
     regular and cavalry movement phases (the caller decides which by
     which legal-action generator it used - see turn.py in engine/).
     `cavalry_only` must match: True for actions built from
-    legal_cavalry_mask, False for legal_movement_mask."""
+    legal_cavalry_mask, False for legal_movement_mask. `rng` is only
+    consumed for a Line Battle's exact-tie coin flip (see pass 1
+    below) - callers should pass the same rng used for the rest of the
+    turn so replays stay deterministic."""
     moves = _validate_and_collect(state, actions_by_faction, cavalry_only)
 
     # --- pass 1: swap / line-battle detection ---
@@ -206,10 +216,24 @@ def apply_movement_step(state, actions_by_faction, cavalry_only=False):
             for mm in (m, reverse):
                 _subtract_departure(state, mm["from"], mm["units"])
 
-            battle_hex = min(m["from"], m["to"])
+            # Line Battle: the fight has to be pinned to one of the two
+            # engaged tiles (there's no third, neutral hex to put it on).
+            # The smaller army's own starting hex hosts it - flavor: they
+            # got pushed back onto their own ground - with a coin flip on
+            # an exact tie, rather than the meaningless min(hex_index)
+            # this used to be.
+            m_total = _units_total(m["units"])
+            r_total = _units_total(reverse["units"])
+            if m_total < r_total:
+                battle_hex = m["from"]
+            elif r_total < m_total:
+                battle_hex = reverse["from"]
+            else:
+                battle_hex = m["from"] if rng.random() < 0.5 else reverse["from"]
+
             contributions = [
-                (m["faction"], m["from"], m["units"]),
-                (reverse["faction"], reverse["from"], reverse["units"]),
+                (m["faction"], m["from"], m["units"], True),
+                (reverse["faction"], reverse["from"], reverse["units"], True),
             ]
             _start_or_extend_battle(state, battle_hex, contributions)
             swap_pairs_handled.add(key)
@@ -230,7 +254,14 @@ def apply_movement_step(state, actions_by_faction, cavalry_only=False):
         faction's peaceful merge (starts a battle there instead of
         vanishing/merging silently) or - a latent quirk present in v1
         too, not introduced here - become locked by an unrelated battle
-        this same step (recreates a peaceful army on a locked hex)."""
+        this same step (recreates a peaceful army on a locked hex).
+
+        moved flags for that battle-starting branch: the faction that
+        peacefully claimed `origin` this step actually moved there
+        (True) - `a`'s own move got voided by the overstack revert, so
+        by the end of this step they never actually left `origin` at
+        all (False), same as any other stationary occupant a battle
+        triggers against."""
         origin = a["from"]
         if state.army_faction[origin] == NO_FACTION:
             state.army_faction[origin] = a["faction"]
@@ -239,14 +270,14 @@ def apply_movement_step(state, actions_by_faction, cavalry_only=False):
             state.army_units[origin] = state.army_units[origin] + a["units"]
         else:
             contributions = [
-                (int(state.army_faction[origin]), origin, _units_at(state, origin)),
-                (a["faction"], origin, a["units"]),
+                (int(state.army_faction[origin]), origin, _units_at(state, origin), True),
+                (a["faction"], origin, a["units"], False),
             ]
             _start_or_extend_battle(state, origin, contributions)
 
     for dest, arrivals in arrivals_by_dest.items():
         if state.locked[dest]:
-            contributions = [(a["faction"], a["from"], a["units"]) for a in arrivals]
+            contributions = [(a["faction"], a["from"], a["units"], True) for a in arrivals]
             _start_or_extend_battle(state, dest, contributions)
             continue
 
@@ -259,9 +290,9 @@ def apply_movement_step(state, actions_by_faction, cavalry_only=False):
         foreign_structure = dest_owner is not None and dest_owner not in arrival_factions
 
         if hostile_present or multiple_arrival_factions or foreign_structure:
-            contributions = [(a["faction"], a["from"], a["units"]) for a in arrivals]
+            contributions = [(a["faction"], a["from"], a["units"], True) for a in arrivals]
             if existing_faction is not None:
-                contributions.append((existing_faction, dest, _units_at(state, dest)))
+                contributions.append((existing_faction, dest, _units_at(state, dest), False))
             _start_or_extend_battle(state, dest, contributions)
         else:
             existing_total = _units_total(state.army_units[dest]) if existing_faction is not None else 0

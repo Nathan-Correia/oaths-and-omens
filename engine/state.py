@@ -78,6 +78,15 @@ class ArrayState:
     battle_faction: np.ndarray   # int8[N, K]          - NO_FACTION for empty slots
     battle_origin: np.ndarray    # int32[N, K]         - hex index units in this slot came from
     battle_units: np.ndarray     # int16[N, K, 3]
+    battle_moved: np.ndarray     # bool_[N, K]         - True iff this slot's units moved into this
+                                  # hex to join the fight (attacker, encounter/line-battle participant,
+                                  # or a later reinforcement); False only for the original stationary
+                                  # occupant a battle triggered against. Gates the real Archers ability
+                                  # (see battle.py's apply_archer_abilities) to the attacking side -
+                                  # separate from battle_origin, which keeps meaning "where do this
+                                  # slot's surviving/overflow units retreat to" and must NOT be
+                                  # (mis)used to infer this, since a Line Battle's battle_hex tie-break
+                                  # can coincidentally equal one side's own origin hex.
     battle_round: np.ndarray     # int16[N]
     battle_order: list           # [hex_index, ...] in battle-creation order - see module docstring
     silver: np.ndarray           # int32[num_factions]
@@ -110,6 +119,7 @@ def new_empty(grid, num_factions):
         battle_faction=np.full((n, MAX_BATTLE_CONTRIB), NO_FACTION, dtype=np.int8),
         battle_origin=np.full((n, MAX_BATTLE_CONTRIB), NO_ORIGIN, dtype=np.int32),
         battle_units=np.zeros((n, MAX_BATTLE_CONTRIB, 3), dtype=np.int16),
+        battle_moved=np.zeros((n, MAX_BATTLE_CONTRIB), dtype=bool),
         battle_round=np.zeros(n, dtype=np.int16),
         battle_order=[],
         silver=np.zeros(num_factions, dtype=np.int32),
