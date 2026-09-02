@@ -38,6 +38,13 @@ questions (which of my own battle-contribution origins gets overflow,
 vs. how much I want a hex as my capital), and once a training loop
 exists, sharing would let gradient signal from one corrupt the other.
 
+NOT COVERED: the new resources/outpost-upgrade/action-card rules (see
+rulebook.md) aren't reflected in this network yet - decide_resource_choice
+in agent.py is a fixed stub rather than a learned decision, and buy_head
+has no upgrade_outpost columns, so the nn agent can build outposts but
+never upgrade them. Revisit once the NN agent's observation/action space
+is actually being worked on.
+
 `battle_hex_index` is always required (not optional) so every call has
 the same shape/trace signature - pass 0 when it's not relevant (the
 target head's output just goes unused in that case).

@@ -22,7 +22,11 @@ part of this file:
     sacrifice priority (infantry first), the same simplification
     agents/greedy_agent.py's greedy_buy already uses for the identical
     problem (see _OUTPOST_UNIT_PRIORITY/_outpost_unit_type_by_hex
-    below).
+    below). NOT COVERED YET: engine.buy's upgrade_outpost action (see
+    rulebook.md's Outpost Upgrades) has no column here, so this agent
+    can never propose one - get_legal_buy_actions may return
+    upgrade_outpost entries, but buy_action_mask below simply doesn't
+    set a column for them, so they're never selected.
   - Target: [num_factions + 1] - one of the alive rival factions, or an
     explicit abstain slot (last index). Already small/fixed since
     num_factions is fixed per game.
@@ -97,7 +101,8 @@ def buy_action_mask(state, legal_buy_actions):
     """[num_hexes, 5] bool, columns = (no-op, buy_infantry,
     convert_to_cavalry, convert_to_archers, build_outpost). Built from
     get_legal_buy_actions' output (engine.buy) - no-op is always legal
-    (a faction never has to spend everything)."""
+    (a faction never has to spend everything). upgrade_outpost entries
+    in legal_buy_actions are ignored here (see module docstring)."""
     mask = np.zeros((state.num_hexes, 5), dtype=bool)
     mask[:, 0] = True
     for a in legal_buy_actions:

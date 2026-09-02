@@ -22,6 +22,19 @@ now. Callback signatures:
     `cap` is normally MAX_STACK_SIZE (send back only the overflow above 6), but is 0 when
     the winner just won a battle on a foreign capital - capitals are uncapturable, so that
     winner has to send EVERYTHING back (see _run_battle_phase).
+  decide_resource_choice(state, faction, hex_index) -> "iron" or "fish"
+    Only ever asked about an outpost adjacent to both a mountain and a lake, during the
+    Collect phase (see collect.py's _outpost_resource) - every other outpost's resource is
+    determined by terrain alone, no decision needed.
+
+RULE CHANGE - turn order: the rulebook now specifies Buy -> Movement ->
+Combat -> Collect, not Collect (income) -> Buy -> Movement -> Combat. Gold
+income, resource income, and the per-round VP tally all moved into one
+end-of-turn Collect phase (see collect.py's apply_collect_phase) - so a
+turn's Buy phase always spends whatever the PREVIOUS turn's Collect phase
+produced, not income collected moments earlier. Turn 1's Buy phase runs
+before any Collect phase ever has, so it only has each faction's starting
+gold to spend - matching the rulebook's setup-phase carve-out.
 """
 
 import random
@@ -30,16 +43,15 @@ import numpy as np
 
 from .battle import faction_totals, get_winner, rectify_overflow, resolve_full_battle
 from .buy import apply_buy_phase, get_legal_buy_actions
-from .income import apply_income_phase
+from .collect import OUTPOST_DESTROY_VP, VP_TO_WIN, apply_collect_phase
 from .movement import apply_movement_step, legal_cavalry_mask, legal_movement_mask
-from .state import MAX_STACK_SIZE, NO_FACTION, NO_ORIGIN, count_units_in_play
+from .state import (
+    MAX_STACK_SIZE, NO_FACTION, NO_ORIGIN, NO_UPGRADE, RESOURCE_TYPES, UPGRADE_TYPES, count_units_in_play,
+)
 from .terrain import apply_terrain_effects
 
 MOVEMENT_STEPS = 3
 CAVALRY_STEPS = 2
-VP_TO_WIN = 50
-OUTPOST_VP_PER_ROUND = 1
-OUTPOST_DESTROY_VP = 2
 
 
 def _run_battle_phase(state, decide_target, decide_rectification, rng):
@@ -128,20 +140,6 @@ def _run_battle_phase(state, decide_target, decide_rectification, rng):
     return battle_events
 
 
-def apply_victory_points(state):
-    """End-of-round VP tally (the win condition - see get_game_winner):
-    your first outpost earns nothing, and each additional one beyond
-    that earns OUTPOST_VP_PER_ROUND more - so 1 outpost is worth 0/round,
-    2 is worth 1, 3 is worth 2, and so on (max(0, outposts - 1), not a
-    flat per-outpost rate). Capitals don't count. Destroying an enemy
-    outpost is awarded separately, immediately, in _run_battle_phase
-    (OUTPOST_DESTROY_VP) - this only covers the recurring per-round
-    income."""
-    for faction in range(state.num_factions):
-        outposts = int(np.sum((state.city_owner == faction) & ~state.is_capital))
-        state.victory_points[faction] += max(0, outposts - 1) * OUTPOST_VP_PER_ROUND
-
-
 def get_game_winner(state):
     """None until some faction's VP total has reached VP_TO_WIN. Among
     every faction at or above VP_TO_WIN, the strict highest total wins
@@ -160,15 +158,19 @@ def get_game_winner(state):
     return max(contenders, key=lambda f: int(state.capital_settle_order[f]))
 
 
-def run_turn(state, decide_buy, decide_movement, decide_cavalry, decide_target, decide_rectification, rng=None):
+def run_turn(state, decide_buy, decide_movement, decide_cavalry, decide_target, decide_rectification,
+             decide_resource_choice, rng=None):
     """Mutates and returns `state`. Each decide_* argument is a
     {faction: callable} dict - see module docstring for each callable's
     signature. Elimination doesn't exist anymore (capitals are
     uncapturable - see movement.py/_run_battle_phase), so every faction
-    is asked for a decision every turn."""
-    rng = rng or random.Random()
+    is asked for a decision every turn.
 
-    apply_income_phase(state)
+    RULE CHANGE - turn order (see module docstring): Buy -> Movement ->
+    Combat -> Collect, not Collect -> Buy -> Movement -> Combat - Collect
+    (gold/resources/VP) now runs at the END of this function, so this
+    turn's Buy phase spends whatever last turn's Collect phase produced."""
+    rng = rng or random.Random()
 
     buy_actions = {}
     for faction in range(state.num_factions):
@@ -192,7 +194,7 @@ def run_turn(state, decide_buy, decide_movement, decide_cavalry, decide_target, 
 
     _run_battle_phase(state, decide_target, decide_rectification, rng)
     apply_terrain_effects(state)
-    apply_victory_points(state)
+    apply_collect_phase(state, decide_resource_choice)
 
     state.turn_number += 1
     return state
@@ -207,12 +209,21 @@ CHECKPOINT_LABELS = ["Start", "Buy", "Move 1", "Move 2", "Move 3",
 
 def _snapshot_entry(state, hex_index, coord):
     """Per-hex log entry: {"q","r","s","city","troops","battle"}. "city"
-    is None, or {"faction", "is_capital"} - capitals and outposts share
-    city_owner but render as different icons (hex_visualizer.py's
-    draw_city_icon vs. draw_outpost_icon), so is_capital has to travel
-    with the log entry rather than being re-derived some other way."""
+    is None, or {"faction", "is_capital", "upgrade"} - capitals and
+    outposts share city_owner but render as different icons
+    (hex_visualizer.py's draw_city_icon vs. draw_outpost_icon), so
+    is_capital has to travel with the log entry rather than being
+    re-derived some other way. "upgrade" is one of UPGRADE_TYPES or None
+    (always None for a capital, and for an outpost with no upgrade yet) -
+    lets the visualizer render Barracks/Workshop/Temple outposts
+    distinctly (see hex_visualizer.py's draw_outpost_icon)."""
     if state.city_owner[hex_index] != NO_FACTION:
-        city = {"faction": int(state.city_owner[hex_index]), "is_capital": bool(state.is_capital[hex_index])}
+        upgrade_index = int(state.outpost_upgrade[hex_index])
+        city = {
+            "faction": int(state.city_owner[hex_index]),
+            "is_capital": bool(state.is_capital[hex_index]),
+            "upgrade": UPGRADE_TYPES[upgrade_index] if upgrade_index != NO_UPGRADE else None,
+        }
     else:
         city = None
     entry = {
@@ -255,7 +266,8 @@ def sparse_hexes(full_hexes):
 def _player_stats_snapshot(state):
     return {
         f: {
-            "silver": int(state.silver[f]),
+            "gold": int(state.gold[f]),
+            "resources": {r: int(state.resources[f, i]) for i, r in enumerate(RESOURCE_TYPES)},
             "kill_xp": int(state.kill_xp[f]),
             "victory_points": int(state.victory_points[f]),
             "alive": bool(state.alive[f]),
@@ -265,7 +277,7 @@ def _player_stats_snapshot(state):
 
 
 def run_turn_and_log(state, decide_buy, decide_movement, decide_cavalry, decide_target, decide_rectification,
-                      rng=None):
+                      decide_resource_choice, rng=None):
     """Same as run_turn, but also returns a turn_record capturing enough
     to replay/visualize the turn: a full board snapshot at every one of
     the turn's checkpoints (see CHECKPOINT_LABELS), the battle events,
@@ -285,10 +297,13 @@ def run_turn_and_log(state, decide_buy, decide_movement, decide_cavalry, decide_
     rng = rng or random.Random()
     turn_number = state.turn_number
 
-    checkpoints = [sparse_hexes(snapshot_hexes(state))]  # "Start" - before income
-
-    apply_income_phase(state)
-    player_stats = [_player_stats_snapshot(state)]  # matches v1: captured AFTER income
+    # "Start" checkpoint: before this turn's Buy phase. Collect (gold/
+    # resources/VP) now runs at the END of a turn (see module docstring),
+    # so this snapshot already reflects the PREVIOUS turn's Collect
+    # output - there's no separate "before income" moment anymore, since
+    # Collect and the "Battle" checkpoint below now happen together.
+    checkpoints = [sparse_hexes(snapshot_hexes(state))]
+    player_stats = [_player_stats_snapshot(state)]
 
     buy_actions = {}
     for faction in range(state.num_factions):
@@ -324,7 +339,7 @@ def run_turn_and_log(state, decide_buy, decide_movement, decide_cavalry, decide_
 
     battle_events = _run_battle_phase(state, decide_target, decide_rectification, rng)
     apply_terrain_effects(state)
-    apply_victory_points(state)
+    apply_collect_phase(state, decide_resource_choice)
     checkpoints.append(sparse_hexes(snapshot_hexes(state)))
     player_stats.append(_player_stats_snapshot(state))
 

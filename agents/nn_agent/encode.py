@@ -38,7 +38,7 @@ changed before, e.g. forest's removal, and will again):
   during turn-phase decisions, never a source of live/confusing signal,
   the same precedent as state.py's `alive` field.
 
-Global features (6 numbers), not tied to any one hex: my silver, my
+Global features (6 numbers), not tied to any one hex: my gold, my
 kill-XP (both normalized against a rough scale, not a hard cap - values
 can exceed 1), fraction of OTHER factions still alive (vestigial now
 that elimination is gone - see engine/state.py's alive field docstring;
@@ -46,6 +46,11 @@ always 1.0 in practice), how far through the game we are (turn_number /
 max_turns), my victory points, and the leading rival's victory points
 (both / VP_TO_WIN) - the actual win condition, so the network needs to
 see how close everyone is to it.
+
+NOT COVERED YET: the new resources/outpost-upgrade rules (see
+rulebook.md) aren't reflected in this observation - resources/upgrades
+exist in engine.state but this network can't see them. Revisit once the
+NN agent's observation/action space is actually being worked on.
 
 SIMPLIFICATION worth knowing about: enemy presence is aggregated across
 all non-self factions into one "the enemy" signal, per hex - the network
@@ -56,14 +61,14 @@ is actually running.
 
 import numpy as np
 
+from engine.collect import VP_TO_WIN
 from engine.state import NO_FACTION, TERRAIN_TYPES
-from engine.turn import VP_TO_WIN
 
 NUM_TERRAIN_TYPES = len(TERRAIN_TYPES)
 PER_HEX_FEATURES = NUM_TERRAIN_TYPES + 3 + 3 + 3 + 3 + 1
 GLOBAL_FEATURES = 6
 
-SILVER_SCALE = 100.0
+GOLD_SCALE = 100.0
 KILL_XP_SCALE = 20.0
 UNIT_SCALE = 6.0  # MAX_STACK_SIZE
 VP_SCALE = float(VP_TO_WIN)
@@ -129,7 +134,7 @@ def encode_observation(state, faction, max_turns=100):
 
     global_feats = np.array(
         [
-            float(state.silver[faction]) / SILVER_SCALE,
+            float(state.gold[faction]) / GOLD_SCALE,
             float(state.kill_xp[faction]) / KILL_XP_SCALE,
             alive_others / total_others,
             float(state.turn_number) / max_turns,

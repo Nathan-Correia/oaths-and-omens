@@ -38,10 +38,11 @@ from .encode import encode_observation
 
 def make_nn_agents(network, num_factions, seed=0, max_turns=100, device=None):
     """Returns (decide_buy, decide_movement, decide_cavalry,
-    decide_target, decide_rectification, decide_placement, decide_draft,
-    decide_swap) dicts - each {faction: callable}, matching
-    engine.turn.run_turn's and engine.placement.run_city_setup's
-    expected signatures, all backed by the same shared `network`."""
+    decide_target, decide_rectification, decide_resource_choice,
+    decide_placement, decide_draft, decide_swap) dicts - each
+    {faction: callable}, matching engine.turn.run_turn's and
+    engine.placement.run_city_setup's expected signatures, all backed by
+    the same shared `network`."""
     device = device or torch.device("cpu")
     network = network.to(device).eval()
     generator = torch.Generator(device=device)
@@ -91,6 +92,12 @@ def make_nn_agents(network, num_factions, seed=0, max_turns=100, device=None):
         out = forward(state, winner_faction, battle_hex_index=hex_index)
         return actions.decode_rectification(generator, out["rectify"], state, hex_index, winner_faction, cap)
 
+    def decide_resource_choice(state, faction, hex_index):
+        # NOT COVERED YET: no learned decision for this (see network.py's
+        # docstring) - a fixed stub, kept only so this agent still
+        # satisfies engine.turn.run_turn's decide_resource_choice callback.
+        return "iron"
+
     def decide_placement(state, faction, legal_mask):
         out = forward(state, faction)
         return actions.decode_capital_choice(generator, out["capital_pref"], legal_mask)
@@ -113,6 +120,7 @@ def make_nn_agents(network, num_factions, seed=0, max_turns=100, device=None):
         {f: decide_cavalry for f in factions},
         {f: decide_target for f in factions},
         {f: decide_rectification for f in factions},
+        {f: decide_resource_choice for f in factions},
         {f: decide_placement for f in factions},
         {f: decide_draft for f in factions},
         {f: decide_swap for f in factions},

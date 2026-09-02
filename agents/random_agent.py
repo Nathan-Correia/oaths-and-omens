@@ -90,13 +90,18 @@ def random_swap(rng):
     return rng.random() < 0.5
 
 
+def random_resource_choice(rng):
+    return rng.choice(("iron", "fish"))
+
+
 def make_random_agents(num_factions, seed=0):
     """Returns (decide_buy, decide_movement, decide_cavalry, decide_target,
-    decide_rectification, decide_placement, decide_draft, decide_swap) -
-    each {faction: callable}, matching engine.turn.run_turn's and
-    engine.placement.run_city_setup's expected signatures. Each faction
-    gets its own random.Random (mirrors v1's per-agent rng), keyed off
-    `seed` so a whole game's agent decisions are reproducible."""
+    decide_rectification, decide_resource_choice, decide_placement,
+    decide_draft, decide_swap) - each {faction: callable}, matching
+    engine.turn.run_turn's and engine.placement.run_city_setup's expected
+    signatures. Each faction gets its own random.Random (mirrors v1's
+    per-agent rng), keyed off `seed` so a whole game's agent decisions
+    are reproducible."""
     rngs = {f: random.Random(seed * 1_000_003 + f) for f in range(num_factions)}
 
     def decide_buy(state, faction, legal):
@@ -114,6 +119,9 @@ def make_random_agents(num_factions, seed=0):
     def decide_rectification(state, hex_index, winner_faction, cap):
         return random_rectification(state, hex_index, winner_faction, cap, rngs[winner_faction])
 
+    def decide_resource_choice(state, faction, hex_index):
+        return random_resource_choice(rngs[faction])
+
     def decide_placement(state, faction, legal_mask):
         return random_placement(rngs[faction], legal_mask)
 
@@ -130,6 +138,7 @@ def make_random_agents(num_factions, seed=0):
         {f: decide_cavalry for f in factions},
         {f: decide_target for f in factions},
         {f: decide_rectification for f in factions},
+        {f: decide_resource_choice for f in factions},
         {f: decide_placement for f in factions},
         {f: decide_draft for f in factions},
         {f: decide_swap for f in factions},

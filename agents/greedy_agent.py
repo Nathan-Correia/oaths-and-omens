@@ -1,10 +1,10 @@
 """
 GreedyAgent for engine: a single-minded outpost rush.
 
-Buy phase prioritizes building as many outposts as it can afford and has
-units for, then spends whatever's left aggressively - infantry with
-leftover silver, all banked kill-XP converted toward whichever of
-cavalry/archers it currently has fewer of.
+Buy phase prioritizes its one outpost action for the turn (build_outpost -
+only 1/turn now, see engine/buy.py), then spends whatever's left
+aggressively - infantry with leftover gold, all banked kill-XP converted
+toward whichever of cavalry/archers it currently has fewer of.
 
 Movement/cavalry phases have two priorities, strictly ordered: while this
 faction still has room for more outposts (under OUTPOST_CAP) and at
@@ -26,10 +26,13 @@ current target, for better or worse. That single-mindedness is what
 "greedy" means here, not tactical caution.
 
 decide_target/decide_rectification are reused as-is from random_agent.py
-- neither needs to be smart for this agent's strategy to work. Setup-
-phase decisions (placement/draft/swap) get their own greedy policy
-below: farthest-point placement/drafting, since a uniform coin flip
-would be an odd fit for an agent named "greedy".
+- neither needs to be smart for this agent's strategy to work.
+decide_resource_choice gets a one-line heuristic (greedy_resource_choice:
+prefer whichever of iron/fish is scarcer) rather than being reused as-is,
+since a uniform coin flip there would just be random_agent's policy under
+another name. Setup-phase decisions (placement/draft/swap) get their own
+greedy policy below: farthest-point placement/drafting, since a uniform
+coin flip would be an odd fit for an agent named "greedy".
 """
 
 import random
@@ -39,7 +42,7 @@ import numpy as np
 from .random_agent import random_rectification, random_target
 from engine.buy import INFANTRY_COST, OUTPOST_CAP, _can_build_outpost, _outpost_count
 from engine.geometry import hex_distance
-from engine.state import IMPASSABLE_TERRAIN_INDICES, NO_FACTION, count_units_in_play
+from engine.state import IMPASSABLE_TERRAIN_INDICES, NO_FACTION, RESOURCE_TO_INDEX, count_units_in_play
 
 # Which unit type to sacrifice first when a hex offers a choice of more
 # than one for building an outpost there.
@@ -55,28 +58,25 @@ def greedy_buy(state, faction, legal, rng):
 
     chosen = []
 
-    # One outpost attempt per hex: get_legal_buy_actions returns one
-    # build_outpost entry per (hex, unit_type present), but only the
-    # first attempt at a given hex can ever succeed (building sets
-    # city_owner there, which _can_build_outpost then rejects) - picking
-    # one preferred entry per hex up front, rather than submitting every
-    # entry and relying on that silent-drop behavior, keeps which unit
-    # type gets sacrificed a deliberate choice instead of an accident of
-    # list order.
+    # Only one outpost action (build_outpost/upgrade_outpost, combined)
+    # goes through per turn now (see engine/buy.py's apply_buy_phase), so
+    # only submit a single build_outpost attempt - one preferred hex,
+    # shuffled among candidates, with a preferred sacrificed unit_type
+    # (infantry first) at that hex.
     by_hex = {}
     for a in outpost_actions:
         by_hex.setdefault(a["hex"], {})[a["unit_type"]] = a
     outpost_hexes = list(by_hex.keys())
     rng.shuffle(outpost_hexes)
-    for hex_index in outpost_hexes:
-        options = by_hex[hex_index]
+    if outpost_hexes:
+        options = by_hex[outpost_hexes[0]]
         for unit_type in _OUTPOST_UNIT_PRIORITY:
             if unit_type in options:
                 chosen.append(options[unit_type])
                 break
 
     if infantry_actions:
-        num_purchases = int(state.silver[faction]) // INFANTRY_COST
+        num_purchases = int(state.gold[faction]) // INFANTRY_COST
         for _ in range(num_purchases):
             chosen.append(rng.choice(infantry_actions))
 
@@ -219,6 +219,15 @@ def greedy_draft(state, legal_pool):
     return max(legal_pool, key=lambda h: _nearest_dist(grid, h, claimed))
 
 
+def greedy_resource_choice(state, faction):
+    """Prefers whichever of iron/fish this faction currently has less of -
+    a simple balance heuristic, same spirit as greedy_buy's cavalry-vs-
+    archers conversion choice."""
+    iron = int(state.resources[faction, RESOURCE_TO_INDEX["iron"]])
+    fish = int(state.resources[faction, RESOURCE_TO_INDEX["fish"]])
+    return "iron" if iron <= fish else "fish"
+
+
 def greedy_swap(state, leftover_hex, placer_hex):
     """Swaps only if placer_hex is a strict improvement over leftover_hex -
     farther from the nearest other already-claimed capital."""
@@ -254,6 +263,9 @@ def make_greedy_agents(num_factions, seed=0):
     def decide_rectification(state, hex_index, winner_faction, cap):
         return random_rectification(state, hex_index, winner_faction, cap, rngs[winner_faction])
 
+    def decide_resource_choice(state, faction, hex_index):
+        return greedy_resource_choice(state, faction)
+
     def decide_placement(state, faction, legal_mask):
         return greedy_placement(state, legal_mask)
 
@@ -270,6 +282,7 @@ def make_greedy_agents(num_factions, seed=0):
         {f: decide_cavalry for f in factions},
         {f: decide_target for f in factions},
         {f: decide_rectification for f in factions},
+        {f: decide_resource_choice for f in factions},
         {f: decide_placement for f in factions},
         {f: decide_draft for f in factions},
         {f: decide_swap for f in factions},

@@ -27,6 +27,7 @@ retune without touching any drawing logic.
 """
 
 import json
+import math
 import os
 import sys
 import pygame
@@ -36,7 +37,8 @@ from hex_common import (
 )
 
 try:
-    from engine.turn import CHECKPOINT_LABELS, VP_TO_WIN
+    from engine.turn import CHECKPOINT_LABELS
+    from engine.collect import VP_TO_WIN
 except ImportError:
     CHECKPOINT_LABELS = ["Start", "Buy", "Move 1", "Move 2", "Move 3",
                           "Cav 1", "Cav 2", "Battle"]
@@ -132,8 +134,12 @@ SQUARE_SIZE = SHAPE_SIZE - 1  # cavalry square rendered a touch smaller than the
 # City icon sizing (no outline on these, kept separate from troop shapes)
 CITY_ICON_SIZE = 9  # half-width of the square base
 
-# Outpost icon sizing - a small outlined triangle, distinct from (and
-# smaller than) a capital's building icon
+# Outpost icon sizing - a small outlined shape, distinct from (and
+# smaller than) a capital's building icon. An unupgraded outpost is a
+# plain triangle; each upgrade swaps in its own silhouette instead (see
+# _outpost_icon_points) so upgrades are readable by shape alone, at a
+# glance, without relying on color (which is already spoken for by
+# faction ownership).
 OUTPOST_ICON_SIZE = 6
 
 # Battle-contribution rectangle sizing (stacked when a hex is locked in a fight)
@@ -191,7 +197,7 @@ def load_game(path):
     turn_checkpoints: list (one per turn) of lists of 10 dense board
     states, each a dict {(q,r,s): {"city","troops","battle"}}.
     turn_player_stats: list (one per turn) of lists of 10 dicts
-    {faction: {"silver","kill_xp","alive"}} - one per checkpoint,
+    {faction: {"gold","resources","kill_xp","alive"}} - one per checkpoint,
     straight from the log (already a full snapshot each time, no
     reconstruction needed).
     turn_battles_by_hex: list (one per turn) of {(q,r,s): battle_event}
@@ -310,16 +316,44 @@ def draw_city_icon(surface, center, faction_color):
     pygame.draw.polygon(surface, faction_color, roof_points)
 
 
-def draw_outpost_icon(surface, center, faction_color):
-    """Small outlined triangle, top-center of hex - marks an outpost,
-    distinct from a capital's building icon (draw_city_icon)."""
+def _star_points(cx, cy, outer, inner, num_points=5):
+    """Alternating outer/inner vertices around a circle, first point
+    straight up - the standard way to build an n-pointed star polygon."""
+    points = []
+    for i in range(num_points * 2):
+        radius = outer if i % 2 == 0 else inner
+        angle = math.pi / 2 + i * math.pi / num_points
+        points.append((cx + radius * math.cos(angle), cy - radius * math.sin(angle)))
+    return points
+
+
+def _outpost_icon_points(cx, cy, s, upgrade):
+    """Vertex list for an outpost's icon, shaped by its upgrade
+    (None = plain triangle, matching the pre-upgrades look) so an
+    upgraded outpost is distinguishable by SILHOUETTE, not just color -
+    color is already spoken for by faction ownership, and a colored ring
+    around one fixed shape read as too subtle at OUTPOST_ICON_SIZE."""
+    if upgrade == "barracks":
+        # Square - a blocky fortification.
+        return [(cx - s, cy - s), (cx + s, cy - s), (cx + s, cy + s), (cx - s, cy + s)]
+    if upgrade == "workshop":
+        # Diamond - a distinct silhouette from both the triangle and the square.
+        return [(cx, cy - s * 1.15), (cx + s * 1.15, cy), (cx, cy + s * 1.15), (cx - s * 1.15, cy)]
+    if upgrade == "temple":
+        # 5-pointed star - reads as "special"/sacred at a glance.
+        return _star_points(cx, cy, outer=s * 1.15, inner=s * 0.45)
+    return [(cx, cy - s), (cx - s, cy + s * 0.7), (cx + s, cy + s * 0.7)]
+
+
+def draw_outpost_icon(surface, center, faction_color, upgrade=None):
+    """Small outlined icon, top-center of hex - marks an outpost,
+    distinct from a capital's building icon (draw_city_icon). Its shape
+    depends on `upgrade` (None/"barracks"/"workshop"/"temple" - see
+    _outpost_icon_points): an unupgraded outpost is the original plain
+    triangle, each upgrade gets its own silhouette. Always drawn in the
+    owning faction's color, same as before - only the shape changes."""
     cx, cy = center
-    s = OUTPOST_ICON_SIZE
-    points = [
-        (cx, cy - s),
-        (cx - s, cy + s * 0.7),
-        (cx + s, cy + s * 0.7),
-    ]
+    points = _outpost_icon_points(cx, cy, OUTPOST_ICON_SIZE, upgrade)
     pygame.draw.polygon(surface, faction_color, points)
     pygame.draw.polygon(surface, SHAPE_OUTLINE_COLOR, points, width=1)
 
@@ -394,7 +428,7 @@ def draw_hex(surface, center, size, terrain, hex_data, font, battle_font):
         if city["is_capital"]:
             draw_city_icon(surface, city_center, FACTION_COLORS[city["faction"]])
         else:
-            draw_outpost_icon(surface, city_center, FACTION_COLORS[city["faction"]])
+            draw_outpost_icon(surface, city_center, FACTION_COLORS[city["faction"]], city.get("upgrade"))
 
     if hex_data["battle"] is not None:
         draw_battle_rectangles(surface, center, hex_data["battle"]["contributions"], battle_font)
@@ -428,7 +462,7 @@ def compute_unit_counts(board_state, num_factions):
 
 def draw_sidebar(surface, x0, y0, height, num_factions, player_stats, unit_counts, header_font, row_font):
     """Always-visible per-faction panel: color swatch, alive/dead state,
-    silver, kill-XP, and each unit type's count separately."""
+    gold, kill-XP, resources, and each unit type's count separately."""
     pygame.draw.rect(surface, SIDEBAR_BG_COLOR, pygame.Rect(x0, y0, SIDEBAR_WIDTH, height))
 
     row_h = height / num_factions
@@ -460,17 +494,24 @@ def draw_sidebar(surface, x0, y0, height, num_factions, player_stats, unit_count
         header_surf = header_font.render(header, True, text_color)
         surface.blit(header_surf, (x0 + pad + 32, row_top + 8))
 
-        silver = stats.get("silver", 0)
+        gold = stats.get("gold", 0)
         kill_xp = stats.get("kill_xp", 0)
+        resources = stats.get("resources", {})
         counts = unit_counts.get(faction, {"infantry": 0, "cavalry": 0, "archers": 0})
 
-        line1 = f"Silver: {silver}    Kill XP: {kill_xp}"
+        line1 = f"Gold: {gold}    Kill XP: {kill_xp}"
         line2 = f"Infantry: {counts['infantry']}   Cavalry: {counts['cavalry']}   Archers: {counts['archers']}"
+        line3 = (
+            f"Wood: {resources.get('wood', 0)}  Iron: {resources.get('iron', 0)}  "
+            f"Clay: {resources.get('clay', 0)}  Fish: {resources.get('fish', 0)}"
+        )
 
         line1_surf = row_font.render(line1, True, text_color)
         line2_surf = row_font.render(line2, True, text_color)
+        line3_surf = row_font.render(line3, True, text_color)
         surface.blit(line1_surf, (x0 + pad + 32, row_top + 34))
         surface.blit(line2_surf, (x0 + pad + 32, row_top + 54))
+        surface.blit(line3_surf, (x0 + pad + 32, row_top + 74))
 
 
 def _empty_totals():

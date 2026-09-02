@@ -51,8 +51,8 @@ def make_game():
     }
     agents = compose_agents(AGENT_ASSIGNMENT, build_fns)
     rng = random.Random(SEED + 1)
-    state = run_city_setup(state, *agents[5:], rng)
-    return state, agents[:5], rng
+    state = run_city_setup(state, *agents[6:], rng)
+    return state, agents[:6], rng
 
 
 def run_plain():

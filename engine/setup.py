@@ -5,7 +5,7 @@ directly into ArrayState's numpy arrays instead of a dict-of-HexState
 board, so engine can create a game without going through v1 at all.
 
 Capital placement is NOT done here - create_initial_state only generates
-terrain and seeds starting silver/kill-XP, leaving city_owner/is_capital/
+terrain and seeds starting gold/kill-XP, leaving city_owner/is_capital/
 city_placer untouched (all NO_FACTION/False) for placement.py's
 run_city_setup to fill in as a real agent-driven decision (colourless
 placement, then a draft) rather than the farthest-point heuristic this
@@ -21,7 +21,7 @@ import numpy as np
 from .geometry import HexGrid
 from .state import IMPASSABLE_TERRAIN_INDICES, TERRAIN_TO_INDEX, new_empty
 
-STARTING_SILVER = 50
+STARTING_GOLD = 50
 STARTING_KILL_XP = 2
 
 _UNSET = -1
@@ -232,7 +232,7 @@ def create_initial_state(radius=8, num_factions=8, seed=42, terrain_log=None):
     state.terrain[:] = generate_terrain(grid, rng, log=terrain_log)
 
     for faction in range(num_factions):
-        state.silver[faction] = STARTING_SILVER
+        state.gold[faction] = STARTING_GOLD
         state.kill_xp[faction] = STARTING_KILL_XP
 
     return state

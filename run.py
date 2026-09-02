@@ -93,7 +93,7 @@ def main():
         "greedy": lambda: make_greedy_agents(NUM_FACTIONS, seed=SEED),
         "nn": lambda: _build_nn_agents(),
     }
-    (decide_buy, decide_movement, decide_cavalry, decide_target, decide_rectification,
+    (decide_buy, decide_movement, decide_cavalry, decide_target, decide_rectification, decide_resource_choice,
      decide_placement, decide_draft, decide_swap) = compose_agents(AGENT_ASSIGNMENT, build_fns)
 
     placement_log = []
@@ -108,7 +108,8 @@ def main():
     turns = []
     while not check_game_end(state, max_turns=MAX_TURNS):
         state, turn_record = run_turn_and_log(
-            state, decide_buy, decide_movement, decide_cavalry, decide_target, decide_rectification, rng=rng,
+            state, decide_buy, decide_movement, decide_cavalry, decide_target, decide_rectification,
+            decide_resource_choice, rng=rng,
         )
         turns.append(turn_record)
 
