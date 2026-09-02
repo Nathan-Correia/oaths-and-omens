@@ -497,7 +497,7 @@
   // Board rendering
   // =========================================================================
 
-  let terrainLayer = null, contentLayer = null;
+  let terrainLayer = null, territoryLayer = null, contentLayer = null;
 
   function buildStaticBoard(g, lay) {
     els.boardSvg.innerHTML = "";
@@ -506,8 +506,10 @@
     els.boardSvg.setAttribute("height", lay.viewBox[1]);
 
     terrainLayer = svgEl("g", { id: "terrainLayer" });
+    territoryLayer = svgEl("g", { id: "territoryLayer" }); // contested-hex Voronoi cells, faction mode only
     contentLayer = svgEl("g", { id: "contentLayer" });
     els.boardSvg.appendChild(terrainLayer);
+    els.boardSvg.appendChild(territoryLayer);
     els.boardSvg.appendChild(contentLayer);
 
     hexPolygons = {};
@@ -531,11 +533,26 @@
 
   // =========================================================================
   // Map modes: "terrain" (default) fills each hex by terrain type;
-  // "faction" fills each hex by whichever faction has a capital or outpost
-  // within 1 hex of it (a simple territory-control overlay), tinted over a
-  // neutral dark base rather than the vivid terrain palette so ownership
-  // reads clearly. Mountain/lake stay distinguishable even unclaimed, since
-  // impassability still matters for reading the board.
+  // "faction" fills each hex by whichever faction(s) have a capital or
+  // outpost within 1 hex of it (a simple territory-control overlay),
+  // tinted over a neutral dark base rather than the vivid terrain palette
+  // so ownership reads clearly. Mountain/lake stay distinguishable even
+  // unclaimed, since impassability still matters for reading the board.
+  //
+  // A hex within range of MULTIPLE factions' structures at once (only
+  // possible at distance exactly 1 from each - buy.py's placement rules
+  // keep any two different factions' structures at least 2 apart, so a
+  // hex can never be one faction's own city AND another's neighbor
+  // simultaneously) is split via an actual Voronoi partition - each
+  // contesting faction's region is whatever part of the hex sits closer
+  // (in real pixel distance) to ITS structure than to every other
+  // contesting faction's - rather than one color silently overriding the
+  // others, or a bearing-from-hex-center wedge (which doesn't line up
+  // between neighboring shared hexes the way a true nearest-site split
+  // does: two capitals 2 hexes apart with an offset, rather than a
+  // straight line, between them have TWO tiles equally close to both,
+  // and the boundary through each has to be the same straight bisector
+  // line for the border to read as continuous rather than arrow-shaped).
   // =========================================================================
 
   const FACTION_TERRITORY_ALPHA = 0.45;
@@ -553,6 +570,10 @@
     return "#" + [r, g, b].map((v) => v.toString(16).padStart(2, "0")).join("");
   }
 
+  function keyToCoord(key) {
+    return key.split("_").map(Number);
+  }
+
   function computeFactionTerritory(g, board) {
     // City hexes present in this checkpoint's (sparse) board.
     const cities = [];
@@ -560,40 +581,119 @@
       const data = board[key];
       if (data.city) cities.push({ coord: keyToCoord(key), faction: data.city.faction });
     }
-    const owner = {}; // coordKey -> faction, only for hexes within 1 of some city
+    // coordKey -> [{faction, coord}, ...] sorted by faction id - every
+    // faction within 1 hex (not just the nearest), each paired with the
+    // real coord of its own nearest qualifying city so the wedge drawn
+    // for it can be oriented toward where that city actually is.
+    const owners = {};
     for (const [q, r, s] of g.coordList) {
       const key = coordKey(q, r, s);
       const coord = [q, r, s];
-      let bestFaction = null, bestDist = Infinity;
+      const byFaction = new Map(); // faction -> {coord, dist} of its nearest qualifying city
       for (const c of cities) {
         const d = hexDistance(coord, c.coord);
-        if (d <= 1 && d < bestDist) { bestDist = d; bestFaction = c.faction; }
+        if (d > 1) continue;
+        const cur = byFaction.get(c.faction);
+        if (!cur || d < cur.dist) byFaction.set(c.faction, { coord: c.coord, dist: d });
       }
-      if (bestFaction !== null) owner[key] = bestFaction;
+      if (byFaction.size) {
+        owners[key] = Array.from(byFaction.entries())
+          .map(([faction, v]) => ({ faction, coord: v.coord }))
+          .sort((a, b) => a.faction - b.faction);
+      }
     }
-    return owner;
+    return owners;
   }
 
-  function keyToCoord(key) {
-    return key.split("_").map(Number);
+  // Sutherland-Hodgman: clips convex polygon `poly` ([x,y] points) down to
+  // the half-plane {p : (p - linePoint) . normal <= 0}, inserting a new
+  // vertex wherever an edge crosses the boundary line. Clipping a convex
+  // polygon by a half-plane always yields a convex (possibly empty)
+  // polygon, so repeated calls - one per other site - correctly narrow
+  // the hex down to just one faction's Voronoi cell.
+  function clipPolygonHalfPlane(poly, linePoint, normal) {
+    if (poly.length === 0) return poly;
+    const side = (p) => (p[0] - linePoint[0]) * normal[0] + (p[1] - linePoint[1]) * normal[1];
+    const out = [];
+    for (let i = 0; i < poly.length; i++) {
+      const curr = poly[i], next = poly[(i + 1) % poly.length];
+      const dCurr = side(curr), dNext = side(next);
+      if (dCurr <= 0) out.push(curr);
+      if (dCurr <= 0 !== dNext <= 0) {
+        const t = dCurr / (dCurr - dNext);
+        out.push([curr[0] + t * (next[0] - curr[0]), curr[1] + t * (next[1] - curr[1])]);
+      }
+    }
+    return out;
   }
 
-  function applyMapModeFills(g, board) {
+  // Splits a contested hex into a true Voronoi partition: each entry's
+  // cell starts as the hex's own corners, then gets clipped (see
+  // clipPolygonHalfPlane) against the perpendicular bisector of its site
+  // and every OTHER contesting faction's site - the same bisector line
+  // for a given pair of factions, wherever it's evaluated, so the
+  // boundary reads as one continuous straight line across neighboring
+  // shared hexes rather than each hex independently pointing wedges at
+  // its own nearby structures.
+  function drawTerritoryVoronoi(center, size, entries, base, lay) {
+    const [cx, cy] = center;
+    const corners = [0, 1, 2, 3, 4, 5].map((i) => hexCorner(cx, cy, size, i));
+
+    const sites = entries.map((e) => {
+      const cityKey = coordKey(e.coord[0], e.coord[1], e.coord[2]);
+      return { faction: e.faction, pos: lay.centers[cityKey] };
+    });
+
+    for (const site of sites) {
+      let cell = corners;
+      for (const other of sites) {
+        if (other === site) continue;
+        const mid = [(site.pos[0] + other.pos[0]) / 2, (site.pos[1] + other.pos[1]) / 2];
+        const normal = [other.pos[0] - site.pos[0], other.pos[1] - site.pos[1]];
+        cell = clipPolygonHalfPlane(cell, mid, normal);
+        if (cell.length < 3) break;
+      }
+      if (cell.length < 3) continue; // this faction's cell doesn't actually reach into this hex
+      const poly = svgEl("polygon", {
+        points: pointsAttr(cell),
+        fill: mixColor(FACTION_COLORS[site.faction], base, FACTION_TERRITORY_ALPHA),
+      });
+      territoryLayer.appendChild(poly);
+    }
+  }
+
+  function applyMapModeFills(g, lay, board) {
+    territoryLayer.innerHTML = "";
+
     if (mapMode === "terrain") {
       for (const [q, r, s] of g.coordList) {
         const key = coordKey(q, r, s);
         hexPolygons[key].setAttribute("fill", TERRAIN_COLORS[g.terrainMap[key]] || "#2a2e38");
+        hexPolygons[key].setAttribute("stroke", "var(--grid-line)");
       }
       return;
     }
-    const owner = computeFactionTerritory(g, board);
+
+    // Faction mode draws its own borderless cells (single-color fill or a
+    // Voronoi split via territoryLayer) - the terrain-layer hex's own grid
+    // stroke would otherwise still outline every tile underneath, which
+    // reads as an unwanted border around solid-color territory.
+    const owners = computeFactionTerritory(g, board);
     for (const [q, r, s] of g.coordList) {
       const key = coordKey(q, r, s);
       const terrain = g.terrainMap[key];
       const base = NEUTRAL_FILL[terrain] || "#20242c";
-      const faction = owner[key];
-      const fill = faction !== undefined ? mixColor(FACTION_COLORS[faction], base, FACTION_TERRITORY_ALPHA) : base;
-      hexPolygons[key].setAttribute("fill", fill);
+      const entries = owners[key];
+
+      hexPolygons[key].setAttribute("stroke", "none");
+      if (!entries) {
+        hexPolygons[key].setAttribute("fill", base);
+      } else if (entries.length === 1) {
+        hexPolygons[key].setAttribute("fill", mixColor(FACTION_COLORS[entries[0].faction], base, FACTION_TERRITORY_ALPHA));
+      } else {
+        hexPolygons[key].setAttribute("fill", base);
+        drawTerritoryVoronoi(lay.centers[key], lay.size, entries, base, lay);
+      }
     }
   }
 
@@ -938,7 +1038,7 @@
     const board = turn.checkpoints[cpIdx];
     const playerStats = turn.playerStats[cpIdx];
 
-    applyMapModeFills(game, board);
+    applyMapModeFills(game, layout, board);
     renderBoardContent(game, layout, board);
     renderSidebar(game, playerStats, computeUnitCounts(board, game.numFactions));
 
