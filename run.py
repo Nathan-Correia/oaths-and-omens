@@ -7,14 +7,14 @@ steps, battle) - see that module's docstring for why these are
 independent snapshots rather than incremental diffs.
 
 Agent mix is configurable per faction via AGENT_ASSIGNMENT below - any
-mix of "random"/"greedy"/"nn" (a randomly-initialized, untrained PyTorch
+mix of "random"/"greedy" (a randomly-initialized, untrained PyTorch
 policy network; see agents/nn_agent/). Faction id -> color
 is fixed (see hex_visualizer.py's FACTION_COLORS: 0=red, 1=blue,
 2=green, 3=purple, 4=orange, 5=brown, 6=pink, 7=grey).
 
 Before any turns run, engine/placement.py's run_city_setup plays out
 colourless city placement and the capital draft - every agent kind,
-including "nn", implements all eight decision points (the five
+implements all eight decision points (the five
 turn-phase ones plus placement/draft/swap), so no per-faction fallback
 wiring is needed here.
 
@@ -61,18 +61,9 @@ MAX_TURNS = 100
 # hardcoding this value back in, if that's ever useful for debugging.
 SEED = int(time.time() * 1000) % (2 ** 31)
 
-# Per-faction agent choice - any of "random", "greedy", "nn".
+# Per-faction agent choice - any of "random", "greedy".
 AGENT_ASSIGNMENT = {f: "greedy" for f in range(NUM_FACTIONS)}
 
-
-def _build_nn_agents():
-    """Lazily pulls in torch/agents.nn_agent - only paid for if
-    AGENT_ASSIGNMENT actually uses "nn" for at least one faction."""
-    from agents.nn_agent.agent import make_nn_agents
-    from agents.nn_agent.network import build_network
-
-    network = build_network(NUM_FACTIONS, seed=SEED)
-    return make_nn_agents(network, NUM_FACTIONS, seed=SEED, max_turns=MAX_TURNS)
 
 
 def main():
@@ -91,7 +82,6 @@ def main():
     build_fns = {
         "random": lambda: make_random_agents(NUM_FACTIONS, seed=SEED),
         "greedy": lambda: make_greedy_agents(NUM_FACTIONS, seed=SEED),
-        "nn": lambda: _build_nn_agents(),
     }
     (decide_buy, decide_movement, decide_cavalry, decide_target, decide_rectification, decide_resource_choice,
      decide_placement, decide_draft, decide_swap) = compose_agents(AGENT_ASSIGNMENT, build_fns)

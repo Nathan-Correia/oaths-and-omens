@@ -3,5 +3,3 @@ __pycache__/
 board_state.json
 terrain_gen_log.json
 city_placement_log.json
-
-checkpoints/
