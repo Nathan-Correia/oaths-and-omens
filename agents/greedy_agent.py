@@ -1,10 +1,13 @@
 """
 GreedyAgent for engine: a single-minded outpost rush.
 
-Buy phase prioritizes its one outpost action for the turn (build_outpost -
-only 1/turn now, see engine/buy.py), then spends whatever's left
-aggressively - infantry with leftover gold, all banked kill-XP converted
-toward whichever of cavalry/archers it currently has fewer of.
+Buy phase prioritizes its one outpost action for the turn (build_outpost or
+upgrade_outpost, combined 1/turn - see engine/buy.py): upgrading an outpost
+it already holds comes before building a new one, since it's pure value-add
+on ground already secured (see greedy_buy/_UPGRADE_PRIORITY). Whatever's
+left then gets spent aggressively - infantry with leftover gold, all banked
+kill-XP converted toward whichever of cavalry/archers it currently has
+fewer of.
 
 Movement/cavalry phases have two priorities, strictly ordered: while this
 faction still has room for more outposts (under OUTPOST_CAP) and at
@@ -42,38 +45,65 @@ import numpy as np
 from .random_agent import random_rectification, random_target
 from engine.buy import INFANTRY_COST, OUTPOST_CAP, _can_build_outpost, _outpost_count
 from engine.geometry import hex_distance
-from engine.state import IMPASSABLE_TERRAIN_INDICES, NO_FACTION, RESOURCE_TO_INDEX, count_units_in_play
+from engine.state import IMPASSABLE_TERRAIN_INDICES, NO_FACTION, NO_UPGRADE, RESOURCE_TO_INDEX, count_units_in_play
 
 # Which unit type to sacrifice first when a hex offers a choice of more
 # than one for building an outpost there.
 _OUTPOST_UNIT_PRIORITY = ("infantry", "cavalry", "archers")
+
+# Which upgrade to grab first when more than one is affordable: Temple
+# first (direct VP - the actual win condition), then Barracks (compounds
+# economy), then Workshop (compounds resources) - a "greedy" ranking by
+# how directly each pays off.
+_UPGRADE_PRIORITY = ("temple", "barracks", "workshop")
 
 _IMPASSABLE_INDEX_SET = {int(x) for x in IMPASSABLE_TERRAIN_INDICES}
 
 
 def greedy_buy(state, faction, legal, rng):
     outpost_actions = [a for a in legal if a["type"] == "build_outpost"]
+    # Only ever gives a bare outpost its FIRST upgrade - get_legal_buy_actions
+    # also offers converting an already-upgraded outpost to a different
+    # upgrade, but re-paying full price to swap isn't worth it for a
+    # strategy this simple, so those are filtered out here.
+    upgrade_actions = [
+        a for a in legal
+        if a["type"] == "upgrade_outpost" and state.outpost_upgrade[a["hex"]] == NO_UPGRADE
+    ]
     infantry_actions = [a for a in legal if a["type"] == "buy_infantry"]
     convert_actions = [a for a in legal if a["type"] == "convert_to_special"]
 
     chosen = []
 
     # Only one outpost action (build_outpost/upgrade_outpost, combined)
-    # goes through per turn now (see engine/buy.py's apply_buy_phase), so
-    # only submit a single build_outpost attempt - one preferred hex,
-    # shuffled among candidates, with a preferred sacrificed unit_type
-    # (infantry first) at that hex.
-    by_hex = {}
-    for a in outpost_actions:
-        by_hex.setdefault(a["hex"], {})[a["unit_type"]] = a
-    outpost_hexes = list(by_hex.keys())
-    rng.shuffle(outpost_hexes)
-    if outpost_hexes:
-        options = by_hex[outpost_hexes[0]]
-        for unit_type in _OUTPOST_UNIT_PRIORITY:
-            if unit_type in options:
-                chosen.append(options[unit_type])
+    # goes through per turn (see engine/buy.py's apply_buy_phase) -
+    # upgrading an outpost already held is prioritized over building a
+    # new one, since it's pure value-add on ground already secured.
+    if upgrade_actions:
+        by_hex = {}
+        for a in upgrade_actions:
+            by_hex.setdefault(a["hex"], {})[a["upgrade"]] = a
+        upgrade_hexes = list(by_hex.keys())
+        rng.shuffle(upgrade_hexes)
+        options = by_hex[upgrade_hexes[0]]
+        for upgrade in _UPGRADE_PRIORITY:
+            if upgrade in options:
+                chosen.append(options[upgrade])
                 break
+    else:
+        # One preferred hex, shuffled among candidates, with a preferred
+        # sacrificed unit_type (infantry first) at that hex.
+        by_hex = {}
+        for a in outpost_actions:
+            by_hex.setdefault(a["hex"], {})[a["unit_type"]] = a
+        outpost_hexes = list(by_hex.keys())
+        rng.shuffle(outpost_hexes)
+        if outpost_hexes:
+            options = by_hex[outpost_hexes[0]]
+            for unit_type in _OUTPOST_UNIT_PRIORITY:
+                if unit_type in options:
+                    chosen.append(options[unit_type])
+                    break
 
     if infantry_actions:
         num_purchases = int(state.gold[faction]) // INFANTRY_COST

@@ -1,0 +1,1114 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Oaths &amp; Omens — Replay Viewer</title>
+<style>
+  :root {
+    --bg: #0d0f14;
+    --panel: #171a21;
+    --panel-2: #1e222b;
+    --border: #2a2e38;
+    --text: #e8e9ee;
+    --text-dim: #9a9ea8;
+    --text-faint: #6b6f7a;
+    --accent: #6ea8ff;
+    --accent-dim: #3a4a66;
+    --danger: #e05252;
+    --grid-line: #363a45;
+    --shadow: 0 8px 24px rgba(0,0,0,0.45);
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    background: var(--bg); color: var(--text);
+    font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    font-size: 14px;
+    overflow: hidden;
+  }
+  #app { display: flex; flex-direction: column; height: 100vh; }
+
+  /* ---------- Top bar ---------- */
+  #topbar {
+    display: flex; align-items: center; gap: 16px;
+    padding: 10px 18px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+    flex: 0 0 auto;
+  }
+  #topbar h1 {
+    font-size: 15px; font-weight: 600; margin: 0;
+    letter-spacing: 0.02em;
+  }
+  #topbar h1 .dim { color: var(--text-dim); font-weight: 400; }
+  #fileStatus { color: var(--text-dim); font-size: 12.5px; flex: 1; }
+  #fileStatus.error { color: var(--danger); }
+  .btn {
+    background: var(--panel-2); color: var(--text);
+    border: 1px solid var(--border); border-radius: 7px;
+    padding: 6px 13px; font-size: 13px; cursor: pointer;
+    transition: background 0.12s, border-color 0.12s;
+  }
+  .btn:hover { background: #262b36; border-color: #3a3f4c; }
+  .btn:active { background: #1a1e27; }
+  .btn.primary { background: var(--accent); color: #0d1420; border-color: var(--accent); font-weight: 600; }
+  .btn.primary:hover { background: #85b6ff; }
+  #fileInput { display: none; }
+
+  #mapModeToggle {
+    display: flex; background: var(--panel-2); border: 1px solid var(--border);
+    border-radius: 7px; padding: 2px; flex: 0 0 auto;
+  }
+  #mapModeToggle button {
+    background: none; border: none; color: var(--text-dim);
+    font-size: 12.5px; padding: 5px 12px; border-radius: 5px; cursor: pointer;
+  }
+  #mapModeToggle button.active { background: var(--accent); color: #0d1420; font-weight: 600; }
+  #mapModeToggle button:not(.active):hover { color: var(--text); }
+
+  /* ---------- Layout ---------- */
+  #main { flex: 1 1 auto; display: flex; min-height: 0; }
+  #boardWrap {
+    flex: 1 1 auto; position: relative; min-width: 0;
+    display: flex; align-items: center; justify-content: center;
+    background:
+      radial-gradient(ellipse at 50% 0%, #14171f 0%, var(--bg) 70%);
+  }
+  #boardSvg { display: block; max-width: 100%; max-height: 100%; }
+
+  #sidebar {
+    flex: 0 0 320px; overflow-y: auto;
+    background: var(--panel);
+    border-left: 1px solid var(--border);
+    padding: 14px;
+    display: flex; flex-direction: column; gap: 10px;
+  }
+  #sidebar h2 {
+    font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em;
+    color: var(--text-faint); margin: 4px 2px 0;
+    font-weight: 600;
+  }
+
+  .faction-card {
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-left: 3px solid transparent;
+    border-radius: 8px;
+    padding: 9px 11px;
+    transition: opacity 0.15s;
+  }
+  .faction-card.dead { opacity: 0.45; }
+  .fc-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+  .fc-swatch { width: 11px; height: 11px; border-radius: 3px; flex: 0 0 auto; }
+  .fc-name { font-weight: 600; font-size: 13px; flex: 1; }
+  .fc-dead-tag { font-size: 10.5px; color: var(--text-faint); }
+
+  .vp-row { display: flex; align-items: center; gap: 8px; margin-bottom: 7px; }
+  .vp-track {
+    flex: 1; height: 7px; border-radius: 4px; background: #262a34;
+    overflow: hidden; position: relative;
+  }
+  .vp-fill { height: 100%; border-radius: 4px; transition: width 0.2s ease; }
+  .vp-num { font-size: 12px; color: var(--text-dim); width: 40px; text-align: right; flex: 0 0 auto; }
+
+  .stat-grid {
+    display: grid; grid-template-columns: repeat(3, 1fr);
+    gap: 4px 8px; font-size: 11.5px; color: var(--text-dim);
+    margin-bottom: 6px;
+  }
+  .stat-grid .stat b { color: var(--text); font-weight: 600; }
+
+  .unit-row { display: flex; gap: 12px; font-size: 12px; color: var(--text-dim); }
+  .unit-row .u { display: flex; align-items: center; gap: 4px; }
+  .unit-row svg { flex: 0 0 auto; }
+
+  /* ---------- Timeline ---------- */
+  #timeline {
+    flex: 0 0 auto;
+    background: var(--panel);
+    border-top: 1px solid var(--border);
+    padding: 8px 18px 12px;
+    display: flex; flex-direction: column; gap: 6px;
+  }
+  #timelineLabel {
+    text-align: center; font-size: 12.5px; color: var(--text-dim);
+    user-select: none;
+  }
+  #timelineLabel b { color: var(--text); font-weight: 600; }
+  #timelineRow { display: flex; align-items: center; gap: 10px; }
+  .icon-btn {
+    background: var(--panel-2); border: 1px solid var(--border);
+    color: var(--text); border-radius: 7px; width: 30px; height: 30px;
+    display: flex; align-items: center; justify-content: center;
+    cursor: pointer; flex: 0 0 auto;
+  }
+  .icon-btn:hover { background: #262b36; }
+  .icon-btn svg { pointer-events: none; }
+
+  #slider {
+    flex: 1; -webkit-appearance: none; appearance: none;
+    height: 6px; border-radius: 4px; background: #262a34;
+    outline: none; cursor: pointer;
+  }
+  #slider::-webkit-slider-thumb {
+    -webkit-appearance: none; appearance: none;
+    width: 16px; height: 16px; border-radius: 50%;
+    background: var(--accent); border: 2px solid #0d1420;
+    cursor: pointer; margin-top: -5px;
+  }
+  #slider::-moz-range-thumb {
+    width: 16px; height: 16px; border-radius: 50%;
+    background: var(--accent); border: 2px solid #0d1420; cursor: pointer;
+  }
+  #slider::-webkit-slider-runnable-track { height: 6px; border-radius: 4px; }
+
+  /* ---------- Empty state ---------- */
+  #emptyState {
+    position: absolute; inset: 0;
+    display: flex; align-items: center; justify-content: center;
+    flex-direction: column; gap: 14px; text-align: center;
+    color: var(--text-dim);
+  }
+  #emptyState.hidden { display: none; }
+  #dropZone {
+    border: 2px dashed var(--border); border-radius: 14px;
+    padding: 48px 64px; transition: border-color 0.15s, background 0.15s;
+  }
+  #dropZone.drag-over { border-color: var(--accent); background: rgba(110,168,255,0.06); }
+  #dropZone .big { font-size: 16px; color: var(--text); margin-bottom: 6px; font-weight: 600; }
+  #dropZone .small { font-size: 12.5px; color: var(--text-faint); }
+
+  /* ---------- Tooltip ---------- */
+  #tooltip {
+    position: fixed; pointer-events: none; z-index: 50;
+    background: #10131a; border: 1px solid var(--border);
+    border-radius: 8px; padding: 8px 11px; font-size: 12px;
+    box-shadow: var(--shadow); max-width: 240px;
+    display: none; line-height: 1.5;
+  }
+  #tooltip .tt-title { font-weight: 600; color: var(--text); margin-bottom: 2px; }
+  #tooltip .tt-row { color: var(--text-dim); }
+  #tooltip .tt-row b { color: var(--text); }
+
+  /* ---------- Battle modal ---------- */
+  #modalScrim {
+    position: fixed; inset: 0; background: rgba(6,7,10,0.65);
+    display: none; align-items: center; justify-content: center; z-index: 100;
+  }
+  #modalScrim.open { display: flex; }
+  #battleModal {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 12px; box-shadow: var(--shadow);
+    max-width: 92vw; max-height: 88vh; overflow: auto;
+    padding: 18px 20px 16px;
+  }
+  #battleModal .bm-head {
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 12px;
+  }
+  #battleModal .bm-title { font-size: 14px; font-weight: 600; }
+  #battleModal .bm-close {
+    background: none; border: none; color: var(--text-faint);
+    font-size: 20px; cursor: pointer; line-height: 1; padding: 2px 6px;
+  }
+  #battleModal .bm-close:hover { color: var(--text); }
+  table.battle-table { border-collapse: collapse; font-size: 12.5px; }
+  table.battle-table th, table.battle-table td {
+    padding: 8px 14px; text-align: left; vertical-align: top;
+    border-bottom: 1px solid var(--border);
+  }
+  table.battle-table th { color: var(--text-dim); font-weight: 600; font-size: 11.5px; }
+  table.battle-table .row-label { color: var(--text-dim); font-weight: 600; white-space: nowrap; }
+  table.battle-table .fac-head { display: flex; align-items: center; gap: 7px; }
+  table.battle-table .fac-swatch { width: 10px; height: 10px; border-radius: 3px; }
+  table.battle-table .cell-line { color: var(--text); }
+  table.battle-table .cell-totals { color: var(--text-faint); margin-top: 4px; font-size: 11px; }
+  table.battle-table td.winner { color: #7ee08a; font-weight: 700; }
+  table.battle-table td.defeated { color: var(--text-faint); }
+
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-thumb { background: #2a2e38; border-radius: 6px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="topbar">
+    <h1>Oaths &amp; Omens <span class="dim">— Replay Viewer</span></h1>
+    <span id="fileStatus">No replay loaded.</span>
+    <div id="mapModeToggle">
+      <button class="active" data-mode="terrain">Terrain</button>
+      <button data-mode="faction">Faction</button>
+    </div>
+    <button class="btn primary" id="loadBtn">Load board_state.json</button>
+    <input type="file" id="fileInput" accept="application/json,.json" />
+  </div>
+
+  <div id="main">
+    <div id="boardWrap">
+      <svg id="boardSvg" xmlns="http://www.w3.org/2000/svg"></svg>
+      <div id="emptyState">
+        <div id="dropZone">
+          <div class="big">Drop a board_state.json here</div>
+          <div class="small">or use "Load board_state.json" above — generated by run.py</div>
+        </div>
+      </div>
+    </div>
+    <div id="sidebar">
+      <h2>Factions</h2>
+      <div id="factionCards"></div>
+    </div>
+  </div>
+
+  <div id="timeline">
+    <div id="timelineLabel">—</div>
+    <div id="timelineRow">
+      <button class="icon-btn" id="prevBtn" title="Previous step (←)">
+        <svg width="14" height="14" viewBox="0 0 14 14"><path d="M9 2 L4 7 L9 12" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </button>
+      <button class="icon-btn" id="playBtn" title="Play / pause (space)">
+        <svg id="playIcon" width="14" height="14" viewBox="0 0 14 14"><path d="M3 2 L12 7 L3 12 Z" fill="currentColor"/></svg>
+      </button>
+      <input type="range" id="slider" min="0" max="0" value="0" step="1" />
+      <button class="icon-btn" id="nextBtn" title="Next step (→)">
+        <svg width="14" height="14" viewBox="0 0 14 14"><path d="M5 2 L10 7 L5 12" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </button>
+    </div>
+  </div>
+</div>
+
+<div id="tooltip"></div>
+
+<div id="modalScrim">
+  <div id="battleModal">
+    <div class="bm-head">
+      <div class="bm-title" id="bmTitle">Battle</div>
+      <button class="bm-close" id="bmClose">&times;</button>
+    </div>
+    <div id="bmBody"></div>
+  </div>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  // =========================================================================
+  // Constants (mirrors hex_common.py / hex_visualizer.py / engine/state.py)
+  // =========================================================================
+
+  const CHECKPOINT_LABELS = ["Start", "Buy", "Move 1", "Move 2", "Move 3", "Cav 1", "Cav 2", "Battle"];
+  const VP_TO_WIN = 50;
+  const TROOP_TYPES = ["infantry", "cavalry", "archers"];
+
+  const FACTION_COLORS = [
+    "#e41a1c", "#377eb8", "#4daf4a", "#984ea3",
+    "#ff7f00", "#a65628", "#f781bf", "#999999",
+  ];
+
+  // Dark-theme terrain palette - muted/desaturated so it reads as map
+  // texture under the dashboard chrome instead of a bright pastel map.
+  const TERRAIN_COLORS = {
+    plains: "#33422c",
+    mountain: "#3c3c42",
+    lake: "#1c3448",
+    desert: "#4a3f27",
+    marsh: "#3a3226",
+  };
+
+  const RESOURCE_KEYS = ["wood", "iron", "clay", "fish"];
+
+  // =========================================================================
+  // Hex geometry (ported from hex_common.py)
+  // =========================================================================
+
+  function hexToPixel(q, r, size) {
+    const x = size * (1.5 * q);
+    const y = size * (Math.sqrt(3) / 2 * q + Math.sqrt(3) * r);
+    return [x, y];
+  }
+
+  function hexCorner(cx, cy, size, i) {
+    const angle = (Math.PI / 180) * (60 * i);
+    return [cx + size * Math.cos(angle), cy + size * Math.sin(angle)];
+  }
+
+  function hexDistance(a, b) {
+    return Math.max(Math.abs(a[0] - b[0]), Math.abs(a[1] - b[1]), Math.abs(a[2] - b[2]));
+  }
+
+  function computeHexSize(radius, w, h, margin) {
+    const availW = w - 2 * margin, availH = h - 2 * margin;
+    const boardWidthUnits = 1.5 * (2 * radius) + 2;
+    const boardHeightUnits = Math.sqrt(3) * (2 * radius + 1);
+    const sizeFromW = availW / boardWidthUnits;
+    const sizeFromH = availH / boardHeightUnits;
+    return Math.max(8, Math.min(sizeFromW, sizeFromH));
+  }
+
+  // =========================================================================
+  // Outpost icon shapes (ported from hex_visualizer.py's
+  // _outpost_icon_points): unupgraded = triangle, each upgrade gets its
+  // own silhouette so it reads by shape, not just color.
+  // =========================================================================
+
+  function starPoints(cx, cy, outer, inner, numPoints) {
+    numPoints = numPoints || 5;
+    const pts = [];
+    for (let i = 0; i < numPoints * 2; i++) {
+      const radius = i % 2 === 0 ? outer : inner;
+      const angle = Math.PI / 2 + i * Math.PI / numPoints;
+      pts.push([cx + radius * Math.cos(angle), cy - radius * Math.sin(angle)]);
+    }
+    return pts;
+  }
+
+  function outpostIconPoints(cx, cy, s, upgrade) {
+    if (upgrade === "barracks") {
+      return [[cx - s, cy - s], [cx + s, cy - s], [cx + s, cy + s], [cx - s, cy + s]];
+    }
+    if (upgrade === "workshop") {
+      return [[cx, cy - s * 1.15], [cx + s * 1.15, cy], [cx, cy + s * 1.15], [cx - s * 1.15, cy]];
+    }
+    if (upgrade === "temple") {
+      return starPoints(cx, cy, s * 1.15, s * 0.45, 5);
+    }
+    return [[cx, cy - s], [cx - s, cy + s * 0.7], [cx + s, cy + s * 0.7]];
+  }
+
+  // =========================================================================
+  // SVG helpers
+  // =========================================================================
+
+  const SVG_NS = "http://www.w3.org/2000/svg";
+  function svgEl(tag, attrs) {
+    const el = document.createElementNS(SVG_NS, tag);
+    if (attrs) {
+      for (const k in attrs) el.setAttribute(k, attrs[k]);
+    }
+    return el;
+  }
+  function pointsAttr(pts) {
+    return pts.map((p) => p[0].toFixed(2) + "," + p[1].toFixed(2)).join(" ");
+  }
+
+  // =========================================================================
+  // State
+  // =========================================================================
+
+  let game = null;        // { radius, numFactions, terrainMap, coordList, turns }
+  let layout = null;      // { size, centers: Map<coordKey,[x,y]>, viewBox: [w,h] }
+  let currentStep = 0;
+  let totalSteps = 0;
+  let playing = false;
+  let playTimer = null;
+  let openBattleTable = null;
+  let mapMode = "terrain"; // "terrain" | "faction"
+  let hexPolygons = {};    // coordKey -> terrain-layer <polygon>, filled by buildStaticBoard
+
+  const els = {
+    boardSvg: document.getElementById("boardSvg"),
+    emptyState: document.getElementById("emptyState"),
+    dropZone: document.getElementById("dropZone"),
+    fileInput: document.getElementById("fileInput"),
+    loadBtn: document.getElementById("loadBtn"),
+    fileStatus: document.getElementById("fileStatus"),
+    mapModeButtons: Array.from(document.querySelectorAll("#mapModeToggle button")),
+    factionCards: document.getElementById("factionCards"),
+    timelineLabel: document.getElementById("timelineLabel"),
+    slider: document.getElementById("slider"),
+    prevBtn: document.getElementById("prevBtn"),
+    nextBtn: document.getElementById("nextBtn"),
+    playBtn: document.getElementById("playBtn"),
+    playIcon: document.getElementById("playIcon"),
+    tooltip: document.getElementById("tooltip"),
+    modalScrim: document.getElementById("modalScrim"),
+    bmTitle: document.getElementById("bmTitle"),
+    bmBody: document.getElementById("bmBody"),
+    bmClose: document.getElementById("bmClose"),
+    boardWrap: document.getElementById("boardWrap"),
+  };
+
+  function coordKey(q, r, s) { return q + "_" + r + "_" + s; }
+
+  // =========================================================================
+  // Loading + parsing board_state.json
+  // =========================================================================
+
+  function parseGame(data) {
+    const radius = data.radius, numFactions = data.num_factions;
+    const terrainMap = {};   // coordKey -> terrain string
+    const coordList = [];    // [q, r, s]
+    for (const key in data.terrain) {
+      const parts = key.split("_").map(Number);
+      terrainMap[key] = data.terrain[key];
+      coordList.push(parts);
+    }
+
+    const turns = data.turns.map((turn) => {
+      const checkpoints = turn.checkpoints.map((sparse) => {
+        const board = {}; // coordKey -> {city, troops, battle}
+        for (const e of sparse) {
+          board[coordKey(e.q, e.r, e.s)] = { city: e.city, troops: e.troops, battle: e.battle };
+        }
+        return board;
+      });
+      const playerStats = turn.player_stats.map((snap) => {
+        const out = {};
+        for (const f in snap) out[Number(f)] = snap[f];
+        return out;
+      });
+      const battlesByHex = {};
+      for (const ev of turn.battle_events || []) {
+        battlesByHex[coordKey(ev.hex[0], ev.hex[1], ev.hex[2])] = ev;
+      }
+      return { checkpoints, playerStats, battlesByHex };
+    });
+
+    return { radius, numFactions, terrainMap, coordList, turns };
+  }
+
+  function computeLayout(g) {
+    const areaW = els.boardWrap.clientWidth || 900;
+    const areaH = els.boardWrap.clientHeight || 900;
+    const margin = 26;
+    const size = computeHexSize(g.radius, areaW, areaH, margin);
+
+    const raw = {};
+    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+    for (const [q, r] of g.coordList) {
+      const [x, y] = hexToPixel(q, r, size);
+      raw[coordKey(q, r, -q - r)] = [x, y];
+      if (x < minX) minX = x; if (x > maxX) maxX = x;
+      if (y < minY) minY = y; if (y > maxY) maxY = y;
+    }
+    const pad = size * 1.2;
+    const w = (maxX - minX) + pad * 2;
+    const h = (maxY - minY) + pad * 2;
+    const centers = {};
+    for (const key in raw) {
+      centers[key] = [raw[key][0] - minX + pad, raw[key][1] - minY + pad];
+    }
+    return { size, centers, viewBox: [w, h] };
+  }
+
+  // =========================================================================
+  // Board rendering
+  // =========================================================================
+
+  let terrainLayer = null, contentLayer = null;
+
+  function buildStaticBoard(g, lay) {
+    els.boardSvg.innerHTML = "";
+    els.boardSvg.setAttribute("viewBox", "0 0 " + lay.viewBox[0] + " " + lay.viewBox[1]);
+    els.boardSvg.setAttribute("width", lay.viewBox[0]);
+    els.boardSvg.setAttribute("height", lay.viewBox[1]);
+
+    terrainLayer = svgEl("g", { id: "terrainLayer" });
+    contentLayer = svgEl("g", { id: "contentLayer" });
+    els.boardSvg.appendChild(terrainLayer);
+    els.boardSvg.appendChild(contentLayer);
+
+    hexPolygons = {};
+    for (const [q, r, s] of g.coordList) {
+      const key = coordKey(q, r, s);
+      const [cx, cy] = lay.centers[key];
+      const corners = [0, 1, 2, 3, 4, 5].map((i) => hexCorner(cx, cy, lay.size, i));
+      const terrain = g.terrainMap[key];
+      const poly = svgEl("polygon", {
+        points: pointsAttr(corners),
+        fill: TERRAIN_COLORS[terrain] || "#2a2e38",
+        stroke: "var(--grid-line)",
+        "stroke-width": "1",
+        class: "hex-tile",
+        "data-key": key,
+      });
+      terrainLayer.appendChild(poly);
+      hexPolygons[key] = poly;
+    }
+  }
+
+  // =========================================================================
+  // Map modes: "terrain" (default) fills each hex by terrain type;
+  // "faction" fills each hex by whichever faction has a capital or outpost
+  // within 1 hex of it (a simple territory-control overlay), tinted over a
+  // neutral dark base rather than the vivid terrain palette so ownership
+  // reads clearly. Mountain/lake stay distinguishable even unclaimed, since
+  // impassability still matters for reading the board.
+  // =========================================================================
+
+  const FACTION_TERRITORY_ALPHA = 0.45;
+  const NEUTRAL_FILL = { plains: "#20242c", marsh: "#20242c", desert: "#20242c", mountain: "#2c2c33", lake: "#182735" };
+
+  function hexToRgb(hex) {
+    const n = parseInt(hex.slice(1), 16);
+    return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+  }
+  function mixColor(fgHex, bgHex, alpha) {
+    const [r1, g1, b1] = hexToRgb(fgHex), [r2, g2, b2] = hexToRgb(bgHex);
+    const r = Math.round(r1 * alpha + r2 * (1 - alpha));
+    const g = Math.round(g1 * alpha + g2 * (1 - alpha));
+    const b = Math.round(b1 * alpha + b2 * (1 - alpha));
+    return "#" + [r, g, b].map((v) => v.toString(16).padStart(2, "0")).join("");
+  }
+
+  function computeFactionTerritory(g, board) {
+    // City hexes present in this checkpoint's (sparse) board.
+    const cities = [];
+    for (const key in board) {
+      const data = board[key];
+      if (data.city) cities.push({ coord: keyToCoord(key), faction: data.city.faction });
+    }
+    const owner = {}; // coordKey -> faction, only for hexes within 1 of some city
+    for (const [q, r, s] of g.coordList) {
+      const key = coordKey(q, r, s);
+      const coord = [q, r, s];
+      let bestFaction = null, bestDist = Infinity;
+      for (const c of cities) {
+        const d = hexDistance(coord, c.coord);
+        if (d <= 1 && d < bestDist) { bestDist = d; bestFaction = c.faction; }
+      }
+      if (bestFaction !== null) owner[key] = bestFaction;
+    }
+    return owner;
+  }
+
+  function keyToCoord(key) {
+    return key.split("_").map(Number);
+  }
+
+  function applyMapModeFills(g, board) {
+    if (mapMode === "terrain") {
+      for (const [q, r, s] of g.coordList) {
+        const key = coordKey(q, r, s);
+        hexPolygons[key].setAttribute("fill", TERRAIN_COLORS[g.terrainMap[key]] || "#2a2e38");
+      }
+      return;
+    }
+    const owner = computeFactionTerritory(g, board);
+    for (const [q, r, s] of g.coordList) {
+      const key = coordKey(q, r, s);
+      const terrain = g.terrainMap[key];
+      const base = NEUTRAL_FILL[terrain] || "#20242c";
+      const faction = owner[key];
+      const fill = faction !== undefined ? mixColor(FACTION_COLORS[faction], base, FACTION_TERRITORY_ALPHA) : base;
+      hexPolygons[key].setAttribute("fill", fill);
+    }
+  }
+
+  function shapePositions(present, cx, cy, size) {
+    const spacing = size * 0.4875;
+    const n = present.length;
+    if (n === 3) {
+      return {
+        archers: [cx, cy - size * 0.2375],
+        infantry: [cx - spacing * 0.55, cy + size * 0.2],
+        cavalry: [cx + spacing * 0.55, cy + size * 0.2],
+      };
+    }
+    const startX = cx - (spacing * (n - 1)) / 2;
+    const out = {};
+    present.forEach((t, i) => { out[t] = [startX + i * spacing, cy + size * 0.03125]; });
+    return out;
+  }
+
+  function drawTroopShape(parent, type, center, size, color, count) {
+    const [cx, cy] = center;
+    let shape;
+    if (type === "infantry") {
+      shape = svgEl("circle", { cx, cy, r: size, fill: color, stroke: "#12141a", "stroke-width": 1 });
+    } else if (type === "cavalry") {
+      const s2 = size - 0.5;
+      shape = svgEl("rect", { x: cx - s2, y: cy - s2, width: s2 * 2, height: s2 * 2, fill: color, stroke: "#12141a", "stroke-width": 1 });
+    } else {
+      const pts = [[cx, cy - size], [cx - size, cy + size * 0.7], [cx + size, cy + size * 0.7]];
+      shape = svgEl("polygon", { points: pointsAttr(pts), fill: color, stroke: "#12141a", "stroke-width": 1 });
+    }
+    parent.appendChild(shape);
+    const fontSize = Math.max(6, size * 1.3);
+    const label = svgEl("text", {
+      x: cx, y: cy + fontSize * 0.37, "text-anchor": "middle", "font-size": String(fontSize), "font-weight": "700",
+      fill: "#fff", style: "pointer-events:none; paint-order: stroke; stroke: rgba(0,0,0,0.55); stroke-width: 2px;",
+    });
+    label.textContent = String(count);
+    parent.appendChild(label);
+  }
+
+  function drawTroopRow(parent, center, size, troops) {
+    const color = FACTION_COLORS[troops.faction];
+    const present = TROOP_TYPES.filter((t) => (troops[t] || 0) > 0);
+    if (!present.length) return;
+    const positions = shapePositions(present, center[0], center[1], size);
+    const shapeSize = Math.max(3.1, size * 0.2625);
+    for (const t of present) {
+      drawTroopShape(parent, t, positions[t], shapeSize, color, troops[t]);
+    }
+  }
+
+  function drawCityIcon(parent, center, size, city) {
+    const [cx, cy] = center;
+    const iconY = cy - size * 0.62 + 4;
+    const color = FACTION_COLORS[city.faction];
+    const s = Math.max(3.1, size * 0.45);
+
+    if (city.is_capital) {
+      const baseW = s * 4 / 3, baseH = s;
+      const rect = svgEl("rect", {
+        x: cx - baseW / 2, y: iconY - baseH / 2, width: baseW, height: baseH,
+        fill: color, stroke: "#0d1420", "stroke-width": 1,
+      });
+      parent.appendChild(rect);
+      const roof = svgEl("polygon", {
+        points: pointsAttr([[cx, iconY - baseH / 2 - s], [cx - baseW / 2, iconY - baseH / 2], [cx + baseW / 2, iconY - baseH / 2]]),
+        fill: color, stroke: "#0d1420", "stroke-width": 1,
+      });
+      parent.appendChild(roof);
+    } else {
+      // 35% smaller than a capital's icon (0.85 * 0.65) - keeps outposts
+      // visually subordinate to capitals on the board.
+      const pts = outpostIconPoints(cx, iconY, s * 0.5525, city.upgrade);
+      const poly = svgEl("polygon", { points: pointsAttr(pts), fill: color, stroke: "#0d1420", "stroke-width": 1.2 });
+      parent.appendChild(poly);
+    }
+  }
+
+  function drawBattleMark(parent, center, size, hexData) {
+    const [cx, cy] = center;
+    const corners = [0, 1, 2, 3, 4, 5].map((i) => hexCorner(cx, cy, size, i));
+    const ring = svgEl("polygon", {
+      points: pointsAttr(corners), fill: "none", stroke: "#e05252", "stroke-width": 2.5,
+      opacity: 0.9, class: "battle-ring",
+    });
+    parent.appendChild(ring);
+
+    const contributions = (hexData.battle && hexData.battle.contributions) || [];
+    let totalUnits = 0;
+    for (const c of contributions) totalUnits += (c.infantry || 0) + (c.cavalry || 0) + (c.archers || 0);
+    const badgeR = Math.max(5, size * 0.2125);
+    const badge = svgEl("circle", { cx, cy, r: badgeR, fill: "#e05252", stroke: "#0d1420", "stroke-width": 1.5 });
+    parent.appendChild(badge);
+    const badgeFontSize = Math.max(6, badgeR * 1.15);
+    const label = svgEl("text", {
+      x: cx, y: cy + badgeFontSize * 0.35, "text-anchor": "middle", "font-size": String(badgeFontSize), "font-weight": "700", fill: "#fff",
+      style: "pointer-events:none;",
+    });
+    label.textContent = String(totalUnits);
+    parent.appendChild(label);
+  }
+
+  function renderBoardContent(g, lay, board) {
+    contentLayer.innerHTML = "";
+    for (const [q, r, s] of g.coordList) {
+      const key = coordKey(q, r, s);
+      const data = board[key];
+      if (!data) continue;
+      const center = lay.centers[key];
+
+      if (data.city) drawCityIcon(contentLayer, center, lay.size, data.city);
+
+      if (data.battle) {
+        drawBattleMark(contentLayer, center, lay.size, data);
+      } else if (data.troops) {
+        drawTroopRow(contentLayer, center, lay.size, data.troops);
+      }
+    }
+  }
+
+  // =========================================================================
+  // Sidebar
+  // =========================================================================
+
+  function computeUnitCounts(board, numFactions) {
+    const counts = {};
+    for (let f = 0; f < numFactions; f++) counts[f] = { infantry: 0, cavalry: 0, archers: 0 };
+    for (const key in board) {
+      const data = board[key];
+      if (data.troops) {
+        const f = data.troops.faction;
+        for (const t of TROOP_TYPES) counts[f][t] += data.troops[t] || 0;
+      }
+      if (data.battle) {
+        for (const c of data.battle.contributions) {
+          for (const t of TROOP_TYPES) counts[c.faction][t] += c[t] || 0;
+        }
+      }
+    }
+    return counts;
+  }
+
+  function unitIconSvg(type, color) {
+    if (type === "infantry") return '<svg width="10" height="10"><circle cx="5" cy="5" r="4.5" fill="' + color + '"/></svg>';
+    if (type === "cavalry") return '<svg width="10" height="10"><rect x="1" y="1" width="8" height="8" fill="' + color + '"/></svg>';
+    return '<svg width="10" height="10"><polygon points="5,0.5 0.5,9 9.5,9" fill="' + color + '"/></svg>';
+  }
+
+  function renderSidebar(g, playerStats, unitCounts) {
+    let html = "";
+    for (let f = 0; f < g.numFactions; f++) {
+      const stats = playerStats[f] || {};
+      const alive = stats.alive !== false;
+      const color = FACTION_COLORS[f];
+      const vp = stats.victory_points || 0;
+      const vpFrac = Math.max(0, Math.min(1, vp / VP_TO_WIN));
+      const gold = stats.gold || 0;
+      const killXp = stats.kill_xp || 0;
+      const res = stats.resources || {};
+      const counts = unitCounts[f] || { infantry: 0, cavalry: 0, archers: 0 };
+
+      html += '<div class="faction-card' + (alive ? "" : " dead") + '" style="border-left-color:' + color + '">';
+      html += '  <div class="fc-head">';
+      html += '    <div class="fc-swatch" style="background:' + color + '"></div>';
+      html += '    <div class="fc-name">Faction ' + f + "</div>";
+      if (!alive) html += '    <div class="fc-dead-tag">eliminated</div>';
+      html += "  </div>";
+
+      html += '  <div class="vp-row">';
+      html += '    <div class="vp-track"><div class="vp-fill" style="width:' + (vpFrac * 100).toFixed(1) + "%;background:" + color + '"></div></div>';
+      html += '    <div class="vp-num">' + vp + " / " + VP_TO_WIN + "</div>";
+      html += "  </div>";
+
+      html += '  <div class="stat-grid">';
+      html += '    <div class="stat">Gold <b>' + gold + "</b></div>";
+      html += '    <div class="stat">Kill&nbsp;XP <b>' + killXp + "</b></div>";
+      html += '    <div class="stat">Wood <b>' + (res.wood || 0) + "</b></div>";
+      html += '    <div class="stat">Iron <b>' + (res.iron || 0) + "</b></div>";
+      html += '    <div class="stat">Clay <b>' + (res.clay || 0) + "</b></div>";
+      html += '    <div class="stat">Fish <b>' + (res.fish || 0) + "</b></div>";
+      html += "  </div>";
+
+      html += '  <div class="unit-row">';
+      html += '    <div class="u">' + unitIconSvg("infantry", color) + " " + counts.infantry + "</div>";
+      html += '    <div class="u">' + unitIconSvg("cavalry", color) + " " + counts.cavalry + "</div>";
+      html += '    <div class="u">' + unitIconSvg("archers", color) + " " + counts.archers + "</div>";
+      html += "  </div>";
+
+      html += "</div>";
+    }
+    els.factionCards.innerHTML = html;
+  }
+
+  // =========================================================================
+  // Battle table (ported from hex_visualizer.py's compute_battle_table)
+  // =========================================================================
+
+  function emptyTotals() { return { infantry: 0, cavalry: 0, archers: 0 }; }
+
+  function computeBattleTable(ev) {
+    const totals = {};
+    for (const c of ev.contributions_start) {
+      const t = totals[c.faction] || (totals[c.faction] = emptyTotals());
+      for (const ut of TROOP_TYPES) t[ut] += c[ut] || 0;
+    }
+    const factions = Object.keys(totals).map(Number).sort((a, b) => a - b);
+    const rows = [];
+
+    const dealtByFaction = {};
+    for (const entry of ev.archer_phase || []) {
+      totals[entry.faction][entry.unit_type] -= entry.count;
+      dealtByFaction[entry.killer] = (dealtByFaction[entry.killer] || 0) + entry.count;
+    }
+    const archerCells = {};
+    for (const f of factions) {
+      const dealt = dealtByFaction[f] || 0;
+      archerCells[f] = { text: dealt > 0 ? "Dealt " + dealt + " kill" + (dealt !== 1 ? "s" : "") : "-", totals: Object.assign({}, totals[f]) };
+    }
+    rows.push({ label: "Archer Phase", cells: archerCells });
+
+    (ev.rounds || []).forEach((roundLog, idx) => {
+      const cells = {};
+      const deathsByFaction = {};
+      for (const d of roundLog.deaths) (deathsByFaction[d.faction] = deathsByFaction[d.faction] || []).push(d);
+      const dismountsByFaction = {};
+      for (const d of roundLog.dismounts) (dismountsByFaction[d.faction] = dismountsByFaction[d.faction] || []).push(d);
+
+      for (const f of factions) {
+        const submitted = roundLog.target_choices_submitted[f];
+        const resolved = roundLog.resolved_targets[f];
+        const roll = roundLog.rolls[f];
+        const killsDealt = roundLog.kills_dealt[f] || 0;
+        const lines = [];
+
+        if (submitted === undefined || submitted === null) {
+          lines.push("-");
+        } else if (resolved !== undefined && resolved !== null) {
+          const rollText = (roll !== undefined && roll !== null) ? " (roll " + roll + ")" : "";
+          lines.push("→ Faction " + resolved + rollText);
+          if (killsDealt) lines.push(killsDealt + " kill" + (killsDealt !== 1 ? "s" : "") + " dealt");
+        } else {
+          lines.push("wanted Faction " + submitted + ", outnumbered");
+        }
+
+        for (const d of deathsByFaction[f] || []) {
+          totals[f][d.unit_type] -= d.count;
+          lines.push("lost " + d.count + " " + d.unit_type);
+        }
+        for (const d of dismountsByFaction[f] || []) {
+          if (d.success) {
+            totals[f].infantry += 1;
+            lines.push("cavalry dismounted → +1 infantry");
+          } else if (d.reason === "cap") {
+            lines.push("dismount blocked (unit cap)");
+          } else {
+            lines.push("dismount roll failed");
+          }
+        }
+        cells[f] = { text: lines.join("\n"), totals: Object.assign({}, totals[f]) };
+      }
+      rows.push({ label: "Round " + (idx + 1), cells });
+    });
+
+    const winner = ev.winner;
+    const resultCells = {};
+    for (const f of factions) {
+      let text, cls;
+      if (winner === null || winner === undefined) { text = "Mutual wipeout"; cls = "defeated"; }
+      else if (f === winner) { text = "WINNER"; cls = "winner"; }
+      else { text = "Defeated"; cls = "defeated"; }
+      resultCells[f] = { text, cls, totals: Object.assign({}, totals[f]) };
+    }
+    rows.push({ label: "Result", cells: resultCells });
+
+    return { factions, rows };
+  }
+
+  function renderBattleModal(table, coordLabel) {
+    els.bmTitle.textContent = "Battle at " + coordLabel;
+    let html = '<div style="overflow-x:auto"><table class="battle-table"><thead><tr><th></th>';
+    for (const f of table.factions) {
+      html += '<th><div class="fac-head"><div class="fac-swatch" style="background:' + FACTION_COLORS[f] + '"></div>Faction ' + f + "</div></th>";
+    }
+    html += "</tr></thead><tbody>";
+    for (const row of table.rows) {
+      html += '<tr><td class="row-label">' + row.label + "</td>";
+      for (const f of table.factions) {
+        const cell = row.cells[f];
+        if (!cell) { html += "<td></td>"; continue; }
+        const cls = cell.cls ? " " + cell.cls : "";
+        const lines = cell.text.split("\n").map((l) => '<div class="cell-line' + cls + '">' + escapeHtml(l) + "</div>").join("");
+        const t = cell.totals;
+        html += "<td>" + lines + '<div class="cell-totals">' + t.infantry + " inf · " + t.cavalry + " cav · " + t.archers + " arc</div></td>";
+      }
+      html += "</tr>";
+    }
+    html += "</tbody></table></div>";
+    els.bmBody.innerHTML = html;
+    els.modalScrim.classList.add("open");
+  }
+
+  function escapeHtml(s) {
+    return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  }
+
+  // =========================================================================
+  // Tooltip
+  // =========================================================================
+
+  function tooltipHtml(coord, terrain, data) {
+    let html = '<div class="tt-title">(' + coord[0] + ", " + coord[1] + ", " + coord[2] + ") — " + terrain + "</div>";
+    if (data && data.city) {
+      const c = data.city;
+      const kind = c.is_capital ? "Capital" : "Outpost" + (c.upgrade ? " (" + c.upgrade + ")" : "");
+      html += '<div class="tt-row">' + kind + " — <b>Faction " + c.faction + "</b></div>";
+    }
+    if (data && data.troops) {
+      const t = data.troops;
+      html += '<div class="tt-row">Faction <b>' + t.faction + "</b>: " + t.infantry + " inf, " + t.cavalry + " cav, " + t.archers + " arc" + (t.frozen ? " (frozen)" : "") + "</div>";
+    }
+    if (data && data.battle) {
+      html += '<div class="tt-row">Battle in progress — click for details</div>';
+    }
+    return html;
+  }
+
+  // =========================================================================
+  // Main render step
+  // =========================================================================
+
+  function currentTurnCheckpoint() {
+    const turnIdx = Math.floor(currentStep / CHECKPOINT_LABELS.length);
+    const cpIdx = currentStep % CHECKPOINT_LABELS.length;
+    return [turnIdx, cpIdx];
+  }
+
+  function render() {
+    if (!game) return;
+    const [turnIdx, cpIdx] = currentTurnCheckpoint();
+    const turn = game.turns[turnIdx];
+    const board = turn.checkpoints[cpIdx];
+    const playerStats = turn.playerStats[cpIdx];
+
+    applyMapModeFills(game, board);
+    renderBoardContent(game, layout, board);
+    renderSidebar(game, playerStats, computeUnitCounts(board, game.numFactions));
+
+    els.timelineLabel.innerHTML =
+      "<b>Turn " + (turnIdx + 1) + " / " + game.turns.length + "</b> &nbsp;•&nbsp; Phase: <b>" +
+      CHECKPOINT_LABELS[cpIdx] + "</b> &nbsp;•&nbsp; drag the slider, use ←/→, or press space to play";
+    els.slider.value = String(currentStep);
+  }
+
+  function goToStep(step) {
+    currentStep = Math.max(0, Math.min(totalSteps - 1, step));
+    render();
+  }
+
+  // =========================================================================
+  // Play/pause
+  // =========================================================================
+
+  function setPlaying(next) {
+    playing = next;
+    els.playIcon.innerHTML = playing
+      ? '<rect x="2" y="1" width="3.5" height="12" fill="currentColor"/><rect x="8.5" y="1" width="3.5" height="12" fill="currentColor"/>'
+      : '<path d="M3 2 L12 7 L3 12 Z" fill="currentColor"/>';
+    if (playTimer) { clearInterval(playTimer); playTimer = null; }
+    if (playing) {
+      playTimer = setInterval(() => {
+        if (currentStep >= totalSteps - 1) { setPlaying(false); return; }
+        goToStep(currentStep + 1);
+      }, 550);
+    }
+  }
+
+  // =========================================================================
+  // Wiring
+  // =========================================================================
+
+  function findHexAtEvent(evt) {
+    const pt = els.boardSvg.createSVGPoint();
+    pt.x = evt.clientX; pt.y = evt.clientY;
+    const ctm = els.boardSvg.getScreenCTM();
+    if (!ctm) return null;
+    const loc = pt.matrixTransform(ctm.inverse());
+    let best = null, bestDist = Infinity;
+    for (const key in layout.centers) {
+      const [cx, cy] = layout.centers[key];
+      const d = (cx - loc.x) ** 2 + (cy - loc.y) ** 2;
+      if (d < bestDist) { bestDist = d; best = key; }
+    }
+    if (best !== null && bestDist <= (layout.size * 1.05) ** 2) return best;
+    return null;
+  }
+
+  function onBoardMove(evt) {
+    if (!game) return;
+    const key = findHexAtEvent(evt);
+    if (!key) { els.tooltip.style.display = "none"; return; }
+    const [turnIdx, cpIdx] = currentTurnCheckpoint();
+    const board = game.turns[turnIdx].checkpoints[cpIdx];
+    const data = board[key];
+    const coord = key.split("_").map(Number);
+    els.tooltip.innerHTML = tooltipHtml(coord, game.terrainMap[key], data);
+    els.tooltip.style.display = "block";
+    els.tooltip.style.left = (evt.clientX + 16) + "px";
+    els.tooltip.style.top = (evt.clientY + 16) + "px";
+  }
+
+  function onBoardClick(evt) {
+    if (!game) return;
+    const key = findHexAtEvent(evt);
+    if (!key) return;
+    const [turnIdx] = currentTurnCheckpoint();
+    const ev = game.turns[turnIdx].battlesByHex[key];
+    if (!ev) return;
+    const table = computeBattleTable(ev);
+    const coord = key.split("_").map(Number);
+    renderBattleModal(table, "(" + coord.join(", ") + ")");
+  }
+
+  function closeModal() { els.modalScrim.classList.remove("open"); }
+
+  function loadFromText(text, name) {
+    try {
+      const data = JSON.parse(text);
+      if (!data.terrain || !data.turns) throw new Error("missing 'terrain' or 'turns' key");
+      game = parseGame(data);
+      totalSteps = game.turns.length * CHECKPOINT_LABELS.length;
+      currentStep = 0;
+      layout = computeLayout(game);
+      buildStaticBoard(game, layout);
+      els.slider.max = String(Math.max(0, totalSteps - 1));
+      els.emptyState.classList.add("hidden");
+      els.fileStatus.classList.remove("error");
+      els.fileStatus.textContent = name + " — " + game.turns.length + " turns, " + game.numFactions + " factions, radius " + game.radius;
+      render();
+    } catch (err) {
+      els.fileStatus.classList.add("error");
+      els.fileStatus.textContent = "Failed to load " + name + ": " + err.message;
+      console.error(err);
+    }
+  }
+
+  function handleFile(file) {
+    const reader = new FileReader();
+    reader.onload = () => loadFromText(reader.result, file.name);
+    reader.onerror = () => {
+      els.fileStatus.classList.add("error");
+      els.fileStatus.textContent = "Could not read " + file.name;
+    };
+    reader.readAsText(file);
+  }
+
+  els.mapModeButtons.forEach((btn) => {
+    btn.addEventListener("click", () => {
+      mapMode = btn.dataset.mode;
+      els.mapModeButtons.forEach((b) => b.classList.toggle("active", b === btn));
+      render();
+    });
+  });
+
+  els.loadBtn.addEventListener("click", () => els.fileInput.click());
+  els.fileInput.addEventListener("change", () => {
+    if (els.fileInput.files && els.fileInput.files[0]) handleFile(els.fileInput.files[0]);
+  });
+
+  ["dragenter", "dragover"].forEach((evtName) => {
+    document.body.addEventListener(evtName, (e) => {
+      e.preventDefault();
+      els.dropZone.classList.add("drag-over");
+    });
+  });
+  ["dragleave", "drop"].forEach((evtName) => {
+    document.body.addEventListener(evtName, (e) => {
+      e.preventDefault();
+      els.dropZone.classList.remove("drag-over");
+    });
+  });
+  document.body.addEventListener("drop", (e) => {
+    if (e.dataTransfer.files && e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]);
+  });
+
+  els.slider.addEventListener("input", () => goToStep(Number(els.slider.value)));
+  els.prevBtn.addEventListener("click", () => { setPlaying(false); goToStep(currentStep - 1); });
+  els.nextBtn.addEventListener("click", () => { setPlaying(false); goToStep(currentStep + 1); });
+  els.playBtn.addEventListener("click", () => setPlaying(!playing));
+
+  els.boardSvg.addEventListener("mousemove", onBoardMove);
+  els.boardSvg.addEventListener("mouseleave", () => { els.tooltip.style.display = "none"; });
+  els.boardSvg.addEventListener("click", onBoardClick);
+
+  els.modalScrim.addEventListener("click", (e) => { if (e.target === els.modalScrim) closeModal(); });
+  els.bmClose.addEventListener("click", closeModal);
+
+  window.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") {
+      if (els.modalScrim.classList.contains("open")) closeModal();
+      return;
+    }
+    if (!game) return;
+    if (e.key === "ArrowLeft" || e.key.toLowerCase() === "a") { setPlaying(false); goToStep(currentStep - 1); }
+    else if (e.key === "ArrowRight" || e.key.toLowerCase() === "d") { setPlaying(false); goToStep(currentStep + 1); }
+    else if (e.key === " ") { e.preventDefault(); setPlaying(!playing); }
+  });
+
+  window.addEventListener("resize", () => {
+    if (!game) return;
+    layout = computeLayout(game);
+    buildStaticBoard(game, layout);
+    render();
+  });
+})();
+</script>
+</body>
+</html>
