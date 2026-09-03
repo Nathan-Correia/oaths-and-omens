@@ -44,6 +44,24 @@ CAVALRY_STEPS = 2
 CHECKPOINT_LABELS = ["Start", "Buy", "Move 1", "Move 2", "Move 3", "Cav 1", "Cav 2", "Battle"]
 
 
+def _uniform_batched_callable(decide_list, f, B):
+    """If decide_list[b][f] is the SAME callable object for every b (the
+    normal case whenever one agent instance is reused across the whole
+    batch - e.g. nn_agent's shared HexPolicyNet, or any agent used
+    uniformly in a self-play batch) AND that callable exposes a `.batch`
+    attribute (see agents/nn_agent's module docstring), return it so the
+    caller can run ONE call across the whole batch instead of B calls.
+    Returns None otherwise (mixed-agent batches, or agents with no
+    batched form) - callers fall back to the per-game loop, unchanged."""
+    fn0 = decide_list[0][f]
+    batch_fn = getattr(fn0, "batch", None)
+    if batch_fn is None:
+        return None
+    if not all(decide_list[b][f] is fn0 for b in range(1, B)):
+        return None
+    return batch_fn
+
+
 def _gather_buy_decisions(state, decide_buy_list, state_views=None):
     """Calls each game's per-faction decide_buy callback and stacks the
     results into the fixed-shape batched tensors apply_buy_phase_batch
@@ -52,6 +70,10 @@ def _gather_buy_decisions(state, decide_buy_list, state_views=None):
     "invalid/absent answer silently falls back to doing nothing" pattern
     used throughout engine (movement/battle callbacks returning None,
     placement/draft falling back to a random legal choice).
+
+    Per faction, uses the batched fast path (see _uniform_batched_callable)
+    when available instead of B separate per-game calls - see
+    agents/nn_agent's module docstring for why this exists.
 
     state_views: optional pre-computed unstack_states(state) - pass this
     in (see run_turn) rather than letting this recompute it, since the
@@ -73,9 +95,13 @@ def _gather_buy_decisions(state, decide_buy_list, state_views=None):
     convert_cavalry = torch.zeros(B, F, N, dtype=torch.long, device=device)
     convert_archers = torch.zeros(B, F, N, dtype=torch.long, device=device)
 
-    for b in range(B):
-        for f in range(F):
-            decision = decide_buy_list[b][f](state_views[b], f)
+    for f in range(F):
+        batch_fn = _uniform_batched_callable(decide_buy_list, f, B)
+        if batch_fn is not None:
+            decisions = batch_fn(state, f)
+        else:
+            decisions = [decide_buy_list[b][f](state_views[b], f) for b in range(B)]
+        for b, decision in enumerate(decisions):
             if not decision:
                 continue
             if decision.get("outpost_type"):
@@ -116,14 +142,18 @@ def _gather_movement_actions(state, decide_list, step, legal_mask_fn, state_view
     if state_views is None:
         state_views = unstack_states(state)
     full_masks = [legal_mask_fn(state, f) for f in range(F)]  # each [B, N, 6], one batched call per faction
-    actions = []
-    for b in range(B):
-        d = {}
-        for f in range(F):
-            per_faction_mask = full_masks[f][b]  # [N, 6] - just an index, no recomputation
-            d[f] = decide_list[b][f](state_views[b], f, step, per_faction_mask)
-        actions.append(d)
-    return actions
+
+    per_faction_actions = []
+    for f in range(F):
+        batch_fn = _uniform_batched_callable(decide_list, f, B)
+        if batch_fn is not None:
+            per_faction_actions.append(batch_fn(state, f, step, full_masks[f]))
+        else:
+            per_faction_actions.append(
+                [decide_list[b][f](state_views[b], f, step, full_masks[f][b]) for b in range(B)]
+            )
+
+    return [{f: per_faction_actions[f][b] for f in range(F)} for b in range(B)]
 
 
 def _run_battle_phase(state, decide_target_list, decide_rectification_list, rng, state_views=None):
