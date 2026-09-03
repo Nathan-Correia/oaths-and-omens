@@ -45,7 +45,7 @@ mechanics correct. Unit types are referenced by index here (0=infantry,
 
 import numpy as np
 
-from .geometry import hex_distance
+from .geometry import min_hex_distance_to_any
 from .state import NO_FACTION, RESOURCE_TO_INDEX, SPAWN_CAPS, UPGRADE_TO_INDEX
 
 INFANTRY_COST = 2
@@ -105,34 +105,60 @@ def _outpost_count(state, faction):
     return int(np.sum((state.city_owner == faction) & ~state.is_capital))
 
 
-def _can_build_outpost(state, hex_index, faction):
-    """Placement legality for a new outpost at hex_index: not on top of
-    an existing capital/outpost, >= OUTPOST_MIN_DIST_OWN_CAPITAL from
-    your own capital, >= OUTPOST_MIN_DIST_ENEMY_CAPITAL from any other
-    faction's capital, and >= OUTPOST_MIN_DIST_OTHER_OUTPOST from any
-    outpost at all (yours included - outposts can't be chained close
-    together)."""
-    if state.city_owner[hex_index] != NO_FACTION:
-        return False
+def eligible_outpost_mask(state, faction):
+    """[num_hexes] bool - the same legality rules as _can_build_outpost
+    (not on top of an existing capital/outpost, >= OUTPOST_MIN_DIST_OWN
+    _CAPITAL from your own capital, >= OUTPOST_MIN_DIST_ENEMY_CAPITAL
+    from any other faction's capital, >= OUTPOST_MIN_DIST_OTHER_OUTPOST
+    from any outpost at all), computed for EVERY hex in one vectorized
+    pass instead of one hex at a time.
 
+    Added because _can_build_outpost used to be the dominant cost of a
+    whole game: every agent's expansion-target scan (greedy_agent's
+    _home_expansion_target, heuristic_agent's _best_expansion_target,
+    vanguard_agent's _ranked_expansion_targets - the last one also
+    inherited by marshal/warlord/sentinel/tactician) calls it once per
+    CANDIDATE HEX, every movement/cavalry step, and it internally looped
+    over every existing outpost computing hex_distance in Python for
+    each candidate - O(hexes x outposts) in pure Python, redone from
+    scratch every step even though almost nothing about outpost
+    placement changes between consecutive steps. Profiled at 88% of
+    total runtime in a 15-game greedy-vs-greedy sample (1.06M calls,
+    13M hex_distance calls beneath them). Callers that need to check
+    MANY candidate hexes should call this once per decision and index
+    into the result; _can_build_outpost (kept for the few single-hex
+    call sites) is now defined in terms of this function."""
     grid = state.grid
-    coord = grid.coord_of(hex_index)
+    coords = grid.coords_array
+    mask = state.city_owner == NO_FACTION
 
     own_capital = np.nonzero((state.city_owner == faction) & state.is_capital)[0]
-    if len(own_capital) and hex_distance(coord, grid.coord_of(int(own_capital[0]))) < OUTPOST_MIN_DIST_OWN_CAPITAL:
-        return False
+    if len(own_capital):
+        dist = min_hex_distance_to_any(coords, own_capital)
+        mask = mask & (dist >= OUTPOST_MIN_DIST_OWN_CAPITAL)
 
     enemy_capitals = np.nonzero(state.is_capital & (state.city_owner != NO_FACTION) & (state.city_owner != faction))[0]
-    for c in enemy_capitals:
-        if hex_distance(coord, grid.coord_of(int(c))) < OUTPOST_MIN_DIST_ENEMY_CAPITAL:
-            return False
+    if len(enemy_capitals):
+        dist = min_hex_distance_to_any(coords, enemy_capitals)
+        mask = mask & (dist >= OUTPOST_MIN_DIST_ENEMY_CAPITAL)
 
     all_outposts = np.nonzero((state.city_owner != NO_FACTION) & ~state.is_capital)[0]
-    for o in all_outposts:
-        if hex_distance(coord, grid.coord_of(int(o))) < OUTPOST_MIN_DIST_OTHER_OUTPOST:
-            return False
+    if len(all_outposts):
+        dist = min_hex_distance_to_any(coords, all_outposts)
+        mask = mask & (dist >= OUTPOST_MIN_DIST_OTHER_OUTPOST)
 
-    return True
+    return mask
+
+
+def _can_build_outpost(state, hex_index, faction):
+    """Placement legality for a new outpost at hex_index - see
+    eligible_outpost_mask's docstring for the actual rules and for why
+    that's the vectorized version of this same check. This single-hex
+    form is for the few call sites that only ever need one hex (mainly
+    _apply_one's build_outpost validation); anything scanning multiple
+    candidate hexes should call eligible_outpost_mask directly instead
+    of calling this in a loop."""
+    return bool(eligible_outpost_mask(state, faction)[hex_index])
 
 
 def get_legal_buy_actions(state, faction):
@@ -156,9 +182,10 @@ def get_legal_buy_actions(state, faction):
 
     if state.gold[faction] >= OUTPOST_COST and _outpost_count(state, faction) < OUTPOST_CAP:
         army_hexes = np.nonzero((state.army_faction == faction) & ~state.locked)[0]
+        eligible = eligible_outpost_mask(state, faction)
         for hex_index in army_hexes:
             hex_index = int(hex_index)
-            if not _can_build_outpost(state, hex_index, faction):
+            if not eligible[hex_index]:
                 continue
             for unit_index, unit_name in enumerate(("infantry", "cavalry", "archers")):
                 if state.army_units[hex_index, unit_index] > 0:
@@ -193,18 +220,26 @@ def _apply_one(state, faction, action, counts, enemy_adjacent_cache):
 
         if state.gold[faction] < INFANTRY_COST or _remaining_cap(counts, 0) <= 0:
             return False
-        state.gold[faction] -= INFANTRY_COST
 
-        if state.army_faction[hex_index] == NO_FACTION:
-            state.army_faction[hex_index] = faction
-        # Ported as-is from engine/buy.py: can't actually trigger given the
-        # city_owner==faction check above - a hostile army can't peacefully
-        # sit on your capital/outpost anymore either (arriving there always
-        # starts a battle now regardless of whether it's defended - see
-        # movement.py) - but kept for exact behavioral parity.
-        if state.army_faction[hex_index] != faction or int(state.army_units[hex_index].sum()) >= 6:
+        # Stack-cap check moved BEFORE the gold deduction below (it used to
+        # run after spending the gold, so a purchase that failed here still
+        # cost the faction 2 gold for nothing - confirmed to waste 38 of a
+        # faction's starting 50 gold on turn 1 alone, since greedy_buy
+        # proposes gold // INFANTRY_COST purchases at one hex with no
+        # awareness of how many actually fit - see heuristic_agent.py's
+        # docstring for the prior agent-side attempt at this fix).
+        # An empty hex (NO_FACTION - e.g. a freshly-built outpost with no
+        # army on it yet) is fine, we'd be the first army there; anything
+        # else not already ours can't actually trigger given the
+        # city_owner==faction check above (a hostile army can't peacefully
+        # sit on your capital/outpost - arriving there always starts a
+        # battle now, see movement.py) but kept for parity.
+        if state.army_faction[hex_index] not in (NO_FACTION, faction) or int(state.army_units[hex_index].sum()) >= 6:
             return False
 
+        state.gold[faction] -= INFANTRY_COST
+        if state.army_faction[hex_index] == NO_FACTION:
+            state.army_faction[hex_index] = faction
         state.army_units[hex_index, 0] += 1
         counts[0] += 1
         return True

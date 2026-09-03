@@ -39,7 +39,7 @@ _run_battle_phase's job, not this module's - see its docstring.
 
 import numpy as np
 
-from .state import IMPASSABLE_TERRAIN_INDICES, MAX_STACK_SIZE, NO_FACTION, TERRAIN_TO_INDEX
+from .state import IMPASSABLE_BY_TERRAIN, IMPASSABLE_TERRAIN_INDICES, MAX_STACK_SIZE, NO_FACTION, TERRAIN_TO_INDEX
 
 MARSH_INDEX = TERRAIN_TO_INDEX["marsh"]
 
@@ -54,7 +54,7 @@ def _legal_mask(state, faction, require_cavalry):
     has_neighbor = neighbor >= 0
     safe_neighbor = np.where(has_neighbor, neighbor, 0)
     neighbor_terrain = state.terrain[safe_neighbor]
-    passable = ~np.isin(neighbor_terrain, IMPASSABLE_TERRAIN_INDICES)
+    passable = ~IMPASSABLE_BY_TERRAIN[neighbor_terrain]
 
     return own_army[:, None] & has_neighbor & passable
 

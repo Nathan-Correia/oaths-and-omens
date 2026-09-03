@@ -43,9 +43,9 @@ import random
 import numpy as np
 
 from .random_agent import random_rectification, random_target
-from engine.buy import INFANTRY_COST, OUTPOST_CAP, _can_build_outpost, _outpost_count
+from engine.buy import INFANTRY_COST, OUTPOST_CAP, eligible_outpost_mask, _outpost_count
 from engine.geometry import hex_distance
-from engine.state import IMPASSABLE_TERRAIN_INDICES, NO_FACTION, NO_UPGRADE, RESOURCE_TO_INDEX, count_units_in_play
+from engine.state import IMPASSABLE_BY_TERRAIN, NO_FACTION, NO_UPGRADE, RESOURCE_TO_INDEX, count_units_in_play
 
 # Which unit type to sacrifice first when a hex offers a choice of more
 # than one for building an outpost there.
@@ -56,8 +56,6 @@ _OUTPOST_UNIT_PRIORITY = ("infantry", "cavalry", "archers")
 # economy), then Workshop (compounds resources) - a "greedy" ranking by
 # how directly each pays off.
 _UPGRADE_PRIORITY = ("temple", "barracks", "workshop")
-
-_IMPASSABLE_INDEX_SET = {int(x) for x in IMPASSABLE_TERRAIN_INDICES}
 
 
 def greedy_buy(state, faction, legal, rng):
@@ -141,29 +139,29 @@ def _home_expansion_target(state, faction):
     """The hex closest to `faction`'s own capital that's legal to found
     an outpost on right now, or None if this faction has already hit
     OUTPOST_CAP or nowhere on the board currently qualifies. Reuses
-    buy.py's own outpost-placement legality check (_can_build_outpost)
+    buy.py's own outpost-placement legality check (eligible_outpost_mask)
     directly rather than re-deriving the same distance rules here, so
     a target this function suggests is always one greedy_buy could
     actually act on the moment an army gets there. Recomputed fresh on
-    every call - once an outpost gets built at the current target,
-    _can_build_outpost naturally stops accepting that hex and this
-    just finds the next-nearest one, so expansion keeps going one spot
-    at a time without any state to track between calls."""
+    every call, fully vectorized (no per-hex Python loop) - once an
+    outpost gets built at the current target, eligible_outpost_mask
+    naturally stops accepting that hex and this just finds the
+    next-nearest one, so expansion keeps going one spot at a time
+    without any state to track between calls."""
     if _outpost_count(state, faction) >= OUTPOST_CAP:
         return None
     grid = state.grid
     own_capital = np.nonzero((state.city_owner == faction) & state.is_capital)[0]
     if len(own_capital) == 0:
         return None
-    capital_coord = grid.coord_of(int(own_capital[0]))
+    capital_index = int(own_capital[0])
 
-    eligible = [
-        i for i in range(grid.num_hexes)
-        if int(state.terrain[i]) not in _IMPASSABLE_INDEX_SET and _can_build_outpost(state, i, faction)
-    ]
-    if not eligible:
+    eligible = eligible_outpost_mask(state, faction) & ~IMPASSABLE_BY_TERRAIN[state.terrain]
+    candidates = np.nonzero(eligible)[0]
+    if len(candidates) == 0:
         return None
-    best = min(eligible, key=lambda i: hex_distance(grid.coord_of(i), capital_coord))
+    dist = np.abs(grid.coords_array[candidates] - grid.coords_array[capital_index]).max(axis=1)
+    best = int(candidates[np.argmin(dist)])
     return grid.coord_of(best)
 
 

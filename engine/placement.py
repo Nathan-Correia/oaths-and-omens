@@ -36,7 +36,7 @@ shared Random threaded through run_city_setup) rather than raising.
 import numpy as np
 
 from .geometry import hex_distance
-from .state import IMPASSABLE_TERRAIN_INDICES, NO_FACTION
+from .state import IMPASSABLE_BY_TERRAIN, NO_FACTION
 
 CAPITAL_MIN_DIST = 3  # minimum hex distance between any two placed cities
 EDGE_BAN_MIN_FACTIONS = 5  # 5-7 players: capitals may not be placed on edge tiles
@@ -44,7 +44,7 @@ EDGE_BAN_MAX_FACTIONS = 7
 
 
 def _passable_mask(state):
-    return ~np.isin(state.terrain, IMPASSABLE_TERRAIN_INDICES)
+    return ~IMPASSABLE_BY_TERRAIN[state.terrain]
 
 
 def _edge_mask(grid):

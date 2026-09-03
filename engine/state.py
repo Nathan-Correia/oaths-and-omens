@@ -47,6 +47,15 @@ TERRAIN_TO_INDEX = {t: i for i, t in enumerate(TERRAIN_TYPES)}
 IMPASSABLE_TERRAIN_INDICES = np.array(
     [TERRAIN_TO_INDEX["mountain"], TERRAIN_TO_INDEX["lake"]], dtype=np.int8
 )
+# bool[len(TERRAIN_TYPES)]: IMPASSABLE_BY_TERRAIN[t] is True iff terrain
+# type t is impassable - a fancy-index lookup (`IMPASSABLE_BY_TERRAIN
+# [some_terrain_array]`) is a much cheaper way to test membership in
+# this fixed 2-element set than np.isin, which pays real fixed overhead
+# (an internal sort/searchsorted) that dominates when called many times
+# per turn against a tiny array - see engine/movement.py's _legal_mask,
+# profiled at ~40% of a whole game's engine-level runtime before this.
+IMPASSABLE_BY_TERRAIN = np.zeros(len(TERRAIN_TYPES), dtype=bool)
+IMPASSABLE_BY_TERRAIN[IMPASSABLE_TERRAIN_INDICES] = True
 
 UNIT_TYPES = ["infantry", "cavalry", "archers"]  # index 0/1/2, matches engine/state.py's order
 MAX_STACK_SIZE = 6

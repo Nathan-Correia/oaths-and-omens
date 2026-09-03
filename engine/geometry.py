@@ -47,6 +47,17 @@ def hex_distance(a, b):
     return max(abs(a[0] - b[0]), abs(a[1] - b[1]), abs(a[2] - b[2]))
 
 
+def min_hex_distance_to_any(coords_array, ref_indices):
+    """[num_hexes] int - hex distance from EVERY hex to whichever of
+    coords_array[ref_indices] is nearest, computed in one vectorized
+    pass instead of a Python loop calling hex_distance per (hex, ref)
+    pair - see HexGrid.coords_array's docstring for the hot path this
+    replaces. ref_indices must be non-empty."""
+    refs = coords_array[ref_indices]  # [k, 3]
+    diff = np.abs(coords_array[:, None, :] - refs[None, :, :])  # [num_hexes, k, 3]
+    return diff.max(axis=2).min(axis=1)
+
+
 class HexGrid:
     """Fixed hex-index bookkeeping for one board radius.
 
@@ -57,6 +68,15 @@ class HexGrid:
     equivalent of engine/geometry.py's cached hex_neighbors() - built
     once per radius (never changes over a game) and then just indexed,
     no per-call work.
+    coords_array: int32[num_hexes, 3], the same data as `coords` (a
+    plain list of (q, r, s) tuples) but as one numpy array, so distance
+    from every hex to a reference coordinate (or set of them) can be
+    computed with one vectorized op instead of a Python loop calling
+    hex_distance per hex - see min_hex_distance_to_any, and
+    engine/buy.py's eligible_outpost_mask for the hot path this was
+    added for (a single Python-loop-driven legality scan used to cost
+    ~88% of a whole game's runtime under greedy_agent - see that
+    module's docstring).
     """
 
     def __init__(self, radius):
@@ -64,6 +84,7 @@ class HexGrid:
         self.coords = cube_hexes_in_radius(radius)
         self.num_hexes = len(self.coords)
         self.coord_to_index = {c: i for i, c in enumerate(self.coords)}
+        self.coords_array = np.array(self.coords, dtype=np.int32)
 
         neighbor_table = np.full((self.num_hexes, NUM_DIRECTIONS), -1, dtype=np.int32)
         for i, (q, r, s) in enumerate(self.coords):

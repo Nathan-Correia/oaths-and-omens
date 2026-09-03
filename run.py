@@ -7,10 +7,18 @@ steps, battle) - see that module's docstring for why these are
 independent snapshots rather than incremental diffs.
 
 Agent mix is configurable per faction via AGENT_ASSIGNMENT below - any
-mix of "random"/"greedy" (a randomly-initialized, untrained PyTorch
-policy network; see agents/nn_agent/). Faction id -> color
-is fixed (see hex_visualizer.py's FACTION_COLORS: 0=red, 1=blue,
-2=green, 3=purple, 4=orange, 5=brown, 6=pink, 7=grey).
+mix of "random", "greedy", "heuristic", "turtle", "denier", "vanguard",
+"warlord", "legion", "hussar", "sentinel", "marshal", "tactician" (see
+agents/*.py - tactician_agent's docstring in particular for the
+strongest of these and why, though it costs meaningfully more compute
+per game than the others, being a search agent; a randomly-
+initialized, untrained PyTorch policy network is referenced in
+agents/__init__.py's docstring as agents/nn_agent/, but that module
+doesn't exist yet). Faction id -> color is fixed (see
+hex_visualizer.py's FACTION_COLORS: 0=red, 1=blue, 2=green, 3=purple,
+4=orange, 5=brown, 6=pink, 7=grey). See tournament.py for headless
+many-game comparisons between these agents instead of a single logged/
+visualized game.
 
 Before any turns run, engine/placement.py's run_city_setup plays out
 colourless city placement and the capital draft - every agent kind,
@@ -44,6 +52,16 @@ import time
 from agents import compose_agents
 from agents.greedy_agent import make_greedy_agents
 from agents.random_agent import make_random_agents
+from agents.heuristic_agent import make_heuristic_agents
+from agents.turtle_agent import make_turtle_agents
+from agents.denier_agent import make_denier_agents
+from agents.vanguard_agent import make_vanguard_agents
+from agents.warlord_agent import make_warlord_agents
+from agents.legion_agent import make_legion_agents
+from agents.hussar_agent import make_hussar_agents
+from agents.sentinel_agent import make_sentinel_agents
+from agents.marshal_agent import make_marshal_agents
+from agents.tactician_agent import make_tactician_agents
 from engine.placement import run_city_setup
 from engine.setup import create_initial_state
 from engine.state import TERRAIN_TYPES
@@ -61,8 +79,19 @@ MAX_TURNS = 100
 # hardcoding this value back in, if that's ever useful for debugging.
 SEED = int(time.time() * 1000) % (2 ** 31)
 
-# Per-faction agent choice - any of "random", "greedy".
-AGENT_ASSIGNMENT = {f: "greedy" for f in range(NUM_FACTIONS)}
+# Per-faction agent choice - any of "random", "greedy", "heuristic", "turtle", "denier",
+# "vanguard", "warlord", "legion", "hussar", "sentinel", "marshal", "tactician".
+AGENT_ASSIGNMENT = {
+    0: "tactician",
+    1: "tactician",
+    2: "tactician",
+    3: "tactician",
+    4: "tactician",
+    5: "tactician",
+    6: "tactician",
+    7: "tactician",
+
+}
 
 
 
@@ -82,6 +111,16 @@ def main():
     build_fns = {
         "random": lambda: make_random_agents(NUM_FACTIONS, seed=SEED),
         "greedy": lambda: make_greedy_agents(NUM_FACTIONS, seed=SEED),
+        "heuristic": lambda: make_heuristic_agents(NUM_FACTIONS, seed=SEED),
+        "turtle": lambda: make_turtle_agents(NUM_FACTIONS, seed=SEED),
+        "denier": lambda: make_denier_agents(NUM_FACTIONS, seed=SEED),
+        "vanguard": lambda: make_vanguard_agents(NUM_FACTIONS, seed=SEED),
+        "warlord": lambda: make_warlord_agents(NUM_FACTIONS, seed=SEED),
+        "legion": lambda: make_legion_agents(NUM_FACTIONS, seed=SEED),
+        "hussar": lambda: make_hussar_agents(NUM_FACTIONS, seed=SEED),
+        "sentinel": lambda: make_sentinel_agents(NUM_FACTIONS, seed=SEED),
+        "marshal": lambda: make_marshal_agents(NUM_FACTIONS, seed=SEED),
+        "tactician": lambda: make_tactician_agents(NUM_FACTIONS, seed=SEED),
     }
     (decide_buy, decide_movement, decide_cavalry, decide_target, decide_rectification, decide_resource_choice,
      decide_placement, decide_draft, decide_swap) = compose_agents(AGENT_ASSIGNMENT, build_fns)
