@@ -26,8 +26,6 @@ no separate cross-map-detour risk to cap against).
 
 import random
 
-import numpy as np
-
 from .denier_agent import _current_leader
 from .greedy_agent import greedy_buy, greedy_draft, greedy_placement, greedy_resource_choice, greedy_swap
 from .heuristic_agent import heuristic_target
@@ -46,14 +44,14 @@ def _leader_targets(state, faction):
     (see denier_agent._current_leader), once this faction holds at
     least DENY_MIN_OWN_OUTPOSTS of its own - empty otherwise (no
     leader, or too early to be worth the diversion)."""
-    if _outpost_count(state, faction) < DENY_MIN_OWN_OUTPOSTS:
+    if int(_outpost_count(state, faction)[0]) < DENY_MIN_OWN_OUTPOSTS:
         return []
     leader = _current_leader(state, faction)
     if leader is None:
         return []
     grid = state.grid
-    outposts = np.nonzero((state.city_owner == leader) & ~state.is_capital)[0]
-    return [grid.coord_of(int(o)) for o in outposts]
+    outposts = ((state.city_owner[0] == leader) & ~state.is_capital[0]).nonzero(as_tuple=False).flatten().tolist()
+    return [grid.coord_of(o) for o in outposts]
 
 
 def _all_targets(state, faction):
@@ -68,8 +66,10 @@ def _all_targets(state, faction):
         return targets
 
     grid = state.grid
-    capitals = np.nonzero(state.is_capital & (state.city_owner != NO_FACTION) & (state.city_owner != faction))[0]
-    return [grid.coord_of(int(c)) for c in capitals]
+    capitals = (
+        state.is_capital[0] & (state.city_owner[0] != NO_FACTION) & (state.city_owner[0] != faction)
+    ).nonzero(as_tuple=False).flatten().tolist()
+    return [grid.coord_of(c) for c in capitals]
 
 
 def warlord_move(state, faction, step, legal_mask, total_steps=1):
@@ -78,7 +78,7 @@ def warlord_move(state, faction, step, legal_mask, total_steps=1):
     pooled target (see _all_targets) is nearest to IT - just drawing
     from this module's target pool instead of vanguard_agent's."""
     grid = state.grid
-    mobile = sorted(int(h) for h in np.nonzero(legal_mask.any(axis=1))[0])
+    mobile = sorted(int(h) for h in legal_mask.any(dim=1).nonzero(as_tuple=False).flatten().tolist())
     if not mobile:
         return None
 
@@ -94,8 +94,8 @@ def warlord_move(state, faction, step, legal_mask, total_steps=1):
         target = min(targets, key=lambda c: hex_distance(origin_coord, c))
         if hex_distance(origin_coord, target) == 0:
             continue
-        legal_dirs = np.nonzero(legal_mask[origin])[0]
-        if len(legal_dirs) == 0:
+        legal_dirs = legal_mask[origin].nonzero(as_tuple=False).flatten().tolist()
+        if not legal_dirs:
             continue
         return origin, _best_direction(state, grid, origin, legal_dirs, target, steps_remaining)
     return None
@@ -108,8 +108,8 @@ def make_warlord_agents(num_factions, seed=0):
     module docstring)."""
     rngs = {f: random.Random(seed * 1_000_003 + f) for f in range(num_factions)}
 
-    def decide_buy(state, faction, legal):
-        return greedy_buy(state, faction, legal, rngs[faction])
+    def decide_buy(state, faction):
+        return greedy_buy(state, faction, rngs[faction])
 
     def decide_movement(state, faction, step, legal_mask):
         return warlord_move(state, faction, step, legal_mask, total_steps=MOVEMENT_STEPS)

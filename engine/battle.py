@@ -1,44 +1,43 @@
 """
-Battle resolution for engine - ported from engine/battle.py.
+Batched battle resolution for engine.
 
-See that module's docstring for the full rules rationale (archer phase,
-per-round targeting/rolls/kills, cavalry dismounts, rectification). This
-port is deliberately as literal as possible, including preserving the
-exact ORDER every rng.randint(1, 20) call happens in, because that order
-is what the parity tests key on: two independently-implemented engines
-fed identically-seeded RNGs will only produce identical results if they
-consume rolls in the same sequence. Where v1 iterates
-`battle.contributions` (a list, in append order), v2 iterates battle
-contribution slots 0..K-1 (in the same append order, by construction -
-see movement.py's _start_or_extend_battle) - that equivalence is what
-keeps faction iteration order (and therefore roll order, and therefore
-results) matching.
+See engine_old/battle.py for the original single-game version and the
+full rules rationale (archer phase, per-round targeting/rolls/kills,
+cavalry dismounts, rectification). RULES are unchanged; two things about
+HOW they're computed changed for batching:
 
-target_fn(state, hex_index, faction) -> target_faction_or_None is the
-external decision point (agent's job, same as v1's target_fn) - not
-implemented here. rectify_overflow's `send_back` is likewise supplied by
-the caller.
+  - "Battle-slot-index" looping (see engine/turn.py's _run_battle_phase,
+    which drives this module): everything here operates on a FLAT,
+    SPARSE list of M active (batch, hex) pairs - "whichever games
+    currently have a battle pending in this slot" - not on the full
+    [B, N, ...] board. M is usually small (at most one hex per game per
+    slot) and shrinks as battles resolve, so this stays cheap regardless
+    of board size. Turn-level ordering (why a game's battles must resolve
+    in a specific sequence, not all at once) is turn.py's concern, not
+    this module's - see that module's docstring.
+  - Faction order: the original iterates factions in "first battle-slot
+    appearance" order, because that order feeds a SINGLE SHARED rng
+    stream, so it affects roll sequencing and therefore results
+    bit-for-bit. This module targets torch.Generator instead of Python's
+    random.Random (see the plan's RNG section) - the two were never going
+    to produce bit-identical rolls regardless of ordering - so every
+    faction-ordered operation here just uses ascending faction index
+    (0..F-1) instead, a simpler, equally-arbitrary, well-defined
+    convention. Round/target/roll OUTCOMES can differ from engine_old's
+    for this reason; the RULES they're computed under do not.
 
-resolve_full_battle returns a full structured log ({"archer_phase": [...],
-"rounds": [...]}), same shape as engine/battle.py's - death/dismount
-entries are plain dicts with string unit types ("infantry"/"cavalry"/
-"archers"), not the leaner int-indexed tuples this module uses
-internally elsewhere, specifically so this log can be handed straight to
-the existing replay/visualization code (hex_visualizer.py's
-compute_battle_table) unchanged - see engine/turn.py's
-run_turn_and_log.
+resolve_full_battle_batch's round loop is a FIXED MAX_ROUNDS_SAFETY_CAP-
+iteration masked loop (mirroring the original's `while` with the same
+hard cap) instead of a variable-trip-count while loop - a battle that
+finishes early just stops contributing further kills/rolls for the rest
+of the fixed iteration count (masked out), matching engine_old's actual
+behavior (which also just checks is_battle_over each iteration) without
+a data-dependent Python loop count.
 """
 
-import numpy as np
+import torch
 
-from .state import (
-    MAX_STACK_SIZE,
-    NO_FACTION,
-    NO_ORIGIN,
-    SPAWN_CAPS,
-    UNIT_TYPES,
-    count_units_in_play,
-)
+from .state import MAX_STACK_SIZE, NO_FACTION, NO_ORIGIN, SPAWN_CAPS, UNIT_TYPES, unstack_states
 
 DEATH_PRIORITY = (0, 1, 2)  # infantry, cavalry, archers
 MAX_ROUNDS_SAFETY_CAP = 50  # pure infinite-loop guard - real battles resolve in a handful of rounds
@@ -46,282 +45,493 @@ CAPITAL_DEFENSE_SHOTS = 2
 OUTPOST_DEFENSE_SHOTS = 1
 
 
-def _battle_faction_order(state, hex_index):
-    """Faction ids present in this hex's battle contributions, in
-    first-appearance (slot) order - mirrors engine/battle.py's
-    battle.factions() (which de-dupes battle.contributions, a list, by
-    first appearance)."""
-    order = []
-    seen = set()
-    for k in range(state.battle_faction.shape[1]):
-        f = int(state.battle_faction[hex_index, k])
-        if f == NO_FACTION or f in seen:
-            continue
-        seen.add(f)
-        order.append(f)
-    return order
+def faction_totals_sparse(battle_faction, battle_units, num_factions):
+    """battle_faction: [M, K], battle_units: [M, K, 3] -> [M, F, 3] int -
+    total units per faction, summed over contribution slots (slot ORDER
+    doesn't matter here - see module docstring for why "first appearance"
+    order isn't reproduced). einsum operands are float32, not int16 -
+    CUDA's einsum kernels don't cover the narrower integer dtypes state.py
+    otherwise uses (hit via direct GPU testing); counts here are always
+    small enough for float32 to represent exactly."""
+    F = num_factions
+    onehot = (battle_faction.unsqueeze(-1) == torch.arange(F, device=battle_faction.device)).float()
+    return torch.einsum("mkf,mku->mfu", onehot, battle_units.float()).round().to(battle_units.dtype)
 
+
+def faction_moved_totals_sparse(battle_faction, battle_units, battle_moved, num_factions):
+    """Like faction_totals_sparse but only over slots with battle_moved
+    True - gates the real Archers ability to units that actually moved to
+    join the fight (see state.py's battle_moved docstring)."""
+    F = num_factions
+    onehot = (battle_faction.unsqueeze(-1) == torch.arange(F, device=battle_faction.device)).float()
+    onehot = onehot * battle_moved.unsqueeze(-1).float()
+    return torch.einsum("mkf,mku->mfu", onehot, battle_units.float()).round().to(battle_units.dtype)
+
+
+def _kills_for_roll(roll, attacker_total_units):
+    """roll/attacker_total_units: [M] int -> [M] int kills. Vectorized
+    version of the same three-tier table (0 on 1-5, 1 on 6-15, 1-2 on
+    16-20 depending on whether the attacker has exactly 1 unit)."""
+    kills = torch.zeros_like(roll)
+    kills = torch.where(roll > 5, torch.ones_like(kills), kills)
+    kills = torch.where(roll > 15, torch.where(attacker_total_units == 1, 1, 2), kills)
+    return kills
+
+
+def _apply_kills_to_faction(state, batch_idx, hex_idx, target_faction, num_kills):
+    """[M] flat event lists - removes up to num_kills units from each
+    (batch, hex)'s target_faction contribution slots (infantry -> cavalry
+    -> archers cascade, earliest slot index first - slot index order is
+    arbitrary now, same reasoning as module docstring's faction-order
+    note, but a FIXED order is still needed so kills apply
+    deterministically across slots of the SAME faction at the same hex,
+    which is why this iterates k=0..K-1 rather than picking arbitrarily).
+    Returns [M, 3] int - how many of each unit type were actually killed
+    (needed by callers to award kill-XP and detect cavalry deaths for
+    dismount rolls)."""
+    M = len(batch_idx)
+    K = state.battle_faction.shape[2]
+    device = state.device
+    remaining = num_kills.clone()
+    killed = torch.zeros(M, 3, dtype=torch.long, device=device)
+    bf = state.battle_faction[batch_idx, hex_idx]  # [M, K]
+    bu = state.battle_units[batch_idx, hex_idx].clone()  # [M, K, 3]
+    is_target = bf == target_faction.unsqueeze(-1)  # [M, K]
+
+    for ut in DEATH_PRIORITY:
+        if not bool((remaining > 0).any()):
+            break
+        for k in range(K):
+            active = (remaining > 0) & is_target[:, k]
+            if not bool(active.any()):
+                continue
+            available = bu[:, k, ut]
+            take = torch.minimum(available, remaining)
+            take = torch.where(active, take, torch.zeros_like(take))
+            bu[:, k, ut] = bu[:, k, ut] - take
+            remaining = remaining - take
+            killed[:, ut] += take
+
+    state.battle_units[batch_idx, hex_idx] = bu
+    return killed
+
+
+def _roll_d20(m, rng):
+    """[m] int in 1..20, drawn from `rng` (a torch.Generator on the same
+    device as the caller's tensors)."""
+    return (torch.rand(m, generator=rng, device=rng.device) * 20).long() + 1
+
+
+def _apply_dismount_rolls(state, batch_idx, hex_idx, faction, cav_died, rng, infantry_counts):
+    """[M] flat event lists - cav_died: [M] int, how many of `faction`'s
+    cavalry died at (batch,hex) this event; rolls the cavalry dismount
+    ability once per death (rulebook: "whenever a cavalry unit dies in
+    battle" - >=14 on d20 succeeds, subject to the infantry SPAWN_CAP).
+    infantry_counts: [B, F] running tally (mutated in place) - shared
+    across every battle resolved this turn, same as engine_old, so
+    dismount cap checks reflect the whole turn's dismounts so far, not
+    just this battle's."""
+    max_died = int(cav_died.max()) if len(cav_died) else 0
+    device = state.device
+    K = state.battle_faction.shape[2]
+    for _ in range(max_died):
+        active = cav_died > 0
+        if not bool(active.any()):
+            break
+        idx = torch.nonzero(active, as_tuple=False).flatten()
+        b, h, f = batch_idx[idx], hex_idx[idx], faction[idx]
+        roll = _roll_d20(len(idx), rng)
+        succeeded_roll = roll >= 14
+        cur_count = infantry_counts[b, f]
+        under_cap = cur_count < int(SPAWN_CAPS[0])
+        success = succeeded_roll & under_cap
+
+        if bool(success.any()):
+            si = idx[success]
+            sb, sh, sf = batch_idx[si], hex_idx[si], faction[si]
+            bf = state.battle_faction[sb, sh]  # [m, K]
+            is_f = bf == sf.unsqueeze(-1)
+            first_slot = is_f.long().argmax(dim=-1)
+            state.battle_units[sb, sh, first_slot, 0] += 1
+            infantry_counts[sb, sf] += 1
+
+        cav_died = cav_died.clone()
+        cav_died[idx] -= 1
+
+
+def apply_structure_defense_shots(state, batch_idx, hex_idx, rng, infantry_counts, kill_xp_delta):
+    """[M] flat event lists - runs once, before round 1: a capital or
+    outpost gets free defensive shots against whoever's attacking its
+    tile, even undefended (2 shots for a capital, 1 for an outpost, each
+    11-20 = 1 kill against the largest attacking rival). Adds to
+    kill_xp_delta[batch,faction] in place (caller applies it to
+    state.kill_xp once, alongside every other phase's kills, matching
+    engine_old's per-entry accumulation but batched)."""
+    F = state.num_factions
+    owner = state.city_owner[batch_idx, hex_idx]  # [M]
+    has_owner = owner != NO_FACTION
+    if not bool(has_owner.any()):
+        return
+
+    totals = faction_totals_sparse(state.battle_faction[batch_idx, hex_idx], state.battle_units[batch_idx, hex_idx], F)
+    alive_units = totals.sum(dim=-1)  # [M, F]
+    is_rival = (torch.arange(F, device=state.device)[None, :] != owner.unsqueeze(-1)) & (alive_units > 0)
+    rival_units = torch.where(is_rival, alive_units, torch.full_like(alive_units, -1))
+    has_rival = (rival_units >= 0).any(dim=-1) & has_owner
+    target = rival_units.argmax(dim=-1)  # [M]
+
+    active_idx = torch.nonzero(has_rival, as_tuple=False).flatten()
+    if len(active_idx) == 0:
+        return
+    is_capital = state.is_capital[batch_idx[active_idx], hex_idx[active_idx]]
+    shots = torch.where(is_capital, CAPITAL_DEFENSE_SHOTS, OUTPOST_DEFENSE_SHOTS)
+    max_shots = int(shots.max())
+    kills = torch.zeros(len(active_idx), dtype=torch.long, device=state.device)
+    for s in range(max_shots):
+        still = shots > s
+        m = int(still.sum())
+        if m == 0:
+            continue
+        roll = _roll_d20(len(active_idx), rng)
+        hit = still & (roll >= 11)
+        kills += hit.long()
+
+    has_kills = kills > 0
+    if not bool(has_kills.any()):
+        return
+    ki = active_idx[has_kills]
+    b, h = batch_idx[ki], hex_idx[ki]
+    killer = owner[ki].long()
+    tgt = target[ki]
+    killed = _apply_kills_to_faction(state, b, h, tgt, kills[has_kills])
+    kill_xp_delta.index_put_((b, killer), killed.sum(dim=-1).to(kill_xp_delta.dtype), accumulate=True)
+    cav_died = killed[:, 1]
+    _apply_dismount_rolls(state, b, h, tgt, cav_died, rng, infantry_counts)
+
+
+def apply_archer_abilities(state, batch_idx, hex_idx, rng, infantry_counts, kill_xp_delta):
+    """[M] flat event lists - runs once, before round 1. Only archers that
+    actually moved to join this battle get to fire (see
+    faction_moved_totals_sparse); targeting still weighs each side's full
+    strength, moved or not. Faction order is ascending index (see module
+    docstring)."""
+    F = state.num_factions
+    bf = state.battle_faction[batch_idx, hex_idx]
+    bu = state.battle_units[batch_idx, hex_idx]
+    bm = state.battle_moved[batch_idx, hex_idx]
+    totals = faction_totals_sparse(bf, bu, F)  # [M, F, 3]
+    moved_totals = faction_moved_totals_sparse(bf, bu, bm, F)  # [M, F, 3]
+    alive_units = totals.sum(dim=-1)  # [M, F]
+
+    for f in range(F):
+        archers = moved_totals[:, f, 2]
+        acting = archers > 0
+        if not bool(acting.any()):
+            continue
+        is_rival = (torch.arange(F, device=state.device)[None, :] != f) & (alive_units > 0)
+        rival_units = torch.where(is_rival, alive_units, torch.full_like(alive_units, -1))
+        has_rival = (rival_units >= 0).any(dim=-1) & acting
+        if not bool(has_rival.any()):
+            continue
+        target = rival_units.argmax(dim=-1)
+
+        idx = torch.nonzero(has_rival, as_tuple=False).flatten()
+        archer_count = archers[idx]  # [M'] - each entry's fixed shot count for this phase
+        max_archers = int(archer_count.max())
+        kills = torch.zeros(len(idx), dtype=torch.long, device=state.device)
+        for s in range(max_archers):
+            still_has_shot = archer_count > s
+            roll = _roll_d20(len(idx), rng)
+            hit = still_has_shot & (roll >= 11)
+            kills += hit.long()
+
+        has_kills = kills > 0
+        if not bool(has_kills.any()):
+            continue
+        ki = idx[has_kills]
+        b, h = batch_idx[ki], hex_idx[ki]
+        killer = torch.full_like(b, f)
+        tgt = target[ki]
+        killed = _apply_kills_to_faction(state, b, h, tgt, kills[has_kills])
+        kill_xp_delta.index_put_((b, killer), killed.sum(dim=-1).to(kill_xp_delta.dtype), accumulate=True)
+        _apply_dismount_rolls(state, b, h, tgt, killed[:, 1], rng, infantry_counts)
+
+        # refresh totals/alive for the next faction's targeting
+        bf = state.battle_faction[batch_idx, hex_idx]
+        bu = state.battle_units[batch_idx, hex_idx]
+        totals = faction_totals_sparse(bf, bu, F)
+        alive_units = totals.sum(dim=-1)
+
+
+def _alive_counts(state, batch_idx, hex_idx):
+    """[M, F] int - per-faction total units at each (batch, hex) pair."""
+    return faction_totals_sparse(
+        state.battle_faction[batch_idx, hex_idx], state.battle_units[batch_idx, hex_idx], state.num_factions
+    ).sum(dim=-1)
+
+
+def is_battle_over_batch(state, batch_idx, hex_idx):
+    """[M] bool - True where at most one faction still has any units."""
+    alive = _alive_counts(state, batch_idx, hex_idx) > 0  # [M, F]
+    return alive.sum(dim=-1) <= 1
+
+
+def get_winner_batch(state, batch_idx, hex_idx):
+    """[M] long - the sole alive faction at each (batch, hex) pair, or -1
+    if the battle isn't over (more than one alive) or somehow empty."""
+    alive = _alive_counts(state, batch_idx, hex_idx) > 0  # [M, F]
+    count = alive.sum(dim=-1)
+    winner = torch.where(count == 1, alive.long().argmax(dim=-1), torch.full_like(count, NO_FACTION))
+    return winner
+
+
+def resolve_round_batch(state, batch_idx, hex_idx, target_choice, rng, infantry_counts, kill_xp_delta):
+    """One full round, for every (batch, hex) pair in this call at once.
+    target_choice: [M, F] long, -1 for "no target"/"not alive" - the
+    caller (resolve_full_battle_batch) is responsible for gathering these
+    from each active game's per-faction agent callback before calling
+    this. See module docstring for why faction order is ascending index,
+    not "first battle-slot appearance" like engine_old."""
+    M = len(batch_idx)
+    F = state.num_factions
+    device = state.device
+
+    totals = _alive_counts(state, batch_idx, hex_idx)  # [M, F] - fixed for the whole round (simultaneous resolution)
+
+    # -- conflict resolution: among attackers sharing a target, the one
+    # with the most units wins (ties broken toward the lower faction
+    # index) - see module docstring for _resolve_targets' vectorized form.
+    faction_idx = torch.arange(F, device=device)
+    score = totals * (F + 1) - faction_idx[None, :]  # [M, F], strictly higher score always wins
+    same_target = (target_choice.unsqueeze(2) == target_choice.unsqueeze(1)) & (target_choice.unsqueeze(2) >= 0)  # [M,F,F]
+    masked_score = torch.where(same_target, score.unsqueeze(1).expand(-1, F, -1), torch.full_like(score, -1).unsqueeze(1).expand(-1, F, -1))
+    group_max = masked_score.max(dim=-1).values  # [M, F]
+    wins = (target_choice >= 0) & (score >= group_max)
+    resolved_target = torch.where(wins, target_choice, torch.full_like(target_choice, -1))  # [M, F]
+
+    # -- rolls + kills, one attacking faction column at a time (fixed F
+    # loop) so multiple killers hitting the same target this round apply
+    # sequentially and correctly accumulate (see _apply_kills_to_faction) --
+    cav_died_by_target = torch.zeros(M, F, dtype=torch.long, device=device)
+    for f in range(F):
+        active = resolved_target[:, f] >= 0
+        if not bool(active.any()):
+            continue
+        idx = torch.nonzero(active, as_tuple=False).flatten()
+        roll = _roll_d20(len(idx), rng)
+        kills = _kills_for_roll(roll, totals[idx, f])
+        has_kills = kills > 0
+        if not bool(has_kills.any()):
+            continue
+        ki = idx[has_kills]
+        b, h = batch_idx[ki], hex_idx[ki]
+        tgt = resolved_target[ki, f]
+        killed = _apply_kills_to_faction(state, b, h, tgt, kills[has_kills])
+        killer = torch.full_like(b, f)
+        kill_xp_delta.index_put_((b, killer), killed.sum(dim=-1).to(kill_xp_delta.dtype), accumulate=True)
+        cav_died_by_target[ki, tgt] += killed[:, 1]
+
+    for t in range(F):
+        died = cav_died_by_target[:, t]
+        active = died > 0
+        if not bool(active.any()):
+            continue
+        idx = torch.nonzero(active, as_tuple=False).flatten()
+        b, h = batch_idx[idx], hex_idx[idx]
+        faction_t = torch.full_like(b, t)
+        _apply_dismount_rolls(state, b, h, faction_t, died[idx], rng, infantry_counts)
+
+    state.battle_round[batch_idx, hex_idx] += 1
+
+
+def _gather_target_choices(state, batch_idx, hex_idx, decide_target_list, state_views, alive_mask):
+    """alive_mask: [M, F] bool - only calls the per-game callback for
+    (m, f) pairs where faction f is currently alive in that battle (a
+    faction with no units left has nothing to decide). Returns
+    target_choice: [M, F] long, -1 for no-target/not-called. Agents stay
+    per-game Python functions (see module docstring), so this is a
+    Python loop over the M active battles x up to F factions - the cost
+    this design accepts in exchange for keeping agent logic unbatched
+    (see the plan's "Consequence for agents/tooling" section)."""
+    M, F = alive_mask.shape
+    target_choice = torch.full((M, F), -1, dtype=torch.long, device=state.device)
+    for m in range(M):
+        b, h = int(batch_idx[m]), int(hex_idx[m])
+        for f in range(F):
+            if not bool(alive_mask[m, f]):
+                continue
+            choice = decide_target_list[b][f](state_views[b], h, f)
+            if choice is not None:
+                target_choice[m, f] = choice
+    return target_choice
+
+
+def resolve_full_battle_batch(state, batch_idx, hex_idx, decide_target_list, rng, infantry_counts, kill_xp_delta,
+                               state_views=None):
+    """[M] flat event lists - runs every one of these M battles to
+    completion (structure phase, archer phase, then up to
+    MAX_ROUNDS_SAFETY_CAP rounds), in place. decide_target_list: length
+    B, one {faction: (state_b, hex_index, faction) -> target_or_None}
+    dict per batch item. infantry_counts/kill_xp_delta: [B, F] tensors
+    the caller maintains and applies across the WHOLE turn's battle
+    phase, not just these M battles (see turn.py's battle-phase
+    orchestration for why - the dismount infantry cap and kill-XP awards
+    are shared per-turn state, same as engine_old). state_views: optional
+    pre-computed unstack_states(state) - see turn.py's run_turn docstring
+    for why passing this in (once per turn, from the caller) beats every
+    battle-slot iteration recomputing its own copy."""
+    apply_structure_defense_shots(state, batch_idx, hex_idx, rng, infantry_counts, kill_xp_delta)
+    apply_archer_abilities(state, batch_idx, hex_idx, rng, infantry_counts, kill_xp_delta)
+
+    if state_views is None:
+        state_views = unstack_states(state)  # cheap views (torch slices), stay live across mutations
+    active = torch.ones(len(batch_idx), dtype=torch.bool, device=state.device)
+    for _ in range(MAX_ROUNDS_SAFETY_CAP):
+        active = active & ~is_battle_over_batch(state, batch_idx, hex_idx)
+        if not bool(active.any()):
+            break
+        idx = torch.nonzero(active, as_tuple=False).flatten()
+        b, h = batch_idx[idx], hex_idx[idx]
+        alive_mask = _alive_counts(state, b, h) > 0
+        target_choice = _gather_target_choices(state, b, h, decide_target_list, state_views, alive_mask)
+        resolve_round_batch(state, b, h, target_choice, rng, infantry_counts, kill_xp_delta)
+
+
+def rectify_overflow_batch(state, batch_idx, hex_idx, winner_faction, send_back_list, cap):
+    """[M] flat event lists - winner_faction: [M] long. send_back_list:
+    length M, one list of {"origin_hex", "units"} dicts per event
+    (already obtained from each game's decide_rectification callback by
+    the caller - see turn.py). cap: [M] long tensor or a single int (0
+    forces full eviction - a foreign capital, see turn.py's battle-phase
+    orchestration). After a battle resolves, if the winning stack exceeds
+    `cap`, the winner sends the excess back to their own contributing
+    origin hexes; units whose origin is invalid/unaccounted-for/full are
+    trimmed (infantry -> cavalry -> archers) rather than left above cap.
+    City ownership is NOT touched here - see turn.py for why."""
+    M = len(batch_idx)
+    device = state.device
+    if not torch.is_tensor(cap):
+        cap = torch.full((M,), cap, dtype=torch.long, device=device)
+
+    idx_m = torch.arange(M, device=device)
+    winning_units = faction_totals_sparse(
+        state.battle_faction[batch_idx, hex_idx], state.battle_units[batch_idx, hex_idx], state.num_factions
+    )[idx_m, winner_faction].clone()  # [M, 3]
+
+    max_entries = max((len(sb) for sb in send_back_list), default=0)
+    for e in range(max_entries):
+        origin = torch.full((M,), -1, dtype=torch.long, device=device)
+        entry_units = torch.zeros(M, 3, dtype=winning_units.dtype, device=device)
+        for m in range(M):
+            if e < len(send_back_list[m]):
+                entry = send_back_list[m][e]
+                o = entry["origin_hex"]
+                if o is not None and 0 <= o < state.num_hexes:
+                    origin[m] = o
+                entry_units[m] = torch.tensor(entry["units"], device=device, dtype=entry_units.dtype)
+
+        take = torch.minimum(entry_units, winning_units)
+        winning_units = winning_units - take
+        valid_origin = origin >= 0
+        has_take = (take.sum(dim=-1) > 0) & valid_origin
+        if not bool(has_take.any()):
+            continue
+
+        b_all, h_all = batch_idx, origin.clamp(min=0)
+        is_empty = state.army_faction[b_all, h_all] == NO_FACTION
+        claim = has_take & is_empty
+        if bool(claim.any()):
+            cb, ch = b_all[claim], h_all[claim]
+            state.army_faction[cb, ch] = winner_faction[claim].to(state.army_faction.dtype)
+            state.army_units[cb, ch] = 0
+
+        is_own_now = state.army_faction[b_all, h_all] == winner_faction
+        deposit_mask = has_take & is_own_now
+        if bool(deposit_mask.any()):
+            db, dh = b_all[deposit_mask], h_all[deposit_mask]
+            dtake = take[deposit_mask]
+            for ut in range(3):
+                room = (MAX_STACK_SIZE - state.army_units[db, dh].sum(dim=-1)).clamp(min=0)
+                deposit = torch.minimum(dtake[:, ut], room)
+                state.army_units[db, dh, ut] += deposit
+
+    total_remaining = winning_units.sum(dim=-1)
+    excess = (total_remaining - cap).clamp(min=0)
+    for ut in DEATH_PRIORITY:
+        take = torch.minimum(winning_units[:, ut], excess)
+        winning_units[:, ut] -= take
+        excess = excess - take
+
+    has_survivors = winning_units.sum(dim=-1) > 0
+    if bool(has_survivors.any()):
+        si = torch.nonzero(has_survivors, as_tuple=False).flatten()
+        state.army_faction[batch_idx[si], hex_idx[si]] = winner_faction[si].to(state.army_faction.dtype)
+        state.army_units[batch_idx[si], hex_idx[si]] = winning_units[si]
+    if bool((~has_survivors).any()):
+        ei = torch.nonzero(~has_survivors, as_tuple=False).flatten()
+        state.army_faction[batch_idx[ei], hex_idx[ei]] = NO_FACTION
+        state.army_units[batch_idx[ei], hex_idx[ei]] = 0
+    state.frozen[batch_idx, hex_idx] = False
+    state.locked[batch_idx, hex_idx] = False
+
+    state.battle_faction[batch_idx, hex_idx] = NO_FACTION
+    state.battle_origin[batch_idx, hex_idx] = NO_ORIGIN
+    state.battle_units[batch_idx, hex_idx] = 0
+    state.battle_moved[batch_idx, hex_idx] = False
+    state.battle_round[batch_idx, hex_idx] = 0
+    for m in range(M):
+        b, h = int(batch_idx[m]), int(hex_idx[m])
+        state.battle_order[b].remove(h)
+
+    return state
+
+
+# ---------------------------------------------------------------------------
+# Single-game convenience wrappers, for agent callbacks (decide_target,
+# etc.) that read battle state the same way engine_old's agents did - see
+# module docstring for why faction order here is ascending index rather
+# than "first battle-slot appearance" (RNG parity with engine_old was
+# never on the table, so there's no reason to keep that ordering
+# convention). `state` must have batch_size 1 (a per-game view - see
+# state.py's unstack_states, used throughout this module to get one).
 
 def faction_totals(state, hex_index):
-    """{faction: int[3]} in first-appearance order - mirrors
-    engine/battle.py's battle.faction_totals()."""
-    totals = {}
-    for f in _battle_faction_order(state, hex_index):
-        mask = state.battle_faction[hex_index] == f
-        totals[f] = state.battle_units[hex_index][mask].sum(axis=0)
-    return totals
+    """{faction: int[3] tensor} for every faction with a contribution
+    slot at hex_index (including ones currently at 0 units - see
+    faction_alive_totals for the alive-only version), ascending faction
+    index order."""
+    bf = state.battle_faction[0, hex_index]
+    present = [f for f in range(state.num_factions) if bool((bf == f).any())]
+    if not present:
+        return {}
+    totals = faction_totals_sparse(bf.unsqueeze(0), state.battle_units[0, hex_index].unsqueeze(0), state.num_factions)[0]
+    return {f: totals[f] for f in present}
 
 
 def faction_moved_totals(state, hex_index):
-    """{faction: int[3]} in first-appearance order, like faction_totals,
-    but summed only over contribution slots flagged battle_moved=True -
-    i.e. units that actually moved to join this fight (attacker,
-    encounter/line-battle participant, or a later reinforcement), not a
-    stationary occupant the battle triggered against. Used to gate the
-    real Archers ability (see apply_archer_abilities) to the attacking
-    side - see state.py's battle_moved field docstring for why this
-    can't just be inferred from battle_origin."""
-    totals = {}
-    for f in _battle_faction_order(state, hex_index):
-        mask = (state.battle_faction[hex_index] == f) & state.battle_moved[hex_index]
-        totals[f] = state.battle_units[hex_index][mask].sum(axis=0)
-    return totals
+    """Like faction_totals, but summed only over contribution slots
+    flagged battle_moved=True - see state.py's battle_moved docstring."""
+    bf = state.battle_faction[0, hex_index]
+    present = [f for f in range(state.num_factions) if bool((bf == f).any())]
+    if not present:
+        return {}
+    totals = faction_moved_totals_sparse(
+        bf.unsqueeze(0), state.battle_units[0, hex_index].unsqueeze(0), state.battle_moved[0, hex_index].unsqueeze(0),
+        state.num_factions,
+    )[0]
+    return {f: totals[f] for f in present}
 
 
 def faction_alive_totals(state, hex_index):
-    """{faction: total_units} for factions still alive in this battle -
-    mirrors engine/battle.py's faction_alive_totals()."""
+    """{faction: total_units} for factions still alive in this battle."""
     return {f: t for f, t in faction_totals(state, hex_index).items() if int(t.sum()) > 0}
 
 
 def get_legal_target_actions(state, hex_index, faction):
     """Valid targets for `faction` this round: any other faction still
-    alive in the battle - mirrors engine/turn.py's
-    get_legal_target_actions."""
+    alive in the battle."""
     totals = faction_totals(state, hex_index)
-    return [f for f in _battle_faction_order(state, hex_index) if f != faction and int(totals[f].sum()) > 0]
-
-
-def _kills_for_roll(roll, attacker_total_units):
-    if roll <= 5:
-        return 0
-    if roll <= 15:
-        return 1
-    return 1 if attacker_total_units == 1 else 2
-
-
-def _apply_kills_to_faction(state, hex_index, target_faction, num_kills, killer_faction, death_log):
-    """Removes up to num_kills units from target_faction's presence in
-    this battle (infantry -> cavalry -> archers cascade, earliest
-    contribution slots first), appending one {"faction", "unit_type",
-    "count", "killer"} dict per removal - mirrors engine/battle.py's
-    _apply_kills_to_faction (dict shape and all, see module docstring)."""
-    remaining = num_kills
-    for ut in DEATH_PRIORITY:
-        if remaining <= 0:
-            break
-        for k in range(state.battle_faction.shape[1]):
-            if remaining <= 0:
-                break
-            if state.battle_faction[hex_index, k] != target_faction:
-                continue
-            take = min(int(state.battle_units[hex_index, k, ut]), remaining)
-            if take > 0:
-                state.battle_units[hex_index, k, ut] -= take
-                remaining -= take
-                death_log.append(
-                    {"faction": target_faction, "unit_type": UNIT_TYPES[ut], "count": take, "killer": killer_faction}
-                )
-
-
-def _apply_kills_and_dismounts(state, hex_index, target_faction, num_kills, killer_faction,
-                                rng, infantry_counts, death_log, dismount_log):
-    """Applies num_kills to target_faction (see _apply_kills_to_faction),
-    then rolls the cavalry dismount ability (rulebook: "whenever a
-    cavalry unit dies in battle") for each cavalry unit that died in
-    that application - mirrors the dismount block resolve_round runs
-    for ordinary combat rounds, but for the pre-round structure/archer
-    phases, which used to apply their kills without ever giving cavalry
-    a chance to dismount. Appends {"faction", "success", ["reason"]}
-    dicts to dismount_log, same shape as resolve_round's."""
-    cav_before = int(state.battle_units[hex_index, state.battle_faction[hex_index] == target_faction, 1].sum())
-    _apply_kills_to_faction(state, hex_index, target_faction, num_kills, killer_faction, death_log)
-    cav_after = int(state.battle_units[hex_index, state.battle_faction[hex_index] == target_faction, 1].sum())
-
-    for _ in range(cav_before - cav_after):
-        if rng.randint(1, 20) < 14:
-            dismount_log.append({"faction": target_faction, "success": False})
-            continue
-        if infantry_counts.get(target_faction, 0) >= int(SPAWN_CAPS[0]):
-            dismount_log.append({"faction": target_faction, "success": False, "reason": "cap"})
-            continue
-        for k in range(state.battle_faction.shape[1]):
-            if state.battle_faction[hex_index, k] == target_faction:
-                state.battle_units[hex_index, k, 0] += 1
-                break
-        infantry_counts[target_faction] = infantry_counts.get(target_faction, 0) + 1
-        dismount_log.append({"faction": target_faction, "success": True})
-
-
-def apply_archer_abilities(state, hex_index, rng, infantry_counts):
-    """Runs once, before round 1. Only archers that actually moved to
-    join this battle get to fire - a stationary defender's archers
-    don't roll at all (see faction_moved_totals / state.py's
-    battle_moved docstring); targeting still weighs each side's full
-    strength, moved or not. Returns (death_log, dismount_log), each a
-    list of dicts in the same shape as resolve_round's "deaths"/
-    "dismounts" - mirrors engine/battle.py's apply_archer_abilities,
-    now also covering cavalry dismounts (see _apply_kills_and_dismounts)."""
-    order = _battle_faction_order(state, hex_index)
-    totals = faction_totals(state, hex_index)
-    moved_totals = faction_moved_totals(state, hex_index)
-    alive = {f: t for f, t in totals.items() if int(t.sum()) > 0}
-    death_log = []
-    dismount_log = []
-
-    for faction in order:
-        archers = int(moved_totals.get(faction, np.zeros(3))[2])
-        if archers <= 0 or faction not in alive:
-            continue
-        rivals = {f: int(alive[f].sum()) for f in order if f != faction and f in alive}
-        if not rivals:
-            continue
-        target = max(rivals, key=lambda f: rivals[f])
-
-        kills = 0
-        for _ in range(archers):
-            if rng.randint(1, 20) >= 11:
-                kills += 1
-        if kills > 0:
-            _apply_kills_and_dismounts(state, hex_index, target, kills, faction, rng, infantry_counts,
-                                        death_log, dismount_log)
-
-    return death_log, dismount_log
-
-
-def apply_structure_defense_shots(state, hex_index, rng, infantry_counts):
-    """Runs once, before round 1 (and before real Archer units get their
-    own ability - see apply_archer_abilities). A capital or outpost gets
-    free defensive shots against whoever's attacking its tile, even if
-    its owner has no units there to defend with: 2 shots for a capital,
-    1 for an outpost, each 11-20 = 1 kill against the largest attacking
-    army, same math as the real Archers ability but a deliberately
-    separate mechanic so it can be tuned independently later. Returns
-    (death_log, dismount_log) - see apply_archer_abilities."""
-    owner = int(state.city_owner[hex_index])
-    if owner == NO_FACTION:
-        return [], []
-
-    totals = faction_totals(state, hex_index)
-    alive = {f: t for f, t in totals.items() if int(t.sum()) > 0}
-    rivals = {f: int(t.sum()) for f, t in alive.items() if f != owner}
-    if not rivals:
-        return [], []
-    target = max(rivals, key=lambda f: rivals[f])
-
-    shots = CAPITAL_DEFENSE_SHOTS if state.is_capital[hex_index] else OUTPOST_DEFENSE_SHOTS
-    kills = 0
-    for _ in range(shots):
-        if rng.randint(1, 20) >= 11:
-            kills += 1
-
-    death_log = []
-    dismount_log = []
-    if kills > 0:
-        _apply_kills_and_dismounts(state, hex_index, target, kills, owner, rng, infantry_counts,
-                                    death_log, dismount_log)
-    return death_log, dismount_log
-
-
-def _resolve_targets(state, hex_index, target_choices):
-    """target_choices: {faction: target_or_None}, in the caller's
-    iteration order. Returns {attacker: target} for attacks actually
-    allowed this round (conflict rule: highest total units wins a
-    contested target) - mirrors engine/battle.py's _resolve_targets."""
-    totals = faction_totals(state, hex_index)
-    unit_counts = {f: int(t.sum()) for f, t in totals.items()}
-
-    by_target = {}
-    for attacker, target in target_choices.items():
-        if target is None:
-            continue
-        by_target.setdefault(target, []).append(attacker)
-
-    resolved = {}
-    for target, attackers in by_target.items():
-        if len(attackers) == 1:
-            resolved[attackers[0]] = target
-        else:
-            winner = max(attackers, key=lambda f: (unit_counts.get(f, 0), -f))
-            resolved[winner] = target
-    return resolved
-
-
-def resolve_round(state, hex_index, target_choices, rng, infantry_counts):
-    """Runs one full round in place: targeting conflicts, rolls,
-    simultaneous kill application, then cavalry dismounts. Returns a
-    dict matching engine/battle.py's resolve_round's round_log shape
-    (target_choices_submitted, resolved_targets, rolls, kills_dealt,
-    deaths, dismounts) - "deaths" also drives kill-XP crediting.
-
-    infantry_counts: {faction: current_infantry_in_play}, a running
-    tally the caller maintains (shared across every battle resolved in
-    the same turn, same as v1) so dismount cap checks don't need a fresh
-    board scan on every roll.
-    """
-    resolved_targets = _resolve_targets(state, hex_index, target_choices)
-    totals = faction_totals(state, hex_index)
-    unit_counts = {f: int(t.sum()) for f, t in totals.items()}
-
-    rolls = {}
-    kills_dealt = {}
-    pending_kills = []
-    for attacker, target in resolved_targets.items():
-        attacker_units = unit_counts.get(attacker, 0)
-        if attacker_units <= 0:
-            continue
-        roll = rng.randint(1, 20)
-        kills = _kills_for_roll(roll, attacker_units)
-        rolls[attacker] = roll
-        kills_dealt[attacker] = kills
-        if kills > 0:
-            pending_kills.append((target, kills, attacker))
-
-    death_log = []
-    cav_died_by_faction = {}
-    for target, kills, killer in pending_kills:
-        cav_before = int(state.battle_units[hex_index, state.battle_faction[hex_index] == target, 1].sum())
-        _apply_kills_to_faction(state, hex_index, target, kills, killer, death_log)
-        cav_after = int(state.battle_units[hex_index, state.battle_faction[hex_index] == target, 1].sum())
-        died = cav_before - cav_after
-        if died > 0:
-            cav_died_by_faction[target] = cav_died_by_faction.get(target, 0) + died
-
-    dismount_log = []
-    for faction, died_count in cav_died_by_faction.items():
-        for _ in range(died_count):
-            if rng.randint(1, 20) < 14:
-                dismount_log.append({"faction": faction, "success": False})
-                continue
-            if infantry_counts.get(faction, 0) >= int(SPAWN_CAPS[0]):
-                dismount_log.append({"faction": faction, "success": False, "reason": "cap"})
-                continue
-            for k in range(state.battle_faction.shape[1]):
-                if state.battle_faction[hex_index, k] == faction:
-                    state.battle_units[hex_index, k, 0] += 1
-                    break
-            infantry_counts[faction] = infantry_counts.get(faction, 0) + 1
-            dismount_log.append({"faction": faction, "success": True})
-
-    state.battle_round[hex_index] += 1
-    return {
-        "target_choices_submitted": dict(target_choices),
-        "resolved_targets": dict(resolved_targets),
-        "rolls": rolls,
-        "kills_dealt": kills_dealt,
-        "deaths": death_log,
-        "dismounts": dismount_log,
-    }
+    return [f for f in totals if f != faction and int(totals[f].sum()) > 0]
 
 
 def is_battle_over(state, hex_index):
@@ -333,135 +543,3 @@ def get_winner(state, hex_index):
     if len(alive) == 1:
         return next(iter(alive))
     return None
-
-
-def resolve_full_battle(state, hex_index, target_fn, rng, infantry_counts=None):
-    """Runs the whole battle to completion, in place. `target_fn(state,
-    hex_index, faction) -> target_faction_or_None` is called once per
-    living faction per round (the agent decision point).
-    `infantry_counts`, if not provided, is built from a fresh scan of
-    just this battle's factions (fine for isolated calls/tests; the
-    real turn orchestration should share one tally across every battle
-    resolved that turn - see engine/turn.py's _run_battle_phase for why).
-
-    Returns {"structure_phase": [...], "structure_phase_dismounts": [...],
-    "archer_phase": [...], "archer_phase_dismounts": [...], "rounds":
-    [round_log, ...]} - "rounds", "structure_phase" and "archer_phase"
-    match the shape of engine/battle.py's resolve_full_battle, for
-    replay/visualization (see module docstring); the two
-    "*_dismounts" keys are new (see _apply_kills_and_dismounts - cavalry
-    killed by a structure's defense shots or the real Archers ability
-    used to never get a chance to dismount) and not yet consumed by any
-    replay viewer. Always computed, same as v1 - cheap, bounded by
-    actual rounds fought - even if a given caller (e.g. run_turn, as
-    opposed to run_turn_and_log) doesn't keep it.
-    """
-    if infantry_counts is None:
-        infantry_counts = {f: count_units_in_play(state, f, 0) for f in _battle_faction_order(state, hex_index)}
-
-    players_kill_xp = state.kill_xp
-
-    structure_phase, structure_phase_dismounts = apply_structure_defense_shots(state, hex_index, rng, infantry_counts)
-    for entry in structure_phase:
-        players_kill_xp[entry["killer"]] += entry["count"]
-
-    archer_phase, archer_phase_dismounts = apply_archer_abilities(state, hex_index, rng, infantry_counts)
-    for entry in archer_phase:
-        players_kill_xp[entry["killer"]] += entry["count"]
-
-    rounds = []
-    rounds_run = 0
-    while not is_battle_over(state, hex_index) and rounds_run < MAX_ROUNDS_SAFETY_CAP:
-        order = _battle_faction_order(state, hex_index)
-        totals = faction_totals(state, hex_index)
-        target_choices = {}
-        for faction in order:
-            if int(totals.get(faction, np.zeros(3)).sum()) <= 0:
-                continue
-            target_choices[faction] = target_fn(state, hex_index, faction)
-
-        round_result = resolve_round(state, hex_index, target_choices, rng, infantry_counts)
-        rounds.append(round_result)
-        for entry in round_result["deaths"]:
-            players_kill_xp[entry["killer"]] += entry["count"]
-
-        rounds_run += 1
-
-    return {
-        "structure_phase": structure_phase,
-        "structure_phase_dismounts": structure_phase_dismounts,
-        "archer_phase": archer_phase,
-        "archer_phase_dismounts": archer_phase_dismounts,
-        "rounds": rounds,
-    }
-
-
-def rectify_overflow(state, hex_index, winner_faction, send_back, cap=MAX_STACK_SIZE):
-    """After a battle resolves, if the winning stack exceeds `cap` units,
-    the winner sends the excess back to their own contributing origin
-    hexes. `send_back`: list of {"origin_hex": hex_index_or_None,
-    "units": int[3]}. Units whose origin_hex is None/invalid, that
-    `send_back` doesn't account for, or that would push the origin hex
-    itself above MAX_STACK_SIZE (the 6-unit limit is strict outside of
-    battle - a returning unit that doesn't fit at its origin simply
-    doesn't make it back, same as a peaceful move that would overstack
-    is just illegal) are trimmed off (infantry -> cavalry -> archers,
-    same cascade used everywhere else) rather than left sitting above
-    `cap` - mirrors engine/battle.py's rectify_overflow, generalized with
-    a `cap` parameter so turn.py can force a full eviction (cap=0) from a
-    capital a foreign faction just won a battle on (see turn.py's
-    _run_battle_phase - capitals are uncapturable, so an attacker who
-    wins there is never allowed to actually occupy it).
-
-    City ownership is NOT touched here: neither a capital (uncapturable)
-    nor an outpost (destroyed rather than captured - see turn.py) ever
-    changes hands by occupation anymore, so that's turn.py's job, not
-    this generic stack-trimming function's."""
-    winning_units = faction_totals(state, hex_index)[winner_faction].copy()
-
-    for entry in send_back:
-        origin = entry["origin_hex"]
-        units = entry["units"]
-        valid_origin = origin is not None and 0 <= origin < state.num_hexes
-        for ut in range(3):
-            take = min(int(units[ut]), int(winning_units[ut]))
-            winning_units[ut] -= take
-            if valid_origin and take > 0:
-                if state.army_faction[origin] == NO_FACTION:
-                    state.army_faction[origin] = winner_faction
-                if state.army_faction[origin] == winner_faction:
-                    room = MAX_STACK_SIZE - int(state.army_units[origin].sum())
-                    deposit = max(0, min(take, room))
-                    state.army_units[origin, ut] += deposit
-                # else: origin is held by another faction (shouldn't
-                # normally happen for your own origin hex) or has no
-                # room left - either way, those units are simply lost
-            # else: those units are simply lost
-
-    total_remaining = int(winning_units.sum())
-    if total_remaining > cap:
-        excess = total_remaining - cap
-        for ut in DEATH_PRIORITY:
-            take = min(int(winning_units[ut]), excess)
-            winning_units[ut] -= take
-            excess -= take
-            if excess <= 0:
-                break
-
-    if int(winning_units.sum()) > 0:
-        state.army_faction[hex_index] = winner_faction
-        state.army_units[hex_index] = winning_units
-    else:
-        state.army_faction[hex_index] = NO_FACTION
-        state.army_units[hex_index] = 0
-    state.frozen[hex_index] = False
-    state.locked[hex_index] = False
-
-    state.battle_faction[hex_index] = NO_FACTION
-    state.battle_origin[hex_index] = NO_ORIGIN
-    state.battle_units[hex_index] = 0
-    state.battle_moved[hex_index] = False
-    state.battle_round[hex_index] = 0
-    state.battle_order.remove(hex_index)
-
-    return state

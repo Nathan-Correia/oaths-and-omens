@@ -1,227 +1,304 @@
 """
-Turn orchestration for engine - ported from engine/turn.py's run_turn,
-plus a run_turn_and_log for replay/visualization (see this module's
-run_turn_and_log docstring for how its log format differs from v1's).
+Batched turn orchestration for engine.
 
-Agents aren't a formal class hierarchy here (unlike v1's BaseAgent) - each
-decision point takes a plain callback instead, looked up per-faction from
-a {faction: callable} dict (mirroring v1's {faction: agent}). Deliberate:
-the real "agent" for engine will eventually be a neural policy with
-its own natural interface (masked observation in, action out) that
-almost certainly won't look like BaseAgent's five methods - building that
-class hierarchy now would likely just be thrown away later. Callbacks
-compose fine with an eventual class-based wrapper (an agent object's
-bound methods are themselves callables) without committing to that shape
-now. Callback signatures:
+Agent callback shape: every decide_* argument is now a length-B list, one
+{faction: callable} dict per batch item (matching the convention used
+throughout movement.py/battle.py/collect.py/buy.py - agents stay per-game
+Python functions; see the plan's "Consequence for agents/tooling"
+section). Per-callback signatures, in the new fixed-shape/batched terms:
 
-  decide_buy(state, faction, legal_actions) -> [action, ...]
-  decide_movement(state, faction, step, legal_mask) -> (hex_index, direction) or None
-  decide_cavalry(state, faction, step, legal_mask) -> (hex_index, direction) or None
-  decide_target(state, hex_index, faction) -> target_faction or None
-  decide_rectification(state, hex_index, winner_faction, cap) -> [{"origin_hex", "units"}, ...]
-    `cap` is normally MAX_STACK_SIZE (send back only the overflow above 6), but is 0 when
-    the winner just won a battle on a foreign capital - capitals are uncapturable, so that
-    winner has to send EVERYTHING back (see _run_battle_phase).
-  decide_resource_choice(state, faction, hex_index) -> "iron" or "fish"
-    Only ever asked about an outpost adjacent to both a mountain and a lake, during the
-    Collect phase (see collect.py's _outpost_resource) - every other outpost's resource is
-    determined by terrain alone, no decision needed.
+  decide_buy(state_b, faction) -> {"outpost_type", "outpost_hex",
+    "outpost_unit_type", "outpost_upgrade", "infantry_buy", "convert_cavalry",
+    "convert_archers"} - see buy.py's module docstring for the fixed-shape
+    action fields.
+  decide_movement(state_b, faction, step) -> (hex_index, direction) or None
+  decide_cavalry(state_b, faction, step) -> (hex_index, direction) or None
+  decide_target(state_b, hex_index, faction) -> target_faction or None
+  decide_rectification(state_b, hex_index, winner_faction, cap) ->
+    [{"origin_hex", "units"}, ...]
+  decide_resource_choice(state_b, faction, hex_index) -> "iron" or "fish"
 
-RULE CHANGE - turn order: the rulebook now specifies Buy -> Movement ->
-Combat -> Collect, not Collect (income) -> Buy -> Movement -> Combat. Gold
-income, resource income, and the per-round VP tally all moved into one
-end-of-turn Collect phase (see collect.py's apply_collect_phase) - so a
-turn's Buy phase always spends whatever the PREVIOUS turn's Collect phase
-produced, not income collected moments earlier. Turn 1's Buy phase runs
-before any Collect phase ever has, so it only has each faction's starting
-gold to spend - matching the rulebook's setup-phase carve-out.
+RULE (unchanged from engine_old): Buy -> Movement -> Combat -> Collect.
+
+Battle-phase orchestration is the one piece of this module that isn't a
+straightforward "wire the batched phases together" - see
+_run_battle_phase's docstring for the battle-slot-index design (loop over
+"each game's Nth pending battle", not over games, so every game's own
+battle_order sequencing - see state.py's docstring for why that order is
+real game state, not cosmetic - is preserved while still batching across
+games at each slot).
 """
 
-import random
+import torch
 
-import numpy as np
-
-from .battle import faction_totals, get_winner, rectify_overflow, resolve_full_battle
-from .buy import apply_buy_phase, get_legal_buy_actions
+from .battle import faction_totals, get_winner_batch, rectify_overflow_batch, resolve_full_battle_batch
+from .buy import _count_all_units_in_play_batch, apply_buy_phase_batch
 from .collect import OUTPOST_DESTROY_VP, VP_TO_WIN, apply_collect_phase
-from .movement import apply_movement_step, legal_cavalry_mask, legal_movement_mask
-from .state import (
-    MAX_STACK_SIZE, NO_FACTION, NO_ORIGIN, NO_UPGRADE, RESOURCE_TYPES, UPGRADE_TYPES, count_units_in_play,
-)
+from .movement import actions_from_dicts, apply_movement_step, legal_cavalry_mask, legal_movement_mask
+from .state import MAX_STACK_SIZE, NO_FACTION, NO_UPGRADE, RESOURCE_TYPES, UPGRADE_TYPES, unstack_states
 from .terrain import apply_terrain_effects
 
 MOVEMENT_STEPS = 3
 CAVALRY_STEPS = 2
 
+CHECKPOINT_LABELS = ["Start", "Buy", "Move 1", "Move 2", "Move 3", "Cav 1", "Cav 2", "Battle"]
 
-def _run_battle_phase(state, decide_target, decide_rectification, rng):
-    """Resolves every pending battle, in state.battle_order (battle
-    creation order - see state.py's module docstring for why this has to
-    match v1's dict-insertion-order semantics rather than e.g. hex-index
-    order: the dismount infantry cap tally below is shared across every
-    battle resolved this turn, so processing order can affect outcomes
-    near the cap). Returns a list of per-battle event logs, same shape
-    as engine/turn.py's _run_battle_phase - always built (cheap, bounded
-    by rounds actually fought), even though only run_turn_and_log ends
-    up keeping it.
 
-    RULE CHANGE - capitals/outposts: neither is capturable by occupation
-    anymore (see movement.py). When the winner of a battle on a hex isn't
-    that hex's city_owner:
-      - a capital evicts the winner entirely (cap=0 rectification, no
-        ownership change - "you can't stand units in another player's
-        capital").
-      - an outpost is destroyed (city_owner cleared) and the winner gets
-        OUTPOST_DESTROY_VP; the winner keeps standing there (normal
-        cap=MAX_STACK_SIZE rectification), same as any other battle hex.
-    """
-    infantry_counts = {f: count_units_in_play(state, f, 0) for f in range(state.num_factions)}
-    pending_hexes = list(state.battle_order)
-    battle_events = []
+def _gather_buy_decisions(state, decide_buy_list, state_views=None):
+    """Calls each game's per-faction decide_buy callback and stacks the
+    results into the fixed-shape batched tensors apply_buy_phase_batch
+    wants. Missing/partial fields in a callback's returned dict default
+    to "no action" (all-zero counts, outpost_type 0) - matches the
+    "invalid/absent answer silently falls back to doing nothing" pattern
+    used throughout engine (movement/battle callbacks returning None,
+    placement/draft falling back to a random legal choice).
 
-    for hex_index in pending_hexes:
-        if not state.locked[hex_index]:
+    state_views: optional pre-computed unstack_states(state) - pass this
+    in (see run_turn) rather than letting this recompute it, since the
+    views are just torch slices that stay live across mutations; the
+    original per-call unstack_states was itself a smaller instance of
+    the same "recompute a cheap-to-share thing on every call" waste the
+    legal-mask fix addressed - see run_turn's docstring."""
+    B, N = state.terrain.shape
+    F = state.num_factions
+    device = state.device
+    if state_views is None:
+        state_views = unstack_states(state)
+
+    outpost_type = torch.zeros(B, F, dtype=torch.long, device=device)
+    outpost_hex = torch.full((B, F), -1, dtype=torch.long, device=device)
+    outpost_unit_type = torch.zeros(B, F, dtype=torch.long, device=device)
+    outpost_upgrade = torch.zeros(B, F, dtype=torch.long, device=device)
+    infantry_buy = torch.zeros(B, F, N, dtype=torch.long, device=device)
+    convert_cavalry = torch.zeros(B, F, N, dtype=torch.long, device=device)
+    convert_archers = torch.zeros(B, F, N, dtype=torch.long, device=device)
+
+    for b in range(B):
+        for f in range(F):
+            decision = decide_buy_list[b][f](state_views[b], f)
+            if not decision:
+                continue
+            if decision.get("outpost_type"):
+                outpost_type[b, f] = int(decision["outpost_type"])
+                outpost_hex[b, f] = int(decision.get("outpost_hex", -1))
+                outpost_unit_type[b, f] = int(decision.get("outpost_unit_type", 0))
+                outpost_upgrade[b, f] = int(decision.get("outpost_upgrade", 0))
+            for hex_index, count in decision.get("infantry_buy", {}).items():
+                infantry_buy[b, f, hex_index] += int(count)
+            for hex_index, count in decision.get("convert_cavalry", {}).items():
+                convert_cavalry[b, f, hex_index] += int(count)
+            for hex_index, count in decision.get("convert_archers", {}).items():
+                convert_archers[b, f, hex_index] += int(count)
+
+    return outpost_type, outpost_hex, outpost_unit_type, outpost_upgrade, infantry_buy, convert_cavalry, convert_archers
+
+
+def _gather_movement_actions(state, decide_list, step, legal_mask_fn, state_views=None):
+    """Calls each game's per-faction movement/cavalry callback for this
+    step and returns the [{faction: action_or_None}, ...] shape
+    movement.actions_from_dicts expects. legal_mask_fn: legal_movement_mask
+    or legal_cavalry_mask - called ONCE PER FACTION over the whole batch
+    (each call is already a proper batched [B, N, 6] op), not once per
+    (batch item, faction) pair - calling it per batch item was the
+    dominant cost of a whole turn (profiled: ~95% of run_turn's wall
+    time at B=128, from re-deriving the same per-faction legality mask
+    from scratch B times over instead of slicing one batched computation
+    - the exact "engine primitive computed correctly but called
+    wastefully" shape as this session's earlier _can_build_outpost
+    finding, just in the batched engine instead of the original one).
+
+    state_views: optional pre-computed unstack_states(state) - see
+    _gather_buy_decisions' docstring for why passing this in beats
+    recomputing it (this function used to call it fresh every one of the
+    5 times per turn it's used - 3 movement steps + 2 cavalry steps)."""
+    B = state.batch_size
+    F = state.num_factions
+    if state_views is None:
+        state_views = unstack_states(state)
+    full_masks = [legal_mask_fn(state, f) for f in range(F)]  # each [B, N, 6], one batched call per faction
+    actions = []
+    for b in range(B):
+        d = {}
+        for f in range(F):
+            per_faction_mask = full_masks[f][b]  # [N, 6] - just an index, no recomputation
+            d[f] = decide_list[b][f](state_views[b], f, step, per_faction_mask)
+        actions.append(d)
+    return actions
+
+
+def _run_battle_phase(state, decide_target_list, decide_rectification_list, rng, state_views=None):
+    """Resolves every pending battle across the whole batch, in place.
+    Battle-slot-index design (see module docstring): loop over slot =
+    0, 1, 2, ... - "each game's (slot)-th still-pending battle, in that
+    game's own battle_order" - resolving that whole cross-game slice
+    together via battle.py's batched primitives before moving to the
+    next slot. This reproduces each individual game's own sequential
+    battle-resolution order (the thing that actually matters - see
+    state.py's battle_order docstring for the shared infantry-dismount-
+    cap coupling across battles in the SAME game) while still batching
+    across games at every slot; a game with only 1 pending battle simply
+    has nothing to do once its own single slot is resolved."""
+    B = state.batch_size
+    F = state.num_factions
+    device = state.device
+    if state_views is None:
+        state_views = unstack_states(state)
+
+    counts_all = _count_all_units_in_play_batch(state)  # [B, F, 3]
+    infantry_counts = counts_all[..., 0].clone()  # running tally shared across every battle THIS turn
+    kill_xp_delta = torch.zeros(B, F, dtype=torch.long, device=device)
+
+    pending = [list(state.battle_order[b]) for b in range(B)]  # snapshot, like engine_old's pending_hexes
+    max_slots = max((len(p) for p in pending), default=0)
+
+    for slot in range(max_slots):
+        batch_list, hex_list = [], []
+        for b in range(B):
+            if slot < len(pending[b]):
+                h = pending[b][slot]
+                if bool(state.locked[b, h]):
+                    batch_list.append(b)
+                    hex_list.append(h)
+        if not batch_list:
             continue
+        batch_idx = torch.tensor(batch_list, dtype=torch.long, device=device)
+        hex_idx = torch.tensor(hex_list, dtype=torch.long, device=device)
 
-        contributions_start = [
-            {
-                "faction": int(state.battle_faction[hex_index, k]),
-                "origin_hex": int(state.battle_origin[hex_index, k]),
-                "infantry": int(state.battle_units[hex_index, k, 0]),
-                "cavalry": int(state.battle_units[hex_index, k, 1]),
-                "archers": int(state.battle_units[hex_index, k, 2]),
-            }
-            for k in range(state.battle_faction.shape[1])
-            if state.battle_faction[hex_index, k] != NO_FACTION
-        ]
+        resolve_full_battle_batch(
+            state, batch_idx, hex_idx, decide_target_list, rng, infantry_counts, kill_xp_delta, state_views=state_views,
+        )
+        winner = get_winner_batch(state, batch_idx, hex_idx)  # [M] long, NO_FACTION if no winner
 
-        def target_fn(s, hidx, faction, _faction_agent=decide_target):
-            return _faction_agent[faction](s, hidx, faction)
+        has_winner = winner != NO_FACTION
+        if bool(has_winner.any()):
+            wi = torch.nonzero(has_winner, as_tuple=False).flatten()
+            wb, wh, ww = batch_idx[wi], hex_idx[wi], winner[wi]
+            owner = state.city_owner[wb, wh]
+            owner_present = owner != NO_FACTION
+            owner_differs = owner_present & (owner != ww)
+            is_cap_hex = state.is_capital[wb, wh]
 
-        full_log = resolve_full_battle(state, hex_index, target_fn, rng, infantry_counts)
+            cap = torch.full((len(wi),), MAX_STACK_SIZE, dtype=torch.long, device=device)
+            cap[owner_differs & is_cap_hex] = 0
 
-        winner = get_winner(state, hex_index)
-        send_back = []
-        if winner is None:
-            state.army_faction[hex_index] = NO_FACTION
-            state.army_units[hex_index] = 0
-            state.locked[hex_index] = False
-            state.battle_faction[hex_index] = NO_FACTION
-            state.battle_origin[hex_index] = NO_ORIGIN
-            state.battle_units[hex_index] = 0
-            state.battle_moved[hex_index] = False
-            state.battle_round[hex_index] = 0
-            state.battle_order.remove(hex_index)
-        else:
-            owner = int(state.city_owner[hex_index])
-            cap = MAX_STACK_SIZE
-            if owner != NO_FACTION and owner != winner:
-                if state.is_capital[hex_index]:
-                    cap = 0
-                else:
-                    state.city_owner[hex_index] = NO_FACTION
-                    state.victory_points[winner] += OUTPOST_DESTROY_VP
+            destroy = owner_differs & ~is_cap_hex
+            if bool(destroy.any()):
+                db, dh, dw = wb[destroy], wh[destroy], ww[destroy]
+                state.city_owner[db, dh] = NO_FACTION
+                state.victory_points.index_put_(
+                    (db, dw), torch.full((len(db),), OUTPOST_DESTROY_VP, dtype=state.victory_points.dtype, device=device),
+                    accumulate=True,
+                )
 
-            send_back = decide_rectification[winner](state, hex_index, winner, cap)
-            rectify_overflow(state, hex_index, winner, send_back, cap=cap)
+            send_back_list = []
+            for i in range(len(wi)):
+                b, h, w, c = int(wb[i]), int(wh[i]), int(ww[i]), int(cap[i])
+                send_back_list.append(decide_rectification_list[b][w](state_views[b], h, w, c))
+            rectify_overflow_batch(state, wb, wh, ww, send_back_list, cap)
 
-        battle_events.append({
-            "hex": list(state.grid.coord_of(hex_index)),
-            "contributions_start": contributions_start,
-            "structure_phase": full_log["structure_phase"],
-            "structure_phase_dismounts": full_log["structure_phase_dismounts"],
-            "archer_phase": full_log["archer_phase"],
-            "archer_phase_dismounts": full_log["archer_phase_dismounts"],
-            "rounds": full_log["rounds"],
-            "winner": winner,
-            "rectification": send_back,
-        })
+        no_winner = ~has_winner
+        if bool(no_winner.any()):
+            ni = torch.nonzero(no_winner, as_tuple=False).flatten()
+            nb_, nh = batch_idx[ni], hex_idx[ni]
+            state.army_faction[nb_, nh] = NO_FACTION
+            state.army_units[nb_, nh] = 0
+            state.locked[nb_, nh] = False
+            state.battle_faction[nb_, nh] = NO_FACTION
+            state.battle_units[nb_, nh] = 0
+            state.battle_moved[nb_, nh] = False
+            state.battle_round[nb_, nh] = 0
+            for i in ni.tolist():
+                b, h = int(batch_idx[i]), int(hex_idx[i])
+                state.battle_order[b].remove(h)
 
-    return battle_events
+    state.kill_xp += kill_xp_delta
+    return state
 
 
 def get_game_winner(state):
-    """None until some faction's VP total has reached VP_TO_WIN. Among
-    every faction at or above VP_TO_WIN, the strict highest total wins
-    outright; an exact tie for the top total is broken by whoever placed
-    their capital later (see rulebook's Win Condition), using
-    state.capital_settle_order - set once per faction by
-    placement.py's run_city_setup, a single incrementing counter, so no
-    two factions can ever tie on it and no further randomness is needed
-    here."""
-    top = int(np.max(state.victory_points))
-    if top < VP_TO_WIN:
-        return None
-    contenders = [f for f in range(state.num_factions) if int(state.victory_points[f]) == top]
-    if len(contenders) == 1:
-        return contenders[0]
-    return max(contenders, key=lambda f: int(state.capital_settle_order[f]))
+    """[B] long - NO_FACTION until some faction's VP total has reached
+    VP_TO_WIN in that game. Among every faction at or above VP_TO_WIN,
+    the strict highest total wins outright; an exact tie for the top
+    total is broken by whoever placed their capital LATER (see
+    placement.py's run_city_setup - a single incrementing counter, so no
+    two factions can ever tie on it)."""
+    top = state.victory_points.max(dim=-1).values  # [B]
+    contenders = (state.victory_points == top.unsqueeze(-1)) & (top.unsqueeze(-1) >= VP_TO_WIN)  # [B, F]
+    settle_order_masked = torch.where(contenders, state.capital_settle_order, torch.full_like(state.capital_settle_order, -1))
+    winner = settle_order_masked.argmax(dim=-1)
+    has_winner = (top >= VP_TO_WIN) & contenders.any(dim=-1)
+    return torch.where(has_winner, winner.to(state.victory_points.dtype), torch.full_like(top, NO_FACTION))
 
 
-def run_turn(state, decide_buy, decide_movement, decide_cavalry, decide_target, decide_rectification,
-             decide_resource_choice, rng=None):
-    """Mutates and returns `state`. Each decide_* argument is a
-    {faction: callable} dict - see module docstring for each callable's
-    signature. Elimination doesn't exist anymore (capitals are
-    uncapturable - see movement.py/_run_battle_phase), so every faction
-    is asked for a decision every turn.
+def check_game_end(state, max_turns=None):
+    """[B] bool - True once a game should stop: the VP win condition has
+    been hit (see get_game_winner), or (if max_turns is given - purely an
+    infra safety net, not part of the rules) that game's turn_number has
+    reached it."""
+    ended = get_game_winner(state) != NO_FACTION
+    if max_turns is not None:
+        ended = ended | (state.turn_number >= max_turns)
+    return ended
 
-    RULE CHANGE - turn order (see module docstring): Buy -> Movement ->
-    Combat -> Collect, not Collect -> Buy -> Movement -> Combat - Collect
-    (gold/resources/VP) now runs at the END of this function, so this
-    turn's Buy phase spends whatever last turn's Collect phase produced."""
-    rng = rng or random.Random()
 
-    buy_actions = {}
-    for faction in range(state.num_factions):
-        legal = get_legal_buy_actions(state, faction)
-        buy_actions[faction] = decide_buy[faction](state, faction, legal)
-    apply_buy_phase(state, buy_actions)
+def run_turn(state, decide_buy_list, decide_movement_list, decide_cavalry_list, decide_target_list,
+             decide_rectification_list, decide_resource_choice_list, rng):
+    """Mutates and returns `state`. Each decide_*_list argument is length
+    B, one {faction: callable} dict per batch item - see module docstring
+    for each callback's signature. `rng`: a torch.Generator on the same
+    device as `state`.
+
+    Every batch item advances one full turn together, regardless of
+    whether some have already won (see check_game_end/get_game_winner) -
+    a finished game just keeps producing decisions/mutations nobody reads
+    (VP_TO_WIN is a floor, not a ceiling, and re-running a phase on an
+    already-won game is harmless, just wasted work). Skipping ended
+    batch items - and any auto-reset of them - is the future training
+    loop's concern (see the plan's "explicitly deferred" section), not
+    this function's.
+
+    state_views (unstack_states(state)) is computed ONCE here and
+    threaded through every phase that needs a per-game view for agent
+    callbacks, rather than each phase recomputing it - the views are
+    just torch slices sharing storage with `state`, so they correctly
+    reflect every phase's mutations without needing to be refreshed (see
+    state.py's unstack_states docstring); recomputing it 6+ times a turn
+    was itself a smaller instance of the same "recompute a cheap-to-
+    share thing on every call" waste the legal-mask fix addressed."""
+    F = state.num_factions
+    state_views = unstack_states(state)
+
+    buy_args = _gather_buy_decisions(state, decide_buy_list, state_views)
+    apply_buy_phase_batch(state, *buy_args)
 
     for step in range(MOVEMENT_STEPS):
-        actions = {}
-        for faction in range(state.num_factions):
-            legal = legal_movement_mask(state, faction)
-            actions[faction] = decide_movement[faction](state, faction, step, legal)
-        apply_movement_step(state, actions, rng, cavalry_only=False)
+        actions = _gather_movement_actions(state, decide_movement_list, step, legal_movement_mask, state_views)
+        from_hex, direction, has_action = actions_from_dicts(actions, F, state.device)
+        apply_movement_step(state, from_hex, direction, has_action, rng, cavalry_only=False)
 
     for step in range(CAVALRY_STEPS):
-        actions = {}
-        for faction in range(state.num_factions):
-            legal = legal_cavalry_mask(state, faction)
-            actions[faction] = decide_cavalry[faction](state, faction, step, legal)
-        apply_movement_step(state, actions, rng, cavalry_only=True)
+        actions = _gather_movement_actions(state, decide_cavalry_list, step, legal_cavalry_mask, state_views)
+        from_hex, direction, has_action = actions_from_dicts(actions, F, state.device)
+        apply_movement_step(state, from_hex, direction, has_action, rng, cavalry_only=True)
 
-    _run_battle_phase(state, decide_target, decide_rectification, rng)
+    _run_battle_phase(state, decide_target_list, decide_rectification_list, rng, state_views)
     apply_terrain_effects(state)
-    apply_collect_phase(state, decide_resource_choice)
+    apply_collect_phase(state, decide_resource_choice_list)
 
     state.turn_number += 1
     return state
 
 
-# Labels for the checkpoints a logged turn produces (1 start + 1 buy +
-# MOVEMENT_STEPS move + CAVALRY_STEPS cav + 1 battle) - same meaning as
-# engine/turn.py's CHECKPOINT_LABELS, reused as-is by hex_visualizer.py.
-CHECKPOINT_LABELS = ["Start", "Buy", "Move 1", "Move 2", "Move 3",
-                      "Cav 1", "Cav 2", "Battle"]
-
-
 def _snapshot_entry(state, hex_index, coord):
     """Per-hex log entry: {"q","r","s","city","troops","battle"}. "city"
-    is None, or {"faction", "is_capital", "upgrade"} - capitals and
-    outposts share city_owner but render as different icons
-    (hex_visualizer.py's draw_city_icon vs. draw_outpost_icon), so
-    is_capital has to travel with the log entry rather than being
-    re-derived some other way. "upgrade" is one of UPGRADE_TYPES or None
-    (always None for a capital, and for an outpost with no upgrade yet) -
-    lets the visualizer render Barracks/Workshop/Temple outposts
-    distinctly (see hex_visualizer.py's draw_outpost_icon)."""
-    if state.city_owner[hex_index] != NO_FACTION:
-        upgrade_index = int(state.outpost_upgrade[hex_index])
+    is None, or {"faction", "is_capital", "upgrade"}. "upgrade" is one of
+    UPGRADE_TYPES or None. Single-game (batch item 0) only - see
+    snapshot_hexes."""
+    if int(state.city_owner[0, hex_index]) != NO_FACTION:
+        upgrade_index = int(state.outpost_upgrade[0, hex_index])
         city = {
-            "faction": int(state.city_owner[hex_index]),
-            "is_capital": bool(state.is_capital[hex_index]),
+            "faction": int(state.city_owner[0, hex_index]),
+            "is_capital": bool(state.is_capital[0, hex_index]),
             "upgrade": UPGRADE_TYPES[upgrade_index] if upgrade_index != NO_UPGRADE else None,
         }
     else:
@@ -231,7 +308,7 @@ def _snapshot_entry(state, hex_index, coord):
         "city": city,
         "troops": None, "battle": None,
     }
-    if state.locked[hex_index]:
+    if bool(state.locked[0, hex_index]):
         totals = faction_totals(state, hex_index)
         if totals:
             entry["battle"] = {
@@ -240,106 +317,86 @@ def _snapshot_entry(state, hex_index, coord):
                     for f, t in totals.items()
                 ]
             }
-    elif state.army_faction[hex_index] != NO_FACTION:
+    elif int(state.army_faction[0, hex_index]) != NO_FACTION:
         entry["troops"] = {
-            "faction": int(state.army_faction[hex_index]),
-            "infantry": int(state.army_units[hex_index, 0]),
-            "cavalry": int(state.army_units[hex_index, 1]),
-            "archers": int(state.army_units[hex_index, 2]),
-            "frozen": bool(state.frozen[hex_index]),
+            "faction": int(state.army_faction[0, hex_index]),
+            "infantry": int(state.army_units[0, hex_index, 0]),
+            "cavalry": int(state.army_units[0, hex_index, 1]),
+            "archers": int(state.army_units[0, hex_index, 2]),
+            "frozen": bool(state.frozen[0, hex_index]),
         }
     return entry
 
 
 def snapshot_hexes(state):
-    """Full per-hex snapshot (all coords) - mirrors engine/turn.py's
-    snapshot_hexes."""
+    """Full per-hex snapshot (all coords), single-game (batch item 0)."""
     return [_snapshot_entry(state, i, coord) for i, coord in enumerate(state.grid.coords)]
 
 
 def sparse_hexes(full_hexes):
-    """Filters a snapshot down to only hexes with something on them -
-    mirrors engine/turn.py's sparse_hexes."""
+    """Filters a snapshot down to only hexes with something on them."""
     return [e for e in full_hexes if e["city"] is not None or e["troops"] is not None or e["battle"] is not None]
 
 
 def _player_stats_snapshot(state):
     return {
         f: {
-            "gold": int(state.gold[f]),
-            "resources": {r: int(state.resources[f, i]) for i, r in enumerate(RESOURCE_TYPES)},
-            "kill_xp": int(state.kill_xp[f]),
-            "victory_points": int(state.victory_points[f]),
-            "alive": bool(state.alive[f]),
+            "gold": int(state.gold[0, f]),
+            "resources": {r: int(state.resources[0, f, i]) for i, r in enumerate(RESOURCE_TYPES)},
+            "kill_xp": int(state.kill_xp[0, f]),
+            "victory_points": int(state.victory_points[0, f]),
+            "alive": bool(state.alive[0, f]),
         }
         for f in range(state.num_factions)
     }
 
 
-def run_turn_and_log(state, decide_buy, decide_movement, decide_cavalry, decide_target, decide_rectification,
-                      decide_resource_choice, rng=None):
+def run_turn_and_log(state, decide_buy_list, decide_movement_list, decide_cavalry_list, decide_target_list,
+                      decide_rectification_list, decide_resource_choice_list, rng):
     """Same as run_turn, but also returns a turn_record capturing enough
     to replay/visualize the turn: a full board snapshot at every one of
-    the turn's checkpoints (see CHECKPOINT_LABELS), the battle events,
-    and player stats at each checkpoint.
+    the turn's checkpoints (see CHECKPOINT_LABELS), and player stats at
+    each checkpoint. Single-game (batch_size=1) only - run.py's use case.
 
-    Deliberately simpler than engine/turn.py's run_turn_and_log: that
-    version stores a sparse keyframe once per turn plus a diff per
-    phase-step, reconstructed incrementally - built to keep replay file
-    size proportional to how much actually happens, a real concern for
-    large/long v1 games. This version just stores sparse_hexes(...)
-    (only occupied/city/battle hexes, but computed fresh, not as a diff
-    against the previous checkpoint) at every checkpoint independently -
-    no incremental reconstruction, no risk of a diffing bug, and at the
-    scale these games run at for now the size difference doesn't matter.
-    Revisit if replay files ever get large enough for that to change.
-    """
-    rng = rng or random.Random()
-    turn_number = state.turn_number
+    battle_events is NOT populated with per-roll detail here, unlike the
+    pre-batching-rewrite engine: its only consumer was hex_visualizer.py's
+    battle animation (compute_battle_table), which is deprecated -
+    rebuilding that level of structured logging for the batched battle
+    resolution (see battle.py's resolve_full_battle_batch, which tracks
+    aggregate kill-XP but not a round-by-round event log) wasn't worth
+    doing for a consumer that no longer exists. Left as an empty list
+    (the field still exists, for callers that only check its presence)
+    rather than removed, so board_state.json's shape doesn't change."""
+    assert state.batch_size == 1, "run_turn_and_log is single-game only"
+    F = state.num_factions
+    turn_number = int(state.turn_number[0])
 
-    # "Start" checkpoint: before this turn's Buy phase. Collect (gold/
-    # resources/VP) now runs at the END of a turn (see module docstring),
-    # so this snapshot already reflects the PREVIOUS turn's Collect
-    # output - there's no separate "before income" moment anymore, since
-    # Collect and the "Battle" checkpoint below now happen together.
+    # "Start" checkpoint: before this turn's Buy phase.
     checkpoints = [sparse_hexes(snapshot_hexes(state))]
     player_stats = [_player_stats_snapshot(state)]
 
-    buy_actions = {}
-    for faction in range(state.num_factions):
-        legal = get_legal_buy_actions(state, faction)
-        chosen = decide_buy[faction](state, faction, legal)
-        if chosen:
-            buy_actions[faction] = chosen
-    apply_buy_phase(state, buy_actions)
+    buy_args = _gather_buy_decisions(state, decide_buy_list)
+    apply_buy_phase_batch(state, *buy_args)
     checkpoints.append(sparse_hexes(snapshot_hexes(state)))
     player_stats.append(_player_stats_snapshot(state))
 
     for step in range(MOVEMENT_STEPS):
-        actions = {}
-        for faction in range(state.num_factions):
-            legal = legal_movement_mask(state, faction)
-            chosen = decide_movement[faction](state, faction, step, legal)
-            if chosen:
-                actions[faction] = chosen
-        apply_movement_step(state, actions, rng, cavalry_only=False)
+        actions = _gather_movement_actions(state, decide_movement_list, step, legal_movement_mask)
+        from_hex, direction, has_action = actions_from_dicts(actions, F, state.device)
+        apply_movement_step(state, from_hex, direction, has_action, rng, cavalry_only=False)
         checkpoints.append(sparse_hexes(snapshot_hexes(state)))
         player_stats.append(_player_stats_snapshot(state))
 
     for step in range(CAVALRY_STEPS):
-        actions = {}
-        for faction in range(state.num_factions):
-            legal = legal_cavalry_mask(state, faction)
-            chosen = decide_cavalry[faction](state, faction, step, legal)
-            if chosen:
-                actions[faction] = chosen
-        apply_movement_step(state, actions, rng, cavalry_only=True)
+        actions = _gather_movement_actions(state, decide_cavalry_list, step, legal_cavalry_mask)
+        from_hex, direction, has_action = actions_from_dicts(actions, F, state.device)
+        apply_movement_step(state, from_hex, direction, has_action, rng, cavalry_only=True)
         checkpoints.append(sparse_hexes(snapshot_hexes(state)))
         player_stats.append(_player_stats_snapshot(state))
 
-    battle_events = _run_battle_phase(state, decide_target, decide_rectification, rng)
+    _run_battle_phase(state, decide_target_list, decide_rectification_list, rng)
     apply_terrain_effects(state)
-    apply_collect_phase(state, decide_resource_choice)
+    apply_collect_phase(state, decide_resource_choice_list)
     checkpoints.append(sparse_hexes(snapshot_hexes(state)))
     player_stats.append(_player_stats_snapshot(state))
 
@@ -348,27 +405,7 @@ def run_turn_and_log(state, decide_buy, decide_movement, decide_cavalry, decide_
     turn_record = {
         "turn_number": turn_number,
         "checkpoints": checkpoints,
-        "battle_events": battle_events,
+        "battle_events": [],
         "player_stats": player_stats,
     }
     return state, turn_record
-
-
-def check_game_end(state, max_turns=None):
-    """True once the game should stop: the VP win condition has been hit
-    (see get_game_winner) - this is a rule, checked unconditionally. If
-    `max_turns` is given, it's purely an infra safety net against a
-    runaway/no-outposts-ever-built game, NOT part of the rules (there is
-    no turn timer anymore); omit it to let the game run until someone
-    actually wins."""
-    if get_game_winner(state) is not None:
-        return True
-    return max_turns is not None and state.turn_number >= max_turns
-
-
-def tally_final_score(state):
-    """The win condition IS the score now - just victory_points per
-    faction (see get_game_winner/apply_victory_points). Kept as its own
-    function for API parity with callers that want a final {faction:
-    score} dict."""
-    return {f: int(state.victory_points[f]) for f in range(state.num_factions)}

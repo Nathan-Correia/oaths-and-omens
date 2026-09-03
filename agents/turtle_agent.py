@@ -1,18 +1,16 @@
 """
 TurtleAgent for engine: greedy_agent's buy phase, rectification, and
-setup-phase policies as-is, heuristic_agent's battle targeting as-is (see
-those modules' docstrings), but NEVER voluntarily initiates a fight -
-movement is pure expansion, full stop. If there's nowhere left to expand
-(OUTPOST_CAP reached, or no hex on the board is currently legal to found
-on), it just sits still rather than falling back to attacking anything,
-unlike every other agent in this package.
+setup-phase policies as-is, heuristic_agent's battle targeting as-is, but
+NEVER voluntarily initiates a fight - movement is pure expansion, full
+stop. If there's nowhere left to expand (OUTPOST_CAP reached, or no hex
+on the board is currently legal to found on), it just sits still rather
+than falling back to attacking anything, unlike every other agent in
+this package.
 
 This exists to isolate a question heuristic_agent/greedy_agent's results
 couldn't answer on their own: is any of the attacking those two do
-actually profitable, or is a "denial" attack's average value close to (or
-below) zero once you account for the units it costs, in a game this
-tempo-driven? Comparing turtle head-to-head against heuristic (identical
-in every other respect) puts a number on exactly that gap. Turtle can
+actually profitable, or is a "denial" attack's average value close to
+(or below) zero once you account for the units it costs. Turtle can
 obviously still end up fighting - moving into a contested tile, or being
 attacked at its own capital/outposts - it just never chooses to start
 one.
@@ -20,7 +18,7 @@ one.
 
 import random
 
-import numpy as np
+import torch
 
 from .greedy_agent import _move_toward, greedy_buy, greedy_draft, greedy_placement, greedy_resource_choice, greedy_swap
 from .heuristic_agent import _best_expansion_target, heuristic_target
@@ -29,12 +27,12 @@ from .random_agent import random_rectification
 
 def turtle_move(state, faction, legal_mask):
     grid = state.grid
-    origins = np.nonzero(legal_mask.any(axis=1))[0]
+    origins = torch.nonzero(legal_mask.any(dim=1), as_tuple=False).flatten()
     if len(origins) == 0:
         return None
 
-    sizes = state.army_units[origins].sum(axis=1)
-    ranked = [int(origins[i]) for i in np.argsort(-sizes)]
+    sizes = state.army_units[0, origins].sum(dim=1)
+    ranked = [int(origins[i]) for i in torch.argsort(-sizes)]
 
     home_target = _best_expansion_target(state, faction)
     if home_target is None:
@@ -45,12 +43,11 @@ def turtle_move(state, faction, legal_mask):
 def make_turtle_agents(num_factions, seed=0):
     """Same 9-callback shape as the other make_X_agents. Buy/target/
     rectification/resource-choice/placement/draft/swap match
-    heuristic_agent's/greedy_agent's; movement is turtle_move (see
-    module docstring)."""
+    heuristic_agent's/greedy_agent's; movement is turtle_move."""
     rngs = {f: random.Random(seed * 1_000_003 + f) for f in range(num_factions)}
 
-    def decide_buy(state, faction, legal):
-        return greedy_buy(state, faction, legal, rngs[faction])
+    def decide_buy(state, faction):
+        return greedy_buy(state, faction, rngs[faction])
 
     def decide_movement(state, faction, step, legal_mask):
         return turtle_move(state, faction, legal_mask)

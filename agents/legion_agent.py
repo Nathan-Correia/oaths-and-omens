@@ -46,8 +46,6 @@ particular, fast/chaotic game).
 
 import random
 
-import numpy as np
-
 from .greedy_agent import greedy_buy, greedy_draft, greedy_placement, greedy_resource_choice, greedy_swap
 from .heuristic_agent import heuristic_target
 from .random_agent import random_rectification
@@ -72,7 +70,7 @@ def legion_move(state, faction, step, legal_mask, claimed):
     already claimed). Mutates `claimed` in place, adding whatever target
     this call ends up committing an army to."""
     grid = state.grid
-    mobile = sorted(int(h) for h in np.nonzero(legal_mask.any(axis=1))[0])
+    mobile = sorted(int(h) for h in legal_mask.any(dim=1).nonzero(as_tuple=False).flatten().tolist())
     if not mobile:
         return None
 
@@ -90,8 +88,8 @@ def legion_move(state, faction, step, legal_mask, claimed):
         target = min(pool, key=lambda c: hex_distance(origin_coord, c))
         if hex_distance(origin_coord, target) == 0:
             continue
-        legal_dirs = np.nonzero(legal_mask[origin])[0]
-        if len(legal_dirs) == 0:
+        legal_dirs = legal_mask[origin].nonzero(as_tuple=False).flatten().tolist()
+        if not legal_dirs:
             continue
         best_dir = min(
             legal_dirs,
@@ -112,8 +110,8 @@ def make_legion_agents(num_factions, seed=0):
     rngs = {f: random.Random(seed * 1_000_003 + f) for f in range(num_factions)}
     claimed = {f: set() for f in range(num_factions)}
 
-    def decide_buy(state, faction, legal):
-        return greedy_buy(state, faction, legal, rngs[faction])
+    def decide_buy(state, faction):
+        return greedy_buy(state, faction, rngs[faction])
 
     def decide_movement(state, faction, step, legal_mask):
         return legion_move(state, faction, step, legal_mask, claimed[faction])

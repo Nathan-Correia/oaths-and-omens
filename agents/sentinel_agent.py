@@ -56,8 +56,6 @@ an unproven one.
 
 import random
 
-import numpy as np
-
 from .greedy_agent import greedy_buy, greedy_draft, greedy_placement, greedy_resource_choice, greedy_swap
 from .heuristic_agent import heuristic_target
 from .random_agent import random_rectification
@@ -73,13 +71,13 @@ def _locked_own_cities(state, faction):
     target come next turn's movement phase (the battle will already be
     over by then)."""
     grid = state.grid
-    hexes = np.nonzero((state.city_owner == faction) & state.locked & ~state.is_capital)[0]
-    return [grid.coord_of(int(h)) for h in hexes]
+    hexes = ((state.city_owner[0] == faction) & state.locked[0] & ~state.is_capital[0]).nonzero(as_tuple=False).flatten().tolist()
+    return [grid.coord_of(h) for h in hexes]
 
 
 def sentinel_move(state, faction, step, legal_mask, total_steps=1):
     grid = state.grid
-    mobile = sorted(int(h) for h in np.nonzero(legal_mask.any(axis=1))[0])
+    mobile = sorted(int(h) for h in legal_mask.any(dim=1).nonzero(as_tuple=False).flatten().tolist())
     if not mobile:
         return None
 
@@ -90,8 +88,8 @@ def sentinel_move(state, faction, step, legal_mask, total_steps=1):
         for origin in ranked:
             origin_coord = grid.coord_of(origin)
             target = min(defense_targets, key=lambda c: hex_distance(origin_coord, c))
-            legal_dirs = np.nonzero(legal_mask[origin])[0]
-            if len(legal_dirs) == 0:
+            legal_dirs = legal_mask[origin].nonzero(as_tuple=False).flatten().tolist()
+            if not legal_dirs:
                 continue
             return origin, _best_direction(state, grid, origin, legal_dirs, target, steps_remaining)
 
@@ -105,8 +103,8 @@ def make_sentinel_agents(num_factions, seed=0):
     module docstring)."""
     rngs = {f: random.Random(seed * 1_000_003 + f) for f in range(num_factions)}
 
-    def decide_buy(state, faction, legal):
-        return greedy_buy(state, faction, legal, rngs[faction])
+    def decide_buy(state, faction):
+        return greedy_buy(state, faction, rngs[faction])
 
     def decide_movement(state, faction, step, legal_mask):
         return sentinel_move(state, faction, step, legal_mask, total_steps=MOVEMENT_STEPS)

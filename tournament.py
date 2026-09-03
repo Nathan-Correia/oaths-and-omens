@@ -7,6 +7,17 @@ dominant cost, and tournament-scale comparisons only care about the final
 winner/VP, not watching the game play out. play_game here just drives
 engine.turn.run_turn directly, turn after turn, with no logging.
 
+Each play_game call is a single (batch_size=1) game - see engine/turn.py's
+module docstring: agents stay per-game Python functions, and this harness
+mirrors that by running one game per call rather than batching many
+tournament games together. That's a real, deliberate scope choice, not an
+oversight: batching many games together (feeding a torch-batched training
+loop, say) is a different consumer of this same engine with different
+needs (see the plan's "explicitly deferred" section on auto-reset/
+experience-buffer design) - this harness's job is statistical comparison
+between agent policies via many independent CPU-run games, which doesn't
+need a shared batch dimension to do its job.
+
 AGENT_BUILDERS: {agent_key: make_X_agents} - add an entry here for every
 new agents/*.py module (each already exposes a make_X_agents(num_factions,
 seed) -> 9-tuple, the same shape run.py's build_fns use).
@@ -32,6 +43,8 @@ import random
 import time
 from collections import defaultdict
 
+import torch
+
 from agents import compose_agents
 from agents.random_agent import make_random_agents
 from agents.greedy_agent import make_greedy_agents
@@ -47,6 +60,7 @@ from agents.marshal_agent import make_marshal_agents
 from agents.tactician_agent import make_tactician_agents
 from engine.placement import run_city_setup
 from engine.setup import create_initial_state
+from engine.state import NO_FACTION
 from engine.turn import check_game_end, get_game_winner, run_turn
 
 AGENT_BUILDERS = {
@@ -81,7 +95,9 @@ def play_game(assignment, radius, num_factions, seed, max_turns=MAX_TURNS):
     """assignment: {faction: agent_key}. Returns {"winner", "turns",
     "vp": {faction: vp}}. `winner` is None only if max_turns was hit
     before anyone reached VP_TO_WIN."""
-    rng = random.Random(seed)
+    setup_rng = random.Random(seed)
+    gen = torch.Generator()
+    gen.manual_seed(seed)
     state = create_initial_state(radius=radius, num_factions=num_factions, seed=seed, terrain_log=None)
 
     keys = set(assignment.values())
@@ -90,18 +106,28 @@ def play_game(assignment, radius, num_factions, seed, max_turns=MAX_TURNS):
     (decide_buy, decide_movement, decide_cavalry, decide_target, decide_rectification, decide_resource_choice,
      decide_placement, decide_draft, decide_swap) = decide
 
-    state = run_city_setup(state, decide_placement, decide_draft, decide_swap, rng)
+    state = run_city_setup(state, decide_placement, decide_draft, decide_swap, setup_rng)
+
+    decide_buy_list = [decide_buy]
+    decide_movement_list = [decide_movement]
+    decide_cavalry_list = [decide_cavalry]
+    decide_target_list = [decide_target]
+    decide_rectification_list = [decide_rectification]
+    decide_resource_choice_list = [decide_resource_choice]
 
     turns = 0
-    while not check_game_end(state, max_turns=max_turns):
-        state = run_turn(state, decide_buy, decide_movement, decide_cavalry, decide_target,
-                          decide_rectification, decide_resource_choice, rng=rng)
+    while not bool(check_game_end(state, max_turns=max_turns)[0]):
+        state = run_turn(
+            state, decide_buy_list, decide_movement_list, decide_cavalry_list, decide_target_list,
+            decide_rectification_list, decide_resource_choice_list, gen,
+        )
         turns += 1
 
+    winner = int(get_game_winner(state)[0])
     return {
-        "winner": get_game_winner(state),
+        "winner": winner if winner != NO_FACTION else None,
         "turns": turns,
-        "vp": {f: int(state.victory_points[f]) for f in range(num_factions)},
+        "vp": {f: int(state.victory_points[0, f]) for f in range(num_factions)},
     }
 
 
