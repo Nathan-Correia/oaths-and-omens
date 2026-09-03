@@ -35,17 +35,26 @@ After every capital is settled, players may rearrange their starting positions t
 
 Each player begins the game with 50 silver and 2 kill experience, awarded once at the very first buy phase instead of that turn's regular income.
 
+## Turn Structure
+
+Each turn proceeds through four phases, in order:
+
+1. **Buy** — spend silver and resources accumulated from previous turns.
+2. **Movement** — regular movement, then cavalry movement.
+3. **Combat** — resolve any battles triggered by movement.
+4. **Collect** — gain this turn's silver income, resources, and victory points.
+
+Because income is collected at the *end* of the turn, the buy phase always spends silver left over from prior turns — you can never spend the silver you're about to earn this turn until your next buy phase.
+
 ## Economy & the Buy Phase
 
-Each turn begins with a buy phase, right after income is collected.
+**Income**: every player collects 3 silver per turn from their capital, plus 1 additional silver for each outpost they control, or 2 additional silver for each outpost they control that has a Barracks upgrade. Income is collected during the Collect phase (see Turn Structure). A player with no cities remaining earns no income and instead loses 1 unit every turn — in practice this can no longer happen, since your capital cannot be captured or destroyed (see Capitals).
 
-**Income**: every player collects 3 silver per turn. If a player controls more than 2 cities, they earn an additional 1 silver for every city beyond their second (your capital and any outposts you control both count as cities here). A player with no cities remaining earns no income and instead loses 1 unit every turn — in practice this can no longer happen, since your capital cannot be captured or destroyed (see Capitals).
-
-**Buying units**: infantry cost 2 silver each. Your capital can always recruit infantry, no matter what's adjacent to it. An outpost can only recruit infantry if no enemy units occupy a tile orthogonally adjacent to it, and is limited to at most 1 new infantry this way per turn; your capital has neither restriction (see Outposts). Cavalry and archers cannot be purchased with silver — they can only be acquired by trading in kill experience (see below).
+**Buying units**: infantry cost 2 silver each. Your capital can always recruit infantry, no matter what's adjacent to it. An outpost can only recruit infantry if no enemy units occupy a tile orthogonally adjacent to it, and is limited to at most 1 new infantry this way per turn, unless it has a Barracks upgrade (see Outpost Upgrades), which removes the 1-per-turn cap but not the adjacent-enemy restriction. Your capital has neither restriction. Cavalry and archers cannot be purchased with silver — they can only be acquired by trading in kill experience (see below).
 
 **Production limits**: each player may have at most 24 infantry, 12 cavalry, and 12 archers in play at once. This is a concurrent limit, not a lifetime total — losing a unit immediately frees up capacity to field another of that type.
 
-**Trading**: players may trade anything with each other — silver, kill experience, units, cities, and favours. Units and cities may only actually change hands during the buy phase.
+**Trading**: players may trade anything with each other — silver, kill experience, units, cities, resources, action cards, and favours. Units and cities may only actually change hands during the buy phase.
 
 ## Movement
 
@@ -139,20 +148,71 @@ If an attacker somehow wins that battle, ownership never changes hands. Instead,
 
 Outposts are smaller, disposable extensions of a player's territory — unlike a capital, they can be destroyed.
 
-**Building**: costs 3 silver and consumes 1 unit (any type) already standing on the tile you're building on. You may build as many outposts as you can afford and have the units/room for during a single buy phase, up to a maximum of 6 outposts per player at once.
+**Building**: costs 3 silver and consumes 1 unit (any type) already standing on the tile you're building on, up to a maximum of 6 outposts per player at once. A player may take at most one outpost action per turn during the buy phase, where an "outpost action" is either building a new outpost or upgrading/converting an existing one (see Outpost Upgrades) — never more than one of either, combined, per turn.
 
-**Placement restrictions**: an outpost cannot be built within 2 tiles of your own capital, within 1 tile of any other player's capital, or within 1 tile of any existing outpost — yours or anyone else's.
+**Placement restrictions**: an outpost cannot be built within 2 tiles of your own capital, within 1 tile of any other player's capital, or within 1 tile of any existing outpost — yours or anyone else's. Outposts may be built on any terrain type that is not impassable, including desert.
 
-**Recruiting**: infantry may be purchased at an outpost for 2 silver, same as at a capital, but only if no enemy units occupy a tile orthogonally adjacent to it, and at most 1 new infantry may be recruited per outpost per turn. A capital has neither restriction.
+**Recruiting**: infantry may be purchased at an outpost for 2 silver, same as at a capital, but only if no enemy units occupy a tile orthogonally adjacent to it, and at most 1 new infantry may be recruited per outpost per turn — unless the outpost has a Barracks upgrade (see Outpost Upgrades).
 
 **Destruction**: entering a tile with an enemy outpost is always treated as an attack and triggers a battle, even if the outpost has no defending army of its own. If, once the battle ends, no other faction's units remain on that tile besides the winner's, the outpost is destroyed — its owner loses it, and the winner does not take ownership of it, but does keep standing there as normal (no forced eviction, unlike a capital).
 
 **Defense**: an outpost gets 1 free defensive shot the instant its tile is attacked, before the first round of combat (11–20 = 1 kill, aimed at the single largest attacking army) — fired even with no defending army present, the same mechanic as a capital's defense but weaker, and tracked separately from it.
 
+### Outpost Upgrades
+
+An outpost may hold at most one upgrade at a time. Upgrades are mutually exclusive — to change an outpost from one upgrade to another, pay the new upgrade's full cost, which converts it directly (no need to strip the old upgrade first). Building an outpost, upgrading an unupgraded outpost, and converting an outpost from one upgrade to another are all "outpost actions" and are each subject to the one-per-turn limit described above.
+
+Upgrade costs:
+
+| Upgrade | Cost |
+|---|---|
+| **Barracks** | 2 Fish, 4 Wood |
+| **Workshop** | 2 Iron, 2 Clay, 4 Wood |
+| **Temple** | 2 Fish, 2 Iron, 2 Clay, 4 Wood |
+
+There are three outpost upgrades:
+
+- **Barracks**: removes the 1-infantry-per-turn recruiting cap at that outpost (the no-adjacent-enemy restriction still applies), and increases that outpost's silver income contribution from 1 to 2 per turn.
+- **Temple**: adds +1 to the player's total victory-point-per-round output (see Win Condition), on top of what the outpost formula would otherwise produce.
+- **Workshop**: doubles that outpost's resource output — 2 of its resource per turn instead of 1 (see Resources).
+
+Note that converting an outpost directly from one upgrade to another still requires paying the new upgrade's full cost.
+
+## Resources
+
+Outposts generate resources every turn, collected during the Collect phase. There are four resource types: **Wood**, **Iron**, **Clay**, and **Fish**. Capitals never generate resources — only outposts do.
+
+An outpost's resource output is determined by its own tile and its adjacent (orthogonally neighboring) tiles, as follows:
+
+- If the outpost is on a **plains** tile, it produces 1 Wood per turn.
+- If the outpost is on a **marsh** tile, it produces 1 Clay per turn.
+- If the outpost is adjacent to a **mountain**, it produces 1 Iron per turn instead of whatever its own tile would produce.
+- If the outpost is adjacent to a **lake**, it produces 1 Fish per turn instead of whatever its own tile would produce.
+- If the outpost is adjacent to both a mountain and a lake, its owner chooses each turn whether it produces Iron or Fish.
+- If the outpost is on a **desert** tile and is not adjacent to a mountain or lake, it produces no resources.
+
+An outpost only ever produces one resource type per turn, regardless of how many qualifying neighboring tiles it has (e.g. being adjacent to two mountains does not produce 2 Iron). A Workshop upgrade doubles the single resource's output to 2 per turn, but does not grant a second resource type.
+
+Resources may be spent to play action cards, to pay outpost upgrade costs, or traded to other players.
+
+## Action Cards
+
+A player may purchase at most 1 action card per turn, for 1 silver, taken at random from the top of the action card deck. Action cards are kept face-up, visible to all players at all times.
+
+To play a card from hand, the player pays that card's resource cost and meets any other requirements listed on the card, after which the card is discarded. If the action card deck is ever emptied, the discard pile is shuffled to form a new deck.
+
+The specific pool of action cards and their effects are still being finalized — see Open Items.
+
 ## Win Condition
 
 Victory points are the win condition. The first player to reach 50 wins.
 
-At the end of every round, each player earns victory points based on how many outposts they currently control — the first one earns nothing, and each additional outpost beyond that earns 1 more point per round: 2 outposts earns 1 VP/round, 3 earns 2 VP/round, 4 earns 3 VP/round, and so on. Destroying another player's outpost also immediately awards the winner of that battle 2 victory points, on top of the recurring per-round total.
+At the end of every round, each player earns victory points based on how many outposts they currently control — the first one earns nothing, and each additional outpost beyond that earns 1 more point per round: 2 outposts earns 1 VP/round, 3 earns 2 VP/round, 4 earns 3 VP/round, and so on. Each outpost with a Temple upgrade adds +1 to this total. Destroying another player's outpost also immediately awards the winner of that battle 2 victory points, on top of the recurring per-round total.
 
 If, at the end of a round, one or more players are at or above 50 victory points, whoever has the single highest total wins immediately. If the top total is exactly tied between two or more players, whoever of them placed their capital later during setup wins the tiebreak.
+
+## Open Items
+
+The following are intentionally undecided and need values before the game is playable:
+
+- The full action card list and each card's specific effects and resource costs.
