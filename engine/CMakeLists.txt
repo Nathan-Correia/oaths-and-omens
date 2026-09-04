@@ -36,9 +36,16 @@ else()
 endif()
 
 # --- core library -----------------------------------------------------------
-# Header-only so far (rng.hpp). Sources get added here as modules land.
-add_library(oo_core INTERFACE)
-target_include_directories(oo_core INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+# Sources get added here as modules land. rng.hpp stays header-only (it is small
+# and hot enough to want inlined).
+add_library(oo_core STATIC
+  src/grid.cpp
+  src/state.cpp
+  src/state_io.cpp
+  src/terrain.cpp
+  src/collect.cpp
+)
+target_include_directories(oo_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 # --- tests ------------------------------------------------------------------
 enable_testing()
@@ -57,3 +64,13 @@ target_link_libraries(test_rng_stress PRIVATE oo_core)
 
 add_test(NAME rng_stress
          COMMAND test_rng_stress ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/rng_stress.txt)
+
+add_executable(test_grid tests/test_grid.cpp)
+target_link_libraries(test_grid PRIVATE oo_core)
+add_test(NAME grid_parity
+         COMMAND test_grid ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/grid_golden.txt)
+
+add_executable(test_phases tests/test_phases.cpp)
+target_link_libraries(test_phases PRIVATE oo_core)
+add_test(NAME phase_parity
+         COMMAND test_phases ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/phase_cases.txt)

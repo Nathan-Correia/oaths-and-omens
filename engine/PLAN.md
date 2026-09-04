@@ -307,6 +307,49 @@ mapping is not. Old seeds no longer reproduce their old boards, so any saved
 `board_state.json` or hardcoded debugging seed refers to a map that no longer
 regenerates.
 
+### 3.3a Phase parity harness — DONE (built during M2)
+
+The infrastructure §3.3 calls for, in its first working form:
+
+- **`src/state_io.cpp` + `tools/state_io.py`** — one canonical text serialization of
+  a whole state, written by both engines. Battle contributions are stored sparsely
+  (occupied slots only), since a dense [331][16] dump would be almost all padding.
+  Text rather than binary because these files get read by a human the moment
+  anything disagrees.
+- **`compare_states`** reports the *first* differing field with its index
+  (`army_units[15][0]: got 1, want 2`) rather than a bare boolean.
+- **`validate_state`** checks the invariants from §4.5 independently of any
+  comparison: battle storage agrees with `battle_order`/`locked`, occupied battle
+  slots are contiguous from 0, no army stands on impassable terrain, peaceful
+  stacks respect the 6-unit cap. Every Python-produced input state is run through
+  it too — if the reference violates our invariants, either the invariants or the
+  reader is wrong, and either way it needs knowing.
+- **`tools/dump_phase_cases.py`** emits (before, after) pairs per phase.
+- **`tools/_bootstrap.py`** aliases `engine/engine_old/` back to `engine.*` so the
+  frozen reference and `agents/` import unmodified. Order matters — aliasing
+  before importing the submodules sends the import machinery into infinite
+  recursion.
+
+**Two lessons worth carrying into M3, both learned the hard way here:**
+
+1. **Measure what the cases actually exercise; do not trust a green result.** The
+   first version of this suite reported 350/350 passing. It was nearly worthless:
+   random-agent games build no outposts, so `resource_income` and
+   `victory_points` changed *nothing* in 100% of cases, and not one outpost
+   upgrade of any type appeared anywhere in the corpus. The fix was to generate
+   from greedy games as well (which do build) and to have the perturbation *build*
+   outposts rather than only re-roll upgrades on ones that already existed.
+   Coverage now, per phase, as a fraction of cases where the phase changes state:
+   collect 100%, gold_income 100%, resource_income 74%, terrain 67%,
+   victory_points 70% — with 7 014 upgrade slots across all three types, 541
+   armies on desert, 435 frozen stacks, 180 states holding a pending battle, and
+   103 faction-instances holding zero cities.
+2. **Mutation-test the suite.** Four plausible bugs were introduced one at a time
+   and every one was caught by a wide margin: flat per-outpost VP instead of
+   `max(0, n-1)` → 287 failures; mountains yielding clay instead of iron → 231;
+   the Barracks gold bonus ignored → 221; desert attrition ignoring the
+   city exemption → 306. A suite that has never been seen to fail is not evidence.
+
 ### 3.3 Golden traces
 
 - `tools/dump_trace.py` — runs `engine_old` with a given seed and agent assignment,
@@ -357,6 +400,15 @@ Immutable per-radius data, built once and shared by every state and thread
 
 Cache built grids in a `map<radius, HexGrid>` behind a mutex, or build eagerly for
 the radii in use. Never mutable after construction — that is the multicore contract.
+
+**Done (M2).** `index_of` is a closed-form inverse of the enumeration via a
+column-offset prefix sum, so it is O(1) rather than engine_old's dict lookup.
+Checked against Python at every radius 0–10: coordinate assignment, neighbour
+table, edge ring, full distance-matrix row sums plus sampled exact rows — 43 105
+checks. Plus reference-free properties: `index_of`/`coord_of` round-trip,
+adjacency symmetric, every neighbour at distance exactly 1, `direction_between`
+inverting the neighbour lookup, and off-board/non-cube coordinates rejected rather
+than aliasing onto a real hex.
 
 ### 4.3 `state.hpp`
 
@@ -661,7 +713,7 @@ Not to be built yet, but the constraints above exist to make it a small change:
 |---|---|---|
 | ~~M0~~ | ~~Toolchain, pybind11 zero-copy view smoke test~~ | **done — §2** |
 | ~~M1~~ | ~~`rng.hpp` matches CPython~~ | **done — 4 617 edge-case checks + 10⁷ draws over 10⁴ seeds, 0 failures (§3.1)** |
-| M2 | Grid + state + terrain + collect | unit tests + parity |
+| ~~M2~~ | ~~Grid + state + terrain + collect~~ | **done — 43 105 grid checks over 11 radii; 970 phase cases, 0 failures; 4/4 mutations caught (§3.3a)** |
 | M3 | buy + movement + battle + turn | full-game parity, random agent, 1000 seeds |
 | M4 | setup + placement | full-pipeline parity from seed alone |
 | M5 | Bindings; `run.py` / `tournament.py` unmodified | identical results, ~2x |
