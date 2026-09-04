@@ -20,6 +20,7 @@
 #pragma once
 
 #include "oo/actions.hpp"
+#include "oo/log_fwd.hpp"
 #include "oo/rng.hpp"
 #include "oo/state.hpp"
 
@@ -69,8 +70,12 @@ using TargetFn = int (*)(const GameState& state, int hex_index, int faction, voi
 // Runs the whole battle to completion, in place, crediting kill-XP as units die.
 // `infantry_counts` is a running per-faction tally the CALLER maintains and shares
 // across every battle in the turn - that sharing is why battle order matters.
+// `log`, when non-null, receives the full structured record of the battle for
+// replay. Threading it through the ONE implementation (rather than writing a
+// second, logging variant) is deliberate: two copies of this would drift, and
+// the roll order here is the most parity-sensitive code in the engine.
 void resolve_full_battle(GameState& state, int hex_index, TargetFn target_fn, void* ctx, Rng& rng,
-                         int32_t infantry_counts[MAX_FACTIONS]);
+                         int32_t infantry_counts[MAX_FACTIONS], BattleLog* log = nullptr);
 
 // After a battle resolves, if the winning stack exceeds `cap`, the winner sends
 // the excess back to their own contributing origin hexes. Units whose origin is

@@ -53,10 +53,15 @@ add_library(oo_core STATIC
   src/agent_util.cpp
   src/agents.cpp
   src/game.cpp
+  src/turn_log.cpp
+  src/json.cpp
 )
 target_include_directories(oo_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 # --- apps (the eventual replacements for run.py / tournament.py) ------------
+add_executable(oo_run apps/oo_run.cpp)
+target_link_libraries(oo_run PRIVATE oo_core)
+
 add_executable(oo_tournament apps/oo_tournament.cpp)
 target_link_libraries(oo_tournament PRIVATE oo_core)
 
@@ -105,6 +110,11 @@ add_executable(test_phases tests/test_phases.cpp)
 target_link_libraries(test_phases PRIVATE oo_core)
 add_test(NAME phase_parity
          COMMAND test_phases ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/phase_cases.txt)
+
+add_executable(test_replay tests/test_replay.cpp)
+target_link_libraries(test_replay PRIVATE oo_core)
+add_test(NAME replay_parity
+         COMMAND test_replay ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/replay_hashes.txt)
 
 add_executable(test_agents tests/test_agents.cpp)
 target_link_libraries(test_agents PRIVATE oo_core)

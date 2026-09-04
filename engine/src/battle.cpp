@@ -1,5 +1,7 @@
 #include "oo/battle.hpp"
 
+#include "oo/log.hpp"
+
 #include <cassert>
 
 namespace oo {
@@ -42,7 +44,7 @@ int kills_for_roll(int roll, int attacker_total_units) {
 // log and credits from it afterwards; crediting inline is equivalent, and the
 // structured log lands with the replay logging in M6c).
 void apply_kills_to_faction(GameState& state, int hex_index, int target_faction, int num_kills,
-                            int killer_faction) {
+                            int killer_faction, std::vector<DeathEntry>* deaths) {
     int remaining = num_kills;
     const int nslots = state.battle_nslots[hex_index];
     for (int p = 0; p < NUM_UNIT_TYPES && remaining > 0; ++p) {
@@ -55,6 +57,12 @@ void apply_kills_to_faction(GameState& state, int hex_index, int target_faction,
                 state.battle_units[hex_index][k][ut] = static_cast<int16_t>(available - take);
                 remaining -= take;
                 state.kill_xp[killer_faction] += take;
+                if (deaths != nullptr) {
+                    deaths->push_back(DeathEntry{static_cast<int8_t>(target_faction),
+                                                 static_cast<int8_t>(ut),
+                                                 static_cast<int16_t>(take),
+                                                 static_cast<int8_t>(killer_faction)});
+                }
             }
         }
     }
@@ -75,10 +83,21 @@ int cavalry_of(const GameState& state, int hex_index, int faction) {
 // infantry joining the same battle immediately - which can keep an otherwise
 // defeated army in the fight - subject to the concurrent infantry cap.
 void roll_dismounts(GameState& state, int hex_index, int faction, int died_count, Rng& rng,
-                    int32_t infantry_counts[MAX_FACTIONS]) {
+                    int32_t infantry_counts[MAX_FACTIONS],
+                    std::vector<DismountEntry>* dismounts) {
     for (int i = 0; i < died_count; ++i) {
-        if (rng.randint(1, 20) < 14) continue;
-        if (infantry_counts[faction] >= kSpawnCaps[kInfantry]) continue;
+        if (rng.randint(1, 20) < 14) {
+            if (dismounts != nullptr) {
+                dismounts->push_back(DismountEntry{static_cast<int8_t>(faction), false, false});
+            }
+            continue;
+        }
+        if (infantry_counts[faction] >= kSpawnCaps[kInfantry]) {
+            if (dismounts != nullptr) {
+                dismounts->push_back(DismountEntry{static_cast<int8_t>(faction), false, true});
+            }
+            continue;
+        }
         const int nslots = state.battle_nslots[hex_index];
         for (int k = 0; k < nslots; ++k) {
             if (state.battle_faction[hex_index][k] == faction) {
@@ -87,6 +106,9 @@ void roll_dismounts(GameState& state, int hex_index, int faction, int died_count
             }
         }
         infantry_counts[faction] += 1;
+        if (dismounts != nullptr) {
+            dismounts->push_back(DismountEntry{static_cast<int8_t>(faction), true, false});
+        }
     }
 }
 
@@ -95,18 +117,23 @@ void roll_dismounts(GameState& state, int hex_index, int faction, int died_count
 // rolls dismounts, so it does this in two steps of its own.
 void apply_kills_and_dismounts(GameState& state, int hex_index, int target_faction, int num_kills,
                                int killer_faction, Rng& rng,
-                               int32_t infantry_counts[MAX_FACTIONS]) {
+                               int32_t infantry_counts[MAX_FACTIONS],
+                               std::vector<DeathEntry>* deaths,
+                               std::vector<DismountEntry>* dismounts) {
     const int before = cavalry_of(state, hex_index, target_faction);
-    apply_kills_to_faction(state, hex_index, target_faction, num_kills, killer_faction);
+    apply_kills_to_faction(state, hex_index, target_faction, num_kills, killer_faction, deaths);
     const int after = cavalry_of(state, hex_index, target_faction);
-    roll_dismounts(state, hex_index, target_faction, before - after, rng, infantry_counts);
+    roll_dismounts(state, hex_index, target_faction, before - after, rng, infantry_counts,
+                   dismounts);
 }
 
 // A capital or outpost gets free defensive shots against whoever is attacking its
 // tile, even with no units there to defend with. Same 11-20 math as the Archers
 // ability but a deliberately separate mechanic, so the two can be tuned apart.
 void apply_structure_defense_shots(GameState& state, int hex_index, Rng& rng,
-                                   int32_t infantry_counts[MAX_FACTIONS]) {
+                                   int32_t infantry_counts[MAX_FACTIONS],
+                                   std::vector<DeathEntry>* deaths,
+                                   std::vector<DismountEntry>* dismounts) {
     const int owner = state.city_owner[hex_index];
     if (owner == NO_FACTION) return;
 
@@ -133,7 +160,8 @@ void apply_structure_defense_shots(GameState& state, int hex_index, Rng& rng,
         if (rng.randint(1, 20) >= 11) ++kills;
     }
     if (kills > 0) {
-        apply_kills_and_dismounts(state, hex_index, target, kills, owner, rng, infantry_counts);
+        apply_kills_and_dismounts(state, hex_index, target, kills, owner, rng, infantry_counts,
+                                  deaths, dismounts);
     }
 }
 
@@ -141,7 +169,9 @@ void apply_structure_defense_shots(GameState& state, int hex_index, Rng& rng,
 // fire - a stationary defender's archers do not roll at all - but targeting still
 // weighs each side's full strength, moved or not.
 void apply_archer_abilities(GameState& state, int hex_index, Rng& rng,
-                            int32_t infantry_counts[MAX_FACTIONS]) {
+                            int32_t infantry_counts[MAX_FACTIONS],
+                            std::vector<DeathEntry>* deaths,
+                            std::vector<DismountEntry>* dismounts) {
     FactionTotals totals, moved;
     faction_totals(state, hex_index, totals);
     faction_moved_totals(state, hex_index, moved);
@@ -175,14 +205,15 @@ void apply_archer_abilities(GameState& state, int hex_index, Rng& rng,
         }
         if (kills > 0) {
             apply_kills_and_dismounts(state, hex_index, target, kills, faction, rng,
-                                      infantry_counts);
+                                      infantry_counts, deaths, dismounts);
         }
     }
 }
 
 // One full round: conflicts, rolls, simultaneous kills, then dismounts.
 void resolve_round(GameState& state, int hex_index, const int target_choices[MAX_FACTIONS],
-                   const FactionTotals& order, Rng& rng, int32_t infantry_counts[MAX_FACTIONS]) {
+                   const FactionTotals& order, Rng& rng, int32_t infantry_counts[MAX_FACTIONS],
+                   RoundLog* log) {
     FactionTotals totals;
     faction_totals(state, hex_index, totals);
 
@@ -192,6 +223,16 @@ void resolve_round(GameState& state, int hex_index, const int target_choices[MAX
     // LOWEST faction id (Python maximizes on (units, -faction)).
     // Resolved pairs are built in first-appearance order of each TARGET, which is
     // then the roll order below.
+    if (log != nullptr) {
+        // target_choices_submitted: every living faction, in first-appearance
+        // order, with its choice (-1 for an abstain, which serializes as null).
+        for (int i = 0; i < order.count; ++i) {
+            if (order.total_for(i) <= 0) continue;
+            log->choice_faction.push_back(order.faction[i]);
+            log->choice_target.push_back(static_cast<int8_t>(target_choices[order.faction[i]]));
+        }
+    }
+
     int attacker_of[MAX_FACTIONS];
     int target_of[MAX_FACTIONS];
     int n_resolved = 0;
@@ -225,6 +266,10 @@ void resolve_round(GameState& state, int hex_index, const int target_choices[MAX
         attacker_of[n_resolved] = winner;
         target_of[n_resolved] = target;
         ++n_resolved;
+        if (log != nullptr) {
+            log->resolved_attacker.push_back(static_cast<int8_t>(winner));
+            log->resolved_target.push_back(static_cast<int8_t>(target));
+        }
     }
 
     // --- rolls -------------------------------------------------------------
@@ -240,6 +285,11 @@ void resolve_round(GameState& state, int hex_index, const int target_choices[MAX
         if (attacker_units <= 0) continue;
         const int roll = static_cast<int>(rng.randint(1, 20));
         const int kills = kills_for_roll(roll, attacker_units);
+        if (log != nullptr) {
+            log->roll_faction.push_back(static_cast<int8_t>(attacker));
+            log->roll_value.push_back(static_cast<int16_t>(roll));
+            log->kills_dealt.push_back(static_cast<int16_t>(kills));
+        }
         if (kills > 0) {
             pending_target[n_pending] = target_of[i];
             pending_kills[n_pending] = kills;
@@ -256,7 +306,8 @@ void resolve_round(GameState& state, int hex_index, const int target_choices[MAX
     for (int i = 0; i < n_pending; ++i) {
         const int target = pending_target[i];
         const int before = cavalry_of(state, hex_index, target);
-        apply_kills_to_faction(state, hex_index, target, pending_kills[i], pending_killer[i]);
+        apply_kills_to_faction(state, hex_index, target, pending_kills[i], pending_killer[i],
+                               log != nullptr ? &log->deaths : nullptr);
         const int after = cavalry_of(state, hex_index, target);
         const int died = before - after;
         if (died <= 0) continue;
@@ -275,7 +326,7 @@ void resolve_round(GameState& state, int hex_index, const int target_choices[MAX
     // --- dismounts, in first-death order -----------------------------------
     for (int d = 0; d < n_died; ++d) {
         roll_dismounts(state, hex_index, cav_died_faction[d], cav_died_count[d], rng,
-                       infantry_counts);
+                       infantry_counts, log != nullptr ? &log->dismounts : nullptr);
     }
 
     state.battle_round[hex_index] += 1;
@@ -326,9 +377,13 @@ int get_winner(const GameState& state, int hex_index) {
 }
 
 void resolve_full_battle(GameState& state, int hex_index, TargetFn target_fn, void* ctx, Rng& rng,
-                         int32_t infantry_counts[MAX_FACTIONS]) {
-    apply_structure_defense_shots(state, hex_index, rng, infantry_counts);
-    apply_archer_abilities(state, hex_index, rng, infantry_counts);
+                         int32_t infantry_counts[MAX_FACTIONS], BattleLog* log) {
+    apply_structure_defense_shots(state, hex_index, rng, infantry_counts,
+                                  log ? &log->structure_phase : nullptr,
+                                  log ? &log->structure_dismounts : nullptr);
+    apply_archer_abilities(state, hex_index, rng, infantry_counts,
+                           log ? &log->archer_phase : nullptr,
+                           log ? &log->archer_dismounts : nullptr);
 
     int rounds_run = 0;
     while (!is_battle_over(state, hex_index) && rounds_run < kMaxRoundsSafetyCap) {
@@ -342,7 +397,9 @@ void resolve_full_battle(GameState& state, int hex_index, TargetFn target_fn, vo
             target_choices[order.faction[i]] = target_fn(state, hex_index, order.faction[i], ctx);
         }
 
-        resolve_round(state, hex_index, target_choices, order, rng, infantry_counts);
+        if (log != nullptr) log->rounds.emplace_back();
+        resolve_round(state, hex_index, target_choices, order, rng, infantry_counts,
+                      log != nullptr ? &log->rounds.back() : nullptr);
         ++rounds_run;
     }
 }

@@ -14,6 +14,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -110,12 +111,165 @@ int run_bench() {
     return 0;
 }
 
+// tournament.py's _rank_of: 1 + how many factions scored strictly higher.
+int rank_of(const oo::GameResult& r, int faction, int num_factions) {
+    int rank = 1;
+    for (int f = 0; f < num_factions; ++f) {
+        if (r.victory_points[f] > r.victory_points[faction]) ++rank;
+    }
+    return rank;
+}
+
+// Builds the per-faction agents for one game, taking each seat from a full set of
+// its own kind. Building the full set matters: an agent's generator is seeded
+// from the faction index, so seat f's agent must come from a set built for f.
+void assemble(oo::AgentSet& out, const std::vector<oo::AgentKind>& per_seat, int num_factions,
+              int64_t seed) {
+    out.num_factions = num_factions;
+    std::vector<oo::AgentSet> built(per_seat.size());
+    std::vector<bool> made(per_seat.size(), false);
+    for (int f = 0; f < num_factions; ++f) {
+        for (size_t k = 0; k < per_seat.size(); ++k) {
+            if (per_seat[f] != per_seat[k] || made[k]) continue;
+            oo::build_agents(built[k], per_seat[k], num_factions, seed);
+            made[k] = true;
+            break;
+        }
+    }
+    for (int f = 0; f < num_factions; ++f) {
+        for (size_t k = 0; k < per_seat.size(); ++k) {
+            if (made[k] && per_seat[k] == per_seat[f] && built[k].agents[f]) {
+                out.agents[f] = std::move(built[k].agents[f]);
+                break;
+            }
+        }
+    }
+}
+
+// challenger holds ONE seat, baseline fills the rest. The challenger's seat
+// rotates with the game index, cancelling out the fact that placement/draft order
+// - and therefore which capital you land, and the settle-order tiebreak - is not
+// perfectly symmetric across seats.
+int run_matchup(const std::string& challenger, const std::string& baseline, int num_games,
+                int radius, int num_factions, int max_turns) {
+    oo::AgentKind ck, bk;
+    if (!oo::agent_kind_from_name(challenger.c_str(), ck) ||
+        !oo::agent_kind_from_name(baseline.c_str(), bk)) {
+        std::fprintf(stderr, "unknown agent\n");
+        return 2;
+    }
+    int wins = 0, no_winner = 0;
+    long long vp_sum = 0, rank_sum = 0, turns_sum = 0;
+    for (int g = 0; g < num_games; ++g) {
+        const int seat = g % num_factions;
+        const int seed = g;
+        std::vector<oo::AgentKind> per_seat(num_factions, bk);
+        per_seat[seat] = ck;
+        oo::AgentSet agents;
+        assemble(agents, per_seat, num_factions, seed);
+
+        const oo::GameResult r = oo::play_game(agents, radius, num_factions, seed, max_turns);
+        vp_sum += r.victory_points[seat];
+        rank_sum += rank_of(r, seat, num_factions);
+        turns_sum += r.turns;
+        if (r.winner == seat) ++wins;
+        if (r.winner < 0) ++no_winner;
+    }
+    std::printf("%14s vs %-10s [r=%2d,f=%d] win_rate=%5.1f%% avg_vp=%5.1f avg_rank=%.2f "
+                "avg_turns=%5.1f",
+                challenger.c_str(), baseline.c_str(), radius, num_factions,
+                100.0 * wins / num_games, double(vp_sum) / num_games,
+                double(rank_sum) / num_games, double(turns_sum) / num_games);
+    if (no_winner) std::printf(" no_winner=%d", no_winner);
+    std::printf("\n");
+    return 0;
+}
+
+// One seat per distinct kind, cycling if there are more seats than kinds, with the
+// assignment rotated by game so each kind samples every seat roughly evenly.
+int run_ffa(const std::vector<std::string>& keys, int num_games, int radius, int num_factions,
+            int max_turns) {
+    std::vector<oo::AgentKind> kinds;
+    for (const std::string& k : keys) {
+        oo::AgentKind kind;
+        if (!oo::agent_kind_from_name(k.c_str(), kind)) {
+            std::fprintf(stderr, "unknown agent %s\n", k.c_str());
+            return 2;
+        }
+        kinds.push_back(kind);
+    }
+    const int n_kinds = static_cast<int>(keys.size());
+    std::vector<int> seats(n_kinds, 0), wins(n_kinds, 0);
+    std::vector<long long> vp(n_kinds, 0), rank(n_kinds, 0);
+    long long turns_sum = 0;
+
+    for (int g = 0; g < num_games; ++g) {
+        const int rotation = g % n_kinds;
+        const int seed = g;
+        std::vector<int> which(num_factions);
+        std::vector<oo::AgentKind> per_seat(num_factions);
+        for (int f = 0; f < num_factions; ++f) {
+            which[f] = (f + rotation) % n_kinds;
+            per_seat[f] = kinds[which[f]];
+        }
+        oo::AgentSet agents;
+        assemble(agents, per_seat, num_factions, seed);
+
+        const oo::GameResult r = oo::play_game(agents, radius, num_factions, seed, max_turns);
+        turns_sum += r.turns;
+        for (int f = 0; f < num_factions; ++f) {
+            const int k = which[f];
+            ++seats[k];
+            vp[k] += r.victory_points[f];
+            rank[k] += rank_of(r, f, num_factions);
+            if (r.winner == f) ++wins[k];
+        }
+    }
+    std::printf("%-12s %6s %9s %8s %9s\n", "agent", "seats", "win_rate", "avg_vp", "avg_rank");
+    for (int k = 0; k < n_kinds; ++k) {
+        std::printf("%-12s %6d %8.1f%% %8.1f %9.2f\n", keys[k].c_str(), seats[k],
+                    seats[k] ? 100.0 * wins[k] / seats[k] : 0.0,
+                    seats[k] ? double(vp[k]) / seats[k] : 0.0,
+                    seats[k] ? double(rank[k]) / seats[k] : 0.0);
+    }
+    std::printf("avg_turns=%.1f\n", double(turns_sum) / num_games);
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     const std::string mode = argc > 1 ? argv[1] : "matrix";
     if (mode == "matrix") return run_matrix();
     if (mode == "bench") return run_bench();
-    std::fprintf(stderr, "usage: oo_tournament [matrix|bench]\n");
+
+    // Defaults mirror tournament.py's DEFAULT_SIZE and MAX_TURNS.
+    int radius = 7, num_factions = 8, num_games = 100, max_turns = 200;
+    std::vector<std::string> rest;
+    for (int i = 2; i < argc; ++i) {
+        const std::string a = argv[i];
+        auto next = [&]() { return (i + 1 < argc) ? argv[++i] : ""; };
+        if (a == "--radius") radius = std::atoi(next());
+        else if (a == "--factions") num_factions = std::atoi(next());
+        else if (a == "--games") num_games = std::atoi(next());
+        else if (a == "--max-turns") max_turns = std::atoi(next());
+        else rest.push_back(a);
+    }
+
+    if (mode == "matchup") {
+        if (rest.size() != 2) {
+            std::fprintf(stderr, "usage: oo_tournament matchup <challenger> <baseline> [opts]\n");
+            return 2;
+        }
+        return run_matchup(rest[0], rest[1], num_games, radius, num_factions, max_turns);
+    }
+    if (mode == "ffa") {
+        if (rest.empty()) {
+            std::fprintf(stderr, "usage: oo_tournament ffa <agent>... [opts]\n");
+            return 2;
+        }
+        return run_ffa(rest, num_games, radius, num_factions, max_turns);
+    }
+    std::fprintf(stderr, "usage: oo_tournament [matrix|bench|matchup|ffa]\n");
     return 2;
 }

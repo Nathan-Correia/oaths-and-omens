@@ -120,7 +120,8 @@ engine-that-lives-inside-Python would do:
 | `web_visualizer.html` | **survives untouched** — pure JS, loads `board_state.json` from a file picker. No Python anywhere in it. The only visualizer going forward. |
 | `hex_visualizer.py`, `city_placement_visualizer.py`, `hex_gen_visualizer.py` | **deprecated and deleted** (commit `1e21ffd`). Not ported. |
 | `hex_common.py` | orphaned by that deletion — nothing imports it any more. Delete. |
-| `run.py`, `tournament.py` | replaced by `oo_run` / `oo_tournament` |
+| ~~`run.py`~~ | **deleted at M6c** - replaced by `oo_run` |
+| `tournament.py` | still drives the M5 gate; goes at M8, replaced by `oo_tournament` |
 | `engine_old/`, `agents/` | parity oracles; deleted or archived at M8 |
 | numpy | only ever reached through the bindings — gone with them |
 
@@ -923,6 +924,57 @@ caught it — and then the comparator, pointed at that specific seed and run to 
 turns, located the exact decision. Neither alone would have been enough: one has
 the reach, the other has the resolution.
 
+### 6.8 M6c result — DONE
+
+`oo_run` and `oo_tournament` are the native replacements for `run.py` and
+`tournament.py`, and all three replay files are written from C++. **`run.py` is
+deleted** — it had been non-functional since M5 (it needs `run_turn_and_log`,
+which §1.2 deliberately kept out of the binding layer) and `oo_run` supersedes it.
+`tournament.py` stays for now: it is what `compare_engines.py` drives for the M5
+gate, and it goes at M8 with the rest.
+
+**The gate: 120/120 files byte-identical** — 5 configurations × 8 seeds × 3 files,
+compared byte for byte against Python's `json.dump` output, not "semantically
+equal". Byte-identity is the only standard that can still be checked once Python
+is gone, and it catches key-order and separator drift a dict comparison would
+accept. Matching it meant reproducing json.dump's defaults exactly: `", "` and
+`": "` separators, no indent, insertion-ordered keys (never sorted), and integer
+dict keys rendered as strings.
+
+`test_replay` keeps this in ctest without needing Python, by goldening SHA-256
+hashes rather than the files (one `board_state.json` is ~270 KB).
+
+**Coverage is reported, not assumed.** A byte-identical result over a corpus that
+never produces a `"reason": "cap"` dismount or a temple upgrade would not have
+tested those paths at all — the §3.3a trap. `compare_replay_json.py` therefore
+prints what the compared corpus exercised, and warns about anything it never hit:
+
+| branch | count | branch | count |
+|---|---|---|---|
+| battle events | 1 941 | rounds | 2 771 |
+| deaths | 4 234 | dismounts | 1 057 |
+| **cap-blocked dismounts** | 7 | **winner: null** | 293 |
+| structure-defence kills | 591 | archer kills | 180 |
+| frozen troops | 3 996 | rectifications | 239 |
+| barracks / workshop / temple | 10 025 / 1 235 / 137 | placement swap / keep / draft_auto | 26 / 8 / 6 |
+
+One branch is never exercised and cannot be: `target_choices_submitted` holding a
+`null`. `resolve_full_battle` only asks a faction for a target while two or more
+are still alive, so `get_legal_target_actions` is never empty at that point and no
+current agent can abstain. It would take an agent that deliberately declines to
+attack. Flagged rather than papered over.
+
+**The native tournament reproduces the recorded Python findings**, which is a
+useful independent check that the agents really are the same players:
+
+| matchup | native (300 games) | recorded in `agents/*.py` |
+|---|---|---|
+| tactician vs greedy | 45.0 % | 40–58 %, ~45 % combined |
+| tactician vs marshal | 18.0 % | ~16.7 % over 120 games |
+| 12-agent free-for-all | tactician 1st (29.5 %), marshal 2nd | tactician 1st (31.2 %), marshal 2nd |
+
+400 free-for-all games run in 3.0 s; 300 tactician-vs-greedy games in 2.2 s.
+
 ### 6.5 Native game driver
 
 Once agents are native, expose `play_game(config, seeds, assignment)` and
@@ -970,7 +1022,7 @@ Not to be built yet, but the constraints above exist to make it a small change:
 | ~~M5~~ | ~~Bindings; `tournament.py` unmodified~~ | **done — 100/100 games identical; 1.7x–15.9x by agent (§5.1). `run.py` deferred to M6c with the native JSON writer.** |
 | ~~M6a~~ | ~~Native random/greedy/heuristic/vanguard/marshal~~ | **done — 25 255 decisions and 80/80 whole games identical; 56–65x end to end (§6.6)** |
 | ~~M6b~~ | ~~Native tactician + the six leaf agents~~ | **done — 202 921 decisions and 155/155 games identical; tactician 56–73x (§6.7)** |
-| M6c | `oo_run` / `oo_tournament` executables + native JSON | all three JSON files byte-identical (§1.3); `web_visualizer.html` loads it; 100x+ |
+| ~~M6c~~ | ~~`oo_run` / `oo_tournament` + native JSON~~ | **done — 120/120 files byte-identical; `run.py` deleted (§6.8)** |
 | M6d | Sparse battle storage | `GameState` ~10 KB, parity holds |
 | M7 | `run_games` thread pool | ~10x on 12 threads, deterministic per seed |
 | M8 | **Python removed** | `-DOO_BUILD_PYTHON=OFF` builds and passes everything; `bindings/`, shims, `engine_old/`, `agents/` deleted |
