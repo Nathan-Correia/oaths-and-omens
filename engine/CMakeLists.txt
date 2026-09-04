@@ -44,6 +44,10 @@ add_library(oo_core STATIC
   src/state_io.cpp
   src/terrain.cpp
   src/collect.cpp
+  src/buy.cpp
+  src/movement.cpp
+  src/battle.cpp
+  src/turn.cpp
 )
 target_include_directories(oo_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
@@ -74,3 +78,19 @@ add_executable(test_phases tests/test_phases.cpp)
 target_link_libraries(test_phases PRIVATE oo_core)
 add_test(NAME phase_parity
          COMMAND test_phases ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/phase_cases.txt)
+
+add_executable(test_buy tests/test_buy.cpp)
+target_link_libraries(test_buy PRIVATE oo_core)
+add_test(NAME buy_parity
+         COMMAND test_buy ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/legal_cases.txt
+                          ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/buy_scenarios.txt)
+
+add_executable(test_movement tests/test_movement.cpp)
+target_link_libraries(test_movement PRIVATE oo_core)
+add_test(NAME movement_scenarios
+         COMMAND test_movement ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/movement_scenarios.txt)
+
+add_executable(test_turn tests/test_turn.cpp)
+target_link_libraries(test_turn PRIVATE oo_core)
+add_test(NAME turn_parity
+         COMMAND test_turn ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/turn_traces.txt)

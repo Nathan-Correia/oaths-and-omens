@@ -350,6 +350,54 @@ The infrastructure §3.3 calls for, in its first working form:
    the Barracks gold bonus ignored → 221; desert attrition ignoring the
    city exemption → 306. A suite that has never been seen to fail is not evidence.
 
+### 3.3b Turn traces and scenario suites — DONE (built during M3)
+
+**Decision-trace replay** turned out to be the right shape for §3.3, and it is
+better than the "mirror each policy in C++" alternative: `tools/dump_turn_traces.py`
+records what engine_old's agents actually *decided*, in order, and
+`tests/test_turn.cpp` replays those decisions through the C++ engine. No policy is
+duplicated, so any agent can be a trace source — including tactician, whose search
+would be miserable to mirror by hand.
+
+It also checks more than the resulting state: the replaying provider asserts the
+C++ engine asks for decisions in the same **order** and with the same
+**arguments**. A battle running an extra round, or a movement step querying the
+wrong faction, is reported where it happens rather than as a mystery state diff
+several phases later. Each turn gets a fresh RNG seeded from (game seed, turn
+number) so every case is independently replayable.
+
+**Three suites, because each closes a hole the others cannot see:**
+
+| suite | what it covers | why it is needed |
+|---|---|---|
+| `turn_traces` | 180 full turns, 9 064 decisions, 6 agent kinds, radii 4–8, 4–10 factions | ordinary play end to end |
+| `movement_scenarios` | 27 hand-built boards | the rare paths — line-battle tie-breaks, overstack reverts, both `_revert_departure` quirks, undefended structures, 6 factions into one hex |
+| `legal_cases` + `buy_scenarios` | 194 states × every faction; 23 hand-built buy batches | legal-action generation, and the per-turn batch caps |
+
+**The lesson from M2 repeated itself, and mutation testing is what caught it.**
+The first M3 suites reported 180/180 and 27/27 on the very first run. Thirteen
+plausible bugs were then introduced one at a time:
+
+- Eleven were caught by wide margins — inverted line-battle tie-break (8 turns),
+  overstack off-by-one (40), kill threshold 15→14 (18), lone attacker scoring 2
+  (37), dismount threshold (12), inverted target-conflict tie-break (3), capital
+  defence shots (15), stationary archers firing (45), capital not evicting (9), no
+  VP for destroying an outpost (61), Barracks not lifting the recruit cap (9).
+- **Marsh no longer freezing broke nothing across 180 turns** — caught only by a
+  movement scenario. Within a turn the effect is invisible unless an army enters
+  a marsh and then tries to move again, and terrain effects clear `frozen` before
+  the after-state snapshot.
+- **Removing the one-outpost-action-per-turn cap entirely broke nothing anywhere.**
+  The rule is only observable when an agent proposes two outpost actions in one
+  turn, and no real agent ever does. That is what `buy_scenarios` exists for; the
+  same mutation now fails 3 scenarios.
+
+Two structural gaps came out of the same exercise and are now closed:
+`get_legal_buy_actions` and the movement/cavalry masks were **entirely untested** —
+turn traces replay what an agent *chose* and never check the menu it chose from,
+even though all twelve agents index into it. Their order is part of the contract,
+so `legal_cases` compares element by element.
+
 ### 3.3 Golden traces
 
 - `tools/dump_trace.py` — runs `engine_old` with a given seed and agent assignment,
@@ -481,6 +529,8 @@ Each step ends with its own parity test green before starting the next.
    where `apply_buy_phase` enforces them, and preserve the stack-cap-before-gold
    ordering fix that its docstring calls out.
 7. **`movement`** — the trickiest module. Port literally, quirks included:
+   **Done (M3)**, quirks preserved and directly covered by `movement_scenarios`;
+   both branches of the exact-tie coin flip are exercised.
    - pass 1 line-battle/swap detection, with the smaller-army tiebreak and the
      `rng.random() < 0.5` coin flip on exact ties (**this RNG draw's position in the
      sequence is load-bearing**);
@@ -714,7 +764,7 @@ Not to be built yet, but the constraints above exist to make it a small change:
 | ~~M0~~ | ~~Toolchain, pybind11 zero-copy view smoke test~~ | **done — §2** |
 | ~~M1~~ | ~~`rng.hpp` matches CPython~~ | **done — 4 617 edge-case checks + 10⁷ draws over 10⁴ seeds, 0 failures (§3.1)** |
 | ~~M2~~ | ~~Grid + state + terrain + collect~~ | **done — 43 105 grid checks over 11 radii; 970 phase cases, 0 failures; 4/4 mutations caught (§3.3a)** |
-| M3 | buy + movement + battle + turn | full-game parity, random agent, 1000 seeds |
+| ~~M3~~ | ~~buy + movement + battle + turn~~ | **done — 180 turns / 9 064 decisions, 27 movement scenarios, 194 legal-action states, 23 buy scenarios; 13/13 mutations caught (§3.3b)** |
 | M4 | setup + placement | full-pipeline parity from seed alone |
 | M5 | Bindings; `run.py` / `tournament.py` unmodified | identical results, ~2x |
 | M6a | Native random/greedy/heuristic/vanguard/marshal | per-agent parity vs Python |
