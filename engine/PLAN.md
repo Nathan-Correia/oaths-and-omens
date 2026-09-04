@@ -876,6 +876,53 @@ change Python agent behaviour on ties, so pre-M6a game outcomes are not comparab
 - `NativeAgentSet` is exposed through the bindings purely so decisions can be
   compared side by side in one process. It goes with the rest of `bindings/` at M8.
 
+### 6.7 M6b result — DONE
+
+All **twelve** agents are native: turtle, denier, warlord, legion, hussar,
+sentinel, and `tactician` — the search agent. `agents/` is now purely a parity
+oracle.
+
+**Parity, same two gates as M6a:**
+
+- **Decision level**: 62 786 decisions at the default sweep, and **202 921
+  decisions over a deeper one** (30 turns × 4 seeds × 3 board sizes × 12 agents),
+  **0 differences**.
+- **Whole game**: **155/155** games reaching the identical winner, turn count and
+  per-faction VP.
+
+**Speed** — tactician is the headline, since it runs the engine thousands of extra
+times per turn:
+
+| agents | Python | native | speedup |
+|---|---|---|---|
+| tactician r7f8 | 1.838 s | 0.0329 s | **56x** |
+| tactician r5f6 | 0.792 s | 0.0108 s | **73x** |
+| every other agent | 0.15–0.27 s | 0.0026–0.0062 s | 45–65x |
+
+`tactician`'s rollouts are the payoff for the POD layout: cloning a state is now a
+`memcpy` where the Python original ran a dozen `np.copy` calls per rollout, up to
+`MAX_CANDIDATES = 10` times per turn per faction.
+
+**The bug worth recording.** `legion` failed 1 of 155 games — diverging at turn 32
+of one game while its first 12 turns were byte-identical. It is the only agent
+carrying non-RNG state: a `claimed` set of objectives that persists for the whole
+game. Two things were wrong, and only the second mattered:
+
+1. Python's `claimed` is a **set**, so re-claiming a target is idempotent; a
+   `CoordList` appending unconditionally accumulated duplicates. Real bug, but not
+   this one.
+2. **`legion_move` bails out on "no mobile armies" BEFORE pruning claims.** I
+   pruned first. Pruning drops claims on hexes that are no longer objectives, so an
+   extra prune on a step where the faction cannot move at all permanently forgets a
+   claim Python still holds — surfacing ~20 turns later as a different target and a
+   different move.
+
+This is the case for keeping **both** gates. The decision comparator's default
+12-turn sweep showed legion clean; only the whole-game test, running to 60 turns,
+caught it — and then the comparator, pointed at that specific seed and run to 40
+turns, located the exact decision. Neither alone would have been enough: one has
+the reach, the other has the resolution.
+
 ### 6.5 Native game driver
 
 Once agents are native, expose `play_game(config, seeds, assignment)` and
@@ -922,7 +969,7 @@ Not to be built yet, but the constraints above exist to make it a small change:
 | ~~M4~~ | ~~setup + placement~~ | **done — 320 maps / 29 120 hexes regenerated from seed alone, 19 setup cases; 11/11 mutations caught (§3.3c)** |
 | ~~M5~~ | ~~Bindings; `tournament.py` unmodified~~ | **done — 100/100 games identical; 1.7x–15.9x by agent (§5.1). `run.py` deferred to M6c with the native JSON writer.** |
 | ~~M6a~~ | ~~Native random/greedy/heuristic/vanguard/marshal~~ | **done — 25 255 decisions and 80/80 whole games identical; 56–65x end to end (§6.6)** |
-| M6b | Native tactician + the six leaf agents | per-agent parity; all 12 native |
+| ~~M6b~~ | ~~Native tactician + the six leaf agents~~ | **done — 202 921 decisions and 155/155 games identical; tactician 56–73x (§6.7)** |
 | M6c | `oo_run` / `oo_tournament` executables + native JSON | all three JSON files byte-identical (§1.3); `web_visualizer.html` loads it; 100x+ |
 | M6d | Sparse battle storage | `GameState` ~10 KB, parity holds |
 | M7 | `run_games` thread pool | ~10x on 12 threads, deterministic per seed |

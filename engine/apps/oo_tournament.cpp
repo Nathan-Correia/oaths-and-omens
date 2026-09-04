@@ -25,13 +25,21 @@ struct Entry {
     int factions;
 };
 
-// MUST match tools/compare_engines.py's MATRIX, in the same order - the two
-// outputs are compared entry by entry. Only the natively implemented agents
-// appear; the rest arrive at M6b.
+// MUST match tools/dump_agent_games.py's MATRIX, in the same order. All twelve
+// agents are native as of M6b.
 const Entry kMatrix[] = {
-    {"random", 7, 8},   {"random", 4, 4},    {"random", 5, 6},    {"random", 8, 8},
-    {"greedy", 7, 8},   {"greedy", 4, 4},    {"greedy", 5, 6},    {"greedy", 8, 8},
-    {"heuristic", 7, 8},{"vanguard", 7, 8},  {"marshal", 7, 8},   {"marshal", 5, 6},
+    {"random", 7, 8},    {"random", 4, 4},   {"random", 5, 6},    {"random", 8, 8},
+    {"greedy", 7, 8},    {"greedy", 4, 4},   {"greedy", 5, 6},    {"greedy", 8, 8},
+    {"heuristic", 7, 8}, {"heuristic", 5, 6},{"heuristic", 4, 4},
+    {"vanguard", 7, 8},  {"vanguard", 5, 6},
+    {"marshal", 7, 8},   {"marshal", 5, 6},  {"marshal", 8, 8},
+    {"turtle", 7, 8},    {"turtle", 5, 6},
+    {"denier", 7, 8},    {"denier", 5, 6},
+    {"warlord", 7, 8},   {"warlord", 4, 4},
+    {"legion", 7, 8},    {"legion", 5, 6},
+    {"hussar", 7, 8},    {"hussar", 4, 4},
+    {"sentinel", 7, 8},  {"sentinel", 5, 6},
+    {"tactician", 7, 8}, {"tactician", 5, 6},{"tactician", 4, 4},
 };
 constexpr int kSeedsPerEntry = 5;
 constexpr int kBaseSeed = 5000;
@@ -75,8 +83,10 @@ int run_matrix() {
 
 int run_bench() {
     const Entry cases[] = {
-        {"random", 7, 8}, {"greedy", 7, 8},   {"heuristic", 7, 8},
-        {"vanguard", 7, 8}, {"marshal", 7, 8},
+        {"random", 7, 8},   {"greedy", 7, 8},  {"heuristic", 7, 8}, {"vanguard", 7, 8},
+        {"marshal", 7, 8},  {"turtle", 7, 8},  {"denier", 7, 8},    {"warlord", 7, 8},
+        {"legion", 7, 8},   {"hussar", 7, 8},  {"sentinel", 7, 8},  {"tactician", 7, 8},
+        {"tactician", 5, 6},
     };
     constexpr int kGames = 5;
     std::printf("%-12s %-8s %5s %9s %9s %7s\n", "agent", "board", "games", "total s", "s/game",

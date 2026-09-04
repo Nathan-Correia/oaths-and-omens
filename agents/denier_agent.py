@@ -98,7 +98,9 @@ def denier_move(state, faction, legal_mask):
         return None
 
     sizes = state.army_units[origins].sum(axis=1)
-    ranked = [int(origins[i]) for i in np.argsort(-sizes)]
+    # kind="stable": see greedy_agent's note - numpy's default argsort leaves
+    # ties in an unreproducible order, and army sizes tie constantly.
+    ranked = [int(origins[i]) for i in np.argsort(-sizes, kind="stable")]
 
     if _outpost_count(state, faction) >= DENY_MIN_OWN_OUTPOSTS:
         leader_target = _leader_attack_target(state, faction)

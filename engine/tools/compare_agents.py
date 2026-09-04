@@ -31,11 +31,18 @@ from engine.placement import run_city_setup  # noqa: E402
 from engine.setup import create_initial_state  # noqa: E402
 from engine.turn import run_turn  # noqa: E402
 from agents import compose_agents  # noqa: E402
+from agents.denier_agent import make_denier_agents  # noqa: E402
 from agents.greedy_agent import make_greedy_agents  # noqa: E402
 from agents.heuristic_agent import make_heuristic_agents  # noqa: E402
+from agents.hussar_agent import make_hussar_agents  # noqa: E402
+from agents.legion_agent import make_legion_agents  # noqa: E402
 from agents.marshal_agent import make_marshal_agents  # noqa: E402
 from agents.random_agent import make_random_agents  # noqa: E402
+from agents.sentinel_agent import make_sentinel_agents  # noqa: E402
+from agents.tactician_agent import make_tactician_agents  # noqa: E402
+from agents.turtle_agent import make_turtle_agents  # noqa: E402
 from agents.vanguard_agent import make_vanguard_agents  # noqa: E402
+from agents.warlord_agent import make_warlord_agents  # noqa: E402
 
 BUILDERS = {
     "random": make_random_agents,
@@ -43,11 +50,28 @@ BUILDERS = {
     "heuristic": make_heuristic_agents,
     "vanguard": make_vanguard_agents,
     "marshal": make_marshal_agents,
+    "turtle": make_turtle_agents,
+    "denier": make_denier_agents,
+    "warlord": make_warlord_agents,
+    "legion": make_legion_agents,
+    "hussar": make_hussar_agents,
+    "sentinel": make_sentinel_agents,
+    "tactician": make_tactician_agents,
 }
 
 SIZES = [(7, 8), (5, 6), (4, 4)]
 SEEDS = [5000, 5001, 5002]
 TURNS = 12
+
+# Overridable so a specific divergence can be chased further into a game than
+# the default sweep goes.
+import os as _os
+if _os.environ.get("OO_CMP_SIZES"):
+    SIZES = [tuple(int(x) for x in p.split(",")) for p in _os.environ["OO_CMP_SIZES"].split(";")]
+if _os.environ.get("OO_CMP_SEEDS"):
+    SEEDS = [int(x) for x in _os.environ["OO_CMP_SEEDS"].split(",")]
+if _os.environ.get("OO_CMP_TURNS"):
+    TURNS = int(_os.environ["OO_CMP_TURNS"])
 
 
 def norm_buy(actions):

@@ -65,7 +65,11 @@ TurnDecisions make_turn_decisions(const AgentSet& agents);
 SetupDecisions make_setup_decisions(const AgentSet& agents);
 
 // Agent kinds implemented natively so far.
-enum class AgentKind { kRandom, kGreedy, kHeuristic, kVanguard, kMarshal };
+enum class AgentKind {
+    kRandom, kGreedy, kHeuristic, kVanguard, kMarshal,       // M6a
+    kTurtle, kDenier, kWarlord, kLegion, kHussar, kSentinel,  // M6b leaves
+    kTactician,                                              // M6b, the search agent
+};
 
 // `seed` is the per-GAME seed; each faction's generator is seeded
 // seed * 1_000_003 + faction, exactly as engine_old does.

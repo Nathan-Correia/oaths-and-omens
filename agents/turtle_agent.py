@@ -34,7 +34,9 @@ def turtle_move(state, faction, legal_mask):
         return None
 
     sizes = state.army_units[origins].sum(axis=1)
-    ranked = [int(origins[i]) for i in np.argsort(-sizes)]
+    # kind="stable": see greedy_agent's note - numpy's default argsort leaves
+    # ties in an unreproducible order, and army sizes tie constantly.
+    ranked = [int(origins[i]) for i in np.argsort(-sizes, kind="stable")]
 
     home_target = _best_expansion_target(state, faction)
     if home_target is None:

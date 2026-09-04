@@ -27,6 +27,13 @@ MATRIX = [
     ("heuristic", 7, 8), ("heuristic", 5, 6), ("heuristic", 4, 4),
     ("vanguard", 7, 8), ("vanguard", 5, 6),
     ("marshal", 7, 8), ("marshal", 5, 6), ("marshal", 8, 8),
+    ("turtle", 7, 8), ("turtle", 5, 6),
+    ("denier", 7, 8), ("denier", 5, 6),
+    ("warlord", 7, 8), ("warlord", 4, 4),
+    ("legion", 7, 8), ("legion", 5, 6),
+    ("hussar", 7, 8), ("hussar", 4, 4),
+    ("sentinel", 7, 8), ("sentinel", 5, 6),
+    ("tactician", 7, 8), ("tactician", 5, 6), ("tactician", 4, 4),
 ]
 SEEDS_PER_ENTRY = 5
 BASE_SEED = 5000
