@@ -14,9 +14,10 @@ constexpr int kDeathPriority[NUM_UNIT_TYPES] = {kInfantry, kCavalry, kArchers};
 
 void totals_impl(const GameState& state, int hex_index, bool moved_only, FactionTotals& out) {
     out.count = 0;
-    const int nslots = state.battle_nslots[hex_index];
-    for (int k = 0; k < nslots; ++k) {
-        const int8_t f = state.battle_faction[hex_index][k];
+    const Battle* b = state.battle_at(hex_index);
+    if (b == nullptr) return;
+    for (int k = 0; k < b->nslots; ++k) {
+        const int8_t f = b->slots[k].faction;
         if (f == NO_FACTION) continue;
         int i = out.index_of(f);
         if (i < 0) {
@@ -25,10 +26,8 @@ void totals_impl(const GameState& state, int hex_index, bool moved_only, Faction
             out.faction[i] = f;
             for (int t = 0; t < NUM_UNIT_TYPES; ++t) out.units[i][t] = 0;
         }
-        if (moved_only && !state.battle_moved[hex_index][k]) continue;
-        for (int t = 0; t < NUM_UNIT_TYPES; ++t) {
-            out.units[i][t] += state.battle_units[hex_index][k][t];
-        }
+        if (moved_only && !b->slots[k].moved) continue;
+        for (int t = 0; t < NUM_UNIT_TYPES; ++t) out.units[i][t] += b->slots[k].units[t];
     }
 }
 
@@ -46,15 +45,16 @@ int kills_for_roll(int roll, int attacker_total_units) {
 void apply_kills_to_faction(GameState& state, int hex_index, int target_faction, int num_kills,
                             int killer_faction, std::vector<DeathEntry>* deaths) {
     int remaining = num_kills;
-    const int nslots = state.battle_nslots[hex_index];
+    Battle* b = state.battle_at(hex_index);
+    if (b == nullptr) return;
     for (int p = 0; p < NUM_UNIT_TYPES && remaining > 0; ++p) {
         const int ut = kDeathPriority[p];
-        for (int k = 0; k < nslots && remaining > 0; ++k) {
-            if (state.battle_faction[hex_index][k] != target_faction) continue;
-            const int available = state.battle_units[hex_index][k][ut];
+        for (int k = 0; k < b->nslots && remaining > 0; ++k) {
+            if (b->slots[k].faction != target_faction) continue;
+            const int available = b->slots[k].units[ut];
             const int take = available < remaining ? available : remaining;
             if (take > 0) {
-                state.battle_units[hex_index][k][ut] = static_cast<int16_t>(available - take);
+                b->slots[k].units[ut] = static_cast<int16_t>(available - take);
                 remaining -= take;
                 state.kill_xp[killer_faction] += take;
                 if (deaths != nullptr) {
@@ -69,12 +69,11 @@ void apply_kills_to_faction(GameState& state, int hex_index, int target_faction,
 }
 
 int cavalry_of(const GameState& state, int hex_index, int faction) {
+    const Battle* b = state.battle_at(hex_index);
+    if (b == nullptr) return 0;
     int total = 0;
-    const int nslots = state.battle_nslots[hex_index];
-    for (int k = 0; k < nslots; ++k) {
-        if (state.battle_faction[hex_index][k] == faction) {
-            total += state.battle_units[hex_index][k][kCavalry];
-        }
+    for (int k = 0; k < b->nslots; ++k) {
+        if (b->slots[k].faction == faction) total += b->slots[k].units[kCavalry];
     }
     return total;
 }
@@ -98,10 +97,10 @@ void roll_dismounts(GameState& state, int hex_index, int faction, int died_count
             }
             continue;
         }
-        const int nslots = state.battle_nslots[hex_index];
-        for (int k = 0; k < nslots; ++k) {
-            if (state.battle_faction[hex_index][k] == faction) {
-                state.battle_units[hex_index][k][kInfantry] += 1;
+        Battle* b = state.battle_at(hex_index);
+        for (int k = 0; b != nullptr && k < b->nslots; ++k) {
+            if (b->slots[k].faction == faction) {
+                b->slots[k].units[kInfantry] += 1;
                 break;
             }
         }
@@ -329,7 +328,7 @@ void resolve_round(GameState& state, int hex_index, const int target_choices[MAX
                        infantry_counts, log != nullptr ? &log->dismounts : nullptr);
     }
 
-    state.battle_round[hex_index] += 1;
+    if (Battle* b = state.battle_at(hex_index)) b->round += 1;
 }
 
 }  // namespace
@@ -458,25 +457,8 @@ void rectify_overflow(GameState& state, int hex_index, int winner_faction, const
         for (int t = 0; t < NUM_UNIT_TYPES; ++t) state.army_units[hex_index][t] = 0;
     }
     state.frozen[hex_index] = false;
-    state.locked[hex_index] = false;
-
-    for (int k = 0; k < MAX_BATTLE_CONTRIB; ++k) {
-        state.battle_faction[hex_index][k] = NO_FACTION;
-        state.battle_origin[hex_index][k] = NO_ORIGIN;
-        state.battle_moved[hex_index][k] = false;
-        for (int t = 0; t < NUM_UNIT_TYPES; ++t) state.battle_units[hex_index][k][t] = 0;
-    }
-    state.battle_nslots[hex_index] = 0;
-    state.battle_round[hex_index] = 0;
-
-    // Order-preserving compacting erase - Python's list.remove keeps order, and
-    // battle order affects outcomes near the shared dismount cap.
-    int w = 0;
-    for (int i = 0; i < state.num_battles; ++i) {
-        if (state.battle_order[i] == hex_index) continue;
-        state.battle_order[w++] = state.battle_order[i];
-    }
-    state.num_battles = static_cast<int16_t>(w);
+    // erase_battle also clears `locked`, which is now derived from battle_index.
+    state.erase_battle(hex_index);
 }
 
 }  // namespace oo

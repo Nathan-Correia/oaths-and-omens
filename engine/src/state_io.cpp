@@ -85,30 +85,47 @@ void write_state(std::ostream& out, const GameState& state) {
         std::vector<int> tmp(static_cast<size_t>(n));
         for (int i = 0; i < n; ++i) tmp[static_cast<size_t>(i)] = state.frozen[i] ? 1 : 0;
         write_array(out, "FROZEN", tmp.data(), n);
-        for (int i = 0; i < n; ++i) tmp[static_cast<size_t>(i)] = state.locked[i] ? 1 : 0;
+        // LOCKED is derived from battle_index now, but stays in the format: the
+        // Python reference still has it as a field, and writing it lets read_state
+        // cross-check the two representations for free.
+        for (int i = 0; i < n; ++i) tmp[static_cast<size_t>(i)] = state.locked(i) ? 1 : 0;
         write_array(out, "LOCKED", tmp.data(), n);
     }
-    write_array(out, "BATTLE_ROUND", state.battle_round, n);
+    {
+        std::vector<int> rounds(static_cast<size_t>(n), 0);
+        for (int h = 0; h < n; ++h) {
+            const Battle* b = state.battle_at(h);
+            rounds[static_cast<size_t>(h)] = b != nullptr ? b->round : 0;
+        }
+        write_array(out, "BATTLE_ROUND", rounds.data(), n);
+    }
 
-    // Sparse: only occupied contribution slots.
+    // Written in HEX order, which is what the Python side produces by scanning its
+    // dense arrays. The file format predates the sparse layout and is kept
+    // unchanged so existing goldens stay valid.
     int slot_count = 0;
     for (int h = 0; h < n; ++h) {
-        for (int k = 0; k < MAX_BATTLE_CONTRIB; ++k) {
-            if (state.battle_faction[h][k] != NO_FACTION) ++slot_count;
-        }
+        if (const Battle* b = state.battle_at(h)) slot_count += b->nslots;
     }
     out << "BATTLE_SLOTS " << slot_count << '\n';
     for (int h = 0; h < n; ++h) {
-        for (int k = 0; k < MAX_BATTLE_CONTRIB; ++k) {
-            if (state.battle_faction[h][k] == NO_FACTION) continue;
-            out << h << ' ' << k << ' ' << static_cast<int>(state.battle_faction[h][k]) << ' '
-                << state.battle_origin[h][k] << ' ' << state.battle_units[h][k][kInfantry] << ' '
-                << state.battle_units[h][k][kCavalry] << ' ' << state.battle_units[h][k][kArchers]
-                << ' ' << (state.battle_moved[h][k] ? 1 : 0) << '\n';
+        const Battle* b = state.battle_at(h);
+        if (b == nullptr) continue;
+        for (int k = 0; k < b->nslots; ++k) {
+            const BattleSlot& sl = b->slots[k];
+            out << h << ' ' << k << ' ' << static_cast<int>(sl.faction) << ' ' << sl.origin << ' '
+                << sl.units[kInfantry] << ' ' << sl.units[kCavalry] << ' ' << sl.units[kArchers]
+                << ' ' << (sl.moved ? 1 : 0) << '\n';
         }
     }
 
-    write_array(out, "BATTLE_ORDER", state.battle_order, state.num_battles);
+    {
+        std::vector<int> order(static_cast<size_t>(state.num_battles));
+        for (int i = 0; i < state.num_battles; ++i) {
+            order[static_cast<size_t>(i)] = state.battles[i].hex;
+        }
+        write_array(out, "BATTLE_ORDER", order.data(), state.num_battles);
+    }
     write_array(out, "CAPITAL_SETTLE_ORDER", state.capital_settle_order, f);
     write_array(out, "GOLD", state.gold, f);
     {
@@ -177,10 +194,11 @@ bool read_state(std::istream& in, GameState& state, std::string& error) {
     tmp.assign(static_cast<size_t>(n), 0);
     if (!read_array(in, "FROZEN", tmp.data(), n, error)) return false;
     for (int i = 0; i < n; ++i) state.frozen[i] = tmp[static_cast<size_t>(i)] != 0;
-    if (!read_array(in, "LOCKED", tmp.data(), n, error)) return false;
-    for (int i = 0; i < n; ++i) state.locked[i] = tmp[static_cast<size_t>(i)] != 0;
+    std::vector<int> want_locked(static_cast<size_t>(n));
+    if (!read_array(in, "LOCKED", want_locked.data(), n, error)) return false;
 
-    if (!read_array(in, "BATTLE_ROUND", state.battle_round, n, error)) return false;
+    std::vector<int> want_round(static_cast<size_t>(n));
+    if (!read_array(in, "BATTLE_ROUND", want_round.data(), n, error)) return false;
 
     if (!expect_token(in, "BATTLE_SLOTS", error)) return false;
     int slot_count = 0;
@@ -188,19 +206,19 @@ bool read_state(std::istream& in, GameState& state, std::string& error) {
         error = "BATTLE_SLOTS: missing count";
         return false;
     }
-    for (int i = 0; i < slot_count; ++i) {
+    // Slots arrive in hex order; the battles themselves are created below in
+    // BATTLE_ORDER, which is the creation order and the one that affects outcomes.
+    struct PendingSlot {
         int h, k, faction, origin, inf, cav, arc, moved;
-        if (!(in >> h >> k >> faction >> origin >> inf >> cav >> arc >> moved)) {
+    };
+    std::vector<PendingSlot> pending(static_cast<size_t>(slot_count));
+    for (int i = 0; i < slot_count; ++i) {
+        PendingSlot& ps = pending[static_cast<size_t>(i)];
+        if (!(in >> ps.h >> ps.k >> ps.faction >> ps.origin >> ps.inf >> ps.cav >> ps.arc >>
+              ps.moved)) {
             error = "BATTLE_SLOTS: truncated row";
             return false;
         }
-        state.battle_faction[h][k] = static_cast<int8_t>(faction);
-        state.battle_origin[h][k] = origin;
-        state.battle_units[h][k][kInfantry] = static_cast<int16_t>(inf);
-        state.battle_units[h][k][kCavalry] = static_cast<int16_t>(cav);
-        state.battle_units[h][k][kArchers] = static_cast<int16_t>(arc);
-        state.battle_moved[h][k] = moved != 0;
-        if (k + 1 > state.battle_nslots[h]) state.battle_nslots[h] = static_cast<uint8_t>(k + 1);
     }
 
     if (!expect_token(in, "BATTLE_ORDER", error)) return false;
@@ -209,14 +227,39 @@ bool read_state(std::istream& in, GameState& state, std::string& error) {
         error = "BATTLE_ORDER: missing count";
         return false;
     }
-    state.num_battles = static_cast<int16_t>(num_battles);
     for (int i = 0; i < num_battles; ++i) {
         int h = 0;
         if (!(in >> h)) {
             error = "BATTLE_ORDER: truncated";
             return false;
         }
-        state.battle_order[i] = static_cast<int16_t>(h);
+        Battle& b = state.new_battle(h);
+        b.round = static_cast<int16_t>(want_round[static_cast<size_t>(h)]);
+    }
+    for (const PendingSlot& ps : pending) {
+        Battle* b = state.battle_at(ps.h);
+        if (b == nullptr) {
+            error = "BATTLE_SLOTS: slot on a hex missing from BATTLE_ORDER";
+            return false;
+        }
+        BattleSlot& sl = b->slots[ps.k];
+        sl.faction = static_cast<int8_t>(ps.faction);
+        sl.origin = ps.origin;
+        sl.units[kInfantry] = static_cast<int16_t>(ps.inf);
+        sl.units[kCavalry] = static_cast<int16_t>(ps.cav);
+        sl.units[kArchers] = static_cast<int16_t>(ps.arc);
+        sl.moved = ps.moved != 0;
+        if (ps.k + 1 > b->nslots) b->nslots = static_cast<uint8_t>(ps.k + 1);
+    }
+
+    // Free cross-check: the file's LOCKED must agree with the derived value.
+    for (int i = 0; i < n; ++i) {
+        if (state.locked(i) != (want_locked[static_cast<size_t>(i)] != 0)) {
+            std::ostringstream os;
+            os << "LOCKED disagrees with battle storage at hex " << i;
+            error = os.str();
+            return false;
+        }
     }
 
     if (!read_array(in, "CAPITAL_SETTLE_ORDER", state.capital_settle_order, f, error)) return false;
@@ -281,30 +324,6 @@ bool compare_states(const GameState& a, const GameState& b, std::string& diff) {
         }
     }
     if (!diff_array(a.frozen, b.frozen, n, "frozen", diff)) return false;
-    if (!diff_array(a.locked, b.locked, n, "locked", diff)) return false;
-    if (!diff_array(a.battle_round, b.battle_round, n, "battle_round", diff)) return false;
-
-    for (int h = 0; h < n; ++h) {
-        for (int k = 0; k < MAX_BATTLE_CONTRIB; ++k) {
-            if (a.battle_faction[h][k] != b.battle_faction[h][k] ||
-                a.battle_origin[h][k] != b.battle_origin[h][k] ||
-                a.battle_moved[h][k] != b.battle_moved[h][k] ||
-                a.battle_units[h][k][0] != b.battle_units[h][k][0] ||
-                a.battle_units[h][k][1] != b.battle_units[h][k][1] ||
-                a.battle_units[h][k][2] != b.battle_units[h][k][2]) {
-                std::ostringstream os;
-                os << "battle slot [" << h << "][" << k << "]: got (f=" << int(a.battle_faction[h][k])
-                   << " o=" << a.battle_origin[h][k] << " u=" << a.battle_units[h][k][0] << "/"
-                   << a.battle_units[h][k][1] << "/" << a.battle_units[h][k][2]
-                   << " moved=" << a.battle_moved[h][k] << "), want (f="
-                   << int(b.battle_faction[h][k]) << " o=" << b.battle_origin[h][k]
-                   << " u=" << b.battle_units[h][k][0] << "/" << b.battle_units[h][k][1] << "/"
-                   << b.battle_units[h][k][2] << " moved=" << b.battle_moved[h][k] << ")";
-                diff = os.str();
-                return false;
-            }
-        }
-    }
 
     if (a.num_battles != b.num_battles) {
         std::ostringstream os;
@@ -312,7 +331,35 @@ bool compare_states(const GameState& a, const GameState& b, std::string& diff) {
         diff = os.str();
         return false;
     }
-    if (!diff_array(a.battle_order, b.battle_order, a.num_battles, "battle_order", diff)) return false;
+    // Compared in creation order, which is the order that affects outcomes.
+    for (int i = 0; i < a.num_battles; ++i) {
+        const Battle& ba = a.battles[i];
+        const Battle& bb = b.battles[i];
+        if (ba.hex != bb.hex || ba.round != bb.round || ba.nslots != bb.nslots) {
+            std::ostringstream os;
+            os << "battle[" << i << "]: got (hex=" << ba.hex << " round=" << ba.round
+               << " nslots=" << int(ba.nslots) << "), want (hex=" << bb.hex << " round=" << bb.round
+               << " nslots=" << int(bb.nslots) << ")";
+            diff = os.str();
+            return false;
+        }
+        for (int k = 0; k < ba.nslots; ++k) {
+            const BattleSlot& sa = ba.slots[k];
+            const BattleSlot& sb = bb.slots[k];
+            if (sa.faction != sb.faction || sa.origin != sb.origin || sa.moved != sb.moved ||
+                sa.units[0] != sb.units[0] || sa.units[1] != sb.units[1] ||
+                sa.units[2] != sb.units[2]) {
+                std::ostringstream os;
+                os << "battle hex " << ba.hex << " slot " << k << ": got (f=" << int(sa.faction)
+                   << " o=" << sa.origin << " u=" << sa.units[0] << "/" << sa.units[1] << "/"
+                   << sa.units[2] << " moved=" << sa.moved << "), want (f=" << int(sb.faction)
+                   << " o=" << sb.origin << " u=" << sb.units[0] << "/" << sb.units[1] << "/"
+                   << sb.units[2] << " moved=" << sb.moved << ")";
+                diff = os.str();
+                return false;
+            }
+        }
+    }
 
     if (!diff_array(a.capital_settle_order, b.capital_settle_order, f, "capital_settle_order", diff))
         return false;
@@ -363,7 +410,7 @@ bool validate_state(const GameState& state, std::string& problem) {
             // The 6-unit limit is strict outside battle. A locked hex is exempt:
             // engine_old's _revert_departure can legitimately recreate a peaceful
             // army on a hex that an unrelated battle locked this same step.
-            if (!state.locked[h] && state.units_at(h) > MAX_STACK_SIZE) {
+            if (!state.locked(h) && state.units_at(h) > MAX_STACK_SIZE) {
                 os << "hex " << h << ": peaceful stack of " << state.units_at(h) << " exceeds "
                    << MAX_STACK_SIZE;
                 problem = os.str();
@@ -375,59 +422,52 @@ bool validate_state(const GameState& state, std::string& problem) {
             return false;
         }
 
-        // Occupied battle slots must be contiguous from 0 - engine_old allocates
-        // via _first_empty_battle_slot and never frees an individual slot, so a
-        // gap means something cleared a slot it should not have.
-        bool seen_empty = false;
-        int occupied = 0;
-        for (int k = 0; k < MAX_BATTLE_CONTRIB; ++k) {
-            if (state.battle_faction[h][k] == NO_FACTION) {
-                seen_empty = true;
-            } else {
-                if (seen_empty) {
-                    os << "hex " << h << ": battle slot " << k << " occupied after an empty slot";
-                    problem = os.str();
-                    return false;
-                }
-                ++occupied;
+        // battle_index must point at a battle that agrees it lives on this hex.
+        // With the sparse layout this replaces the old "occupied slots are
+        // contiguous" check - a gap is now structurally impossible, but a stale
+        // or crossed index is the new failure mode worth guarding.
+        const int bi = state.battle_index[h];
+        if (bi != -1) {
+            if (bi < 0 || bi >= state.num_battles) {
+                os << "hex " << h << ": battle_index " << bi << " out of range (num_battles="
+                   << state.num_battles << ")";
+                problem = os.str();
+                return false;
             }
-        }
-        if (occupied != state.battle_nslots[h]) {
-            os << "hex " << h << ": battle_nslots=" << int(state.battle_nslots[h]) << " but "
-               << occupied << " slots occupied";
-            problem = os.str();
-            return false;
-        }
-        if ((occupied > 0) != state.locked[h]) {
-            os << "hex " << h << ": locked=" << state.locked[h] << " but " << occupied
-               << " battle slots occupied";
-            problem = os.str();
-            return false;
+            if (state.battles[bi].hex != h) {
+                os << "hex " << h << ": battle_index points at a battle on hex "
+                   << state.battles[bi].hex;
+                problem = os.str();
+                return false;
+            }
         }
     }
 
-    // battle_order must list exactly the locked hexes, without duplicates.
     if (state.num_battles < 0 || state.num_battles > MAX_ACTIVE_BATTLES) {
         problem = "num_battles out of range";
         return false;
     }
-    int locked_total = 0;
-    for (int h = 0; h < n; ++h) locked_total += state.locked[h] ? 1 : 0;
-    if (locked_total != state.num_battles) {
-        os << "num_battles=" << state.num_battles << " but " << locked_total << " hexes locked";
-        problem = os.str();
-        return false;
-    }
     for (int i = 0; i < state.num_battles; ++i) {
-        const int h = state.battle_order[i];
-        if (h < 0 || h >= n || !state.locked[h]) {
-            os << "battle_order[" << i << "]=" << h << " is not a locked hex";
+        const Battle& b = state.battles[i];
+        if (b.hex < 0 || b.hex >= n) {
+            os << "battles[" << i << "] has hex " << b.hex << " out of range";
             problem = os.str();
             return false;
         }
-        for (int j = 0; j < i; ++j) {
-            if (state.battle_order[j] == h) {
-                os << "battle_order contains hex " << h << " twice";
+        if (state.battle_index[b.hex] != i) {
+            os << "battles[" << i << "] on hex " << b.hex << " but battle_index says "
+               << state.battle_index[b.hex];
+            problem = os.str();
+            return false;
+        }
+        if (b.nslots == 0 || b.nslots > MAX_BATTLE_CONTRIB) {
+            os << "battles[" << i << "] has " << int(b.nslots) << " slots";
+            problem = os.str();
+            return false;
+        }
+        for (int k = 0; k < b.nslots; ++k) {
+            if (b.slots[k].faction < 0 || b.slots[k].faction >= state.num_factions) {
+                os << "battles[" << i << "] slot " << k << ": faction out of range";
                 problem = os.str();
                 return false;
             }

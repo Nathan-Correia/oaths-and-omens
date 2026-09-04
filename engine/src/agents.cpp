@@ -71,9 +71,9 @@ void random_rectification(Rng& rng, const GameState& state, int hex_index, int w
 
     SmallVec<int32_t, MAX_BATTLE_CONTRIB> origins;
     origins.clear();
-    for (int k = 0; k < state.battle_nslots[hex_index]; ++k) {
-        if (state.battle_faction[hex_index][k] == winner) {
-            origins.push_back(state.battle_origin[hex_index][k]);
+    if (const Battle* b = state.battle_at(hex_index)) {
+        for (int k = 0; k < b->nslots; ++k) {
+            if (b->slots[k].faction == winner) origins.push_back(b->slots[k].origin);
         }
     }
     if (origins.empty()) return;
@@ -418,7 +418,7 @@ bool best_attack_target(const GameState& state, int faction, CoordList& out) {
     HexList origins;
     origins.clear();
     for (int h = 0; h < state.num_hexes; ++h) {
-        if (state.army_faction[h] == faction && !state.locked[h]) {
+        if (state.army_faction[h] == faction && !state.locked(h)) {
             origins.push_back(static_cast<int16_t>(h));
         }
     }
@@ -602,7 +602,7 @@ bool leader_attack_target(const GameState& state, int faction, CoordList& out) {
     HexList origins;
     origins.clear();
     for (int h = 0; h < state.num_hexes; ++h) {
-        if (state.army_faction[h] == faction && !state.locked[h]) {
+        if (state.army_faction[h] == faction && !state.locked(h)) {
             origins.push_back(static_cast<int16_t>(h));
         }
     }
@@ -799,7 +799,7 @@ void prune_claims(CoordList& claimed, const CoordList& targets) {
 void locked_own_cities(const GameState& state, int faction, CoordList& out) {
     out.clear();
     for (int h = 0; h < state.num_hexes; ++h) {
-        if (state.city_owner[h] == faction && state.locked[h] && !state.is_capital[h]) {
+        if (state.city_owner[h] == faction && state.locked(h) && !state.is_capital[h]) {
             out.push_back(state.grid->coord_of(h));
         }
     }
@@ -885,11 +885,11 @@ double evaluate(const GameState& state, int faction) {
             for (int t = 0; t < NUM_UNIT_TYPES; ++t) total[t] += state.army_units[h][t];
         }
     }
-    for (int b = 0; b < state.num_battles; ++b) {
-        const int h = state.battle_order[b];
-        for (int k = 0; k < state.battle_nslots[h]; ++k) {
-            if (state.battle_faction[h][k] != faction) continue;
-            for (int t = 0; t < NUM_UNIT_TYPES; ++t) total[t] += state.battle_units[h][k][t];
+    for (int i = 0; i < state.num_battles; ++i) {
+        const Battle& bt = state.battles[i];
+        for (int k = 0; k < bt.nslots; ++k) {
+            if (bt.slots[k].faction != faction) continue;
+            for (int t = 0; t < NUM_UNIT_TYPES; ++t) total[t] += bt.slots[k].units[t];
         }
     }
     const double power =

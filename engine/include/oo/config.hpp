@@ -34,8 +34,15 @@ inline constexpr int NUM_UPGRADE_TYPES = 3;
 // cavalry dismounts, so this may need revisiting if the assert ever fires.
 inline constexpr int MAX_BATTLE_CONTRIB = 16;
 
-// Worst case is one battle per hex. Cheap to size generously (2 bytes each).
-inline constexpr int MAX_ACTIVE_BATTLES = MAX_HEXES;
+// A movement step gives each faction at most one move, so it can start at most
+// `num_factions` new battles; a turn has 3 movement + 2 cavalry steps. The true
+// worst case is therefore 5 x 10 = 50 simultaneous pending battles. 64 leaves
+// headroom, and new_battle() asserts rather than overflowing.
+//
+// This bound matters now that battle storage is sparse (state.hpp): each entry is
+// ~200 bytes, so sizing it at MAX_HEXES would cost more than the dense layout it
+// replaced.
+inline constexpr int MAX_ACTIVE_BATTLES = 64;
 
 inline constexpr int MAX_STACK_SIZE = 6;  // outside battle this is strict
 

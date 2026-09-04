@@ -989,6 +989,51 @@ GIL round trips, and with `_clone_state` collapsed to a `memcpy`.
 
 ---
 
+### 6.9 M6d result — DONE
+
+`GameState` is **70 200 -> 18 128 bytes**, a 3.9x reduction, with every gate still
+green.
+
+Battle storage was **65 207 of the original 70 200 bytes - 93 % of the state** -
+for something empty on almost every hex almost all the time. It is now a small
+side table: `battle_index[MAX_HEXES]` plus `Battle battles[64]`, where a `Battle`
+is 200 bytes (16 slots of 12). Total battle cost: 13 464 bytes.
+
+`MAX_ACTIVE_BATTLES` dropped from `MAX_HEXES` (331) to **64**, and that bound is
+what makes the change a win rather than a loss - at 331 entries the sparse table
+would have cost 87 KB, *more* than the dense arrays it replaced. The bound is
+provable: a movement step gives each faction at most one move, so at most
+`num_factions` new battles per step, over 3 movement + 2 cavalry steps = 5 x 10 =
+**50 worst case**. Measured across 15 radius-8 / 10-faction games, the observed
+peak was **8**.
+
+Because `assert` compiles out under NDEBUG and running off the end of `battles`
+would silently corrupt the whole state, `new_battle` and the slot append also
+carry a release-safe guard. They run once per battle, so the check costs nothing.
+
+**`locked` is gone.** A hex is locked exactly when it has a battle, so a separate
+bool was a second source of truth that could desync; it is now
+`battle_index[h] >= 0`. `state_io` still writes the derived value, which gives
+`read_state` a free cross-check that the two representations agree.
+
+**No speedup, and that is the expected result.** Tactician's rollouts went 0.0329
+-> 0.0323 s/game, inside noise. The memcpy was never the bottleneck at one state
+per rollout. The win is footprint, and it pays off where footprint matters:
+
+| | dense | sparse |
+|---|---|---|
+| one state | 68.6 KB | 17.7 KB |
+| 12 threads (§7) | 823 KB | 212 KB |
+| a 10 000-state batch | 700 MB | 181 MB |
+| a 1 M-node search tree | 70 GB | 18 GB |
+
+That last row is the actual motivation - it is the difference between a search
+tree fitting in memory and not.
+
+**Gates after the refactor:** all 10 ctests; 62 786 agent decisions and a deeper
+127 447-decision sweep, 0 differences; 100/100 M5 games; 120/120 replay files
+byte-identical.
+
 ## 7. Step 6 — multicore (design for it now, build it later)
 
 Not to be built yet, but the constraints above exist to make it a small change:
@@ -1023,7 +1068,7 @@ Not to be built yet, but the constraints above exist to make it a small change:
 | ~~M6a~~ | ~~Native random/greedy/heuristic/vanguard/marshal~~ | **done — 25 255 decisions and 80/80 whole games identical; 56–65x end to end (§6.6)** |
 | ~~M6b~~ | ~~Native tactician + the six leaf agents~~ | **done — 202 921 decisions and 155/155 games identical; tactician 56–73x (§6.7)** |
 | ~~M6c~~ | ~~`oo_run` / `oo_tournament` + native JSON~~ | **done — 120/120 files byte-identical; `run.py` deleted (§6.8)** |
-| M6d | Sparse battle storage | `GameState` ~10 KB, parity holds |
+| ~~M6d~~ | ~~Sparse battle storage~~ | **done — 68.6 KB -> 17.7 KB; all gates green (§6.9)** |
 | M7 | `run_games` thread pool | ~10x on 12 threads, deterministic per seed |
 | M8 | **Python removed** | `-DOO_BUILD_PYTHON=OFF` builds and passes everything; `bindings/`, shims, `engine_old/`, `agents/` deleted |
 

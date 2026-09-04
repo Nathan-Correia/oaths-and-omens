@@ -17,11 +17,11 @@ void run_battle_phase(GameState& state, const TurnDecisions& decisions, Rng& rng
     // reverting/rectifying can add or remove entries.
     int16_t pending[MAX_ACTIVE_BATTLES];
     const int n_pending = state.num_battles;
-    for (int i = 0; i < n_pending; ++i) pending[i] = state.battle_order[i];
+    for (int i = 0; i < n_pending; ++i) pending[i] = state.battles[i].hex;
 
     for (int i = 0; i < n_pending; ++i) {
         const int hex_index = pending[i];
-        if (!state.locked[hex_index]) continue;
+        if (!state.locked(hex_index)) continue;
 
         resolve_full_battle(state, hex_index, decisions.target, decisions.ctx, rng,
                             infantry_counts);
@@ -32,22 +32,7 @@ void run_battle_phase(GameState& state, const TurnDecisions& decisions, Rng& rng
             // one victorious.
             state.army_faction[hex_index] = NO_FACTION;
             for (int t = 0; t < NUM_UNIT_TYPES; ++t) state.army_units[hex_index][t] = 0;
-            state.locked[hex_index] = false;
-            for (int k = 0; k < MAX_BATTLE_CONTRIB; ++k) {
-                state.battle_faction[hex_index][k] = NO_FACTION;
-                state.battle_origin[hex_index][k] = NO_ORIGIN;
-                state.battle_moved[hex_index][k] = false;
-                for (int t = 0; t < NUM_UNIT_TYPES; ++t) state.battle_units[hex_index][k][t] = 0;
-            }
-            state.battle_nslots[hex_index] = 0;
-            state.battle_round[hex_index] = 0;
-
-            int w = 0;
-            for (int j = 0; j < state.num_battles; ++j) {
-                if (state.battle_order[j] == hex_index) continue;
-                state.battle_order[w++] = state.battle_order[j];
-            }
-            state.num_battles = static_cast<int16_t>(w);
+            state.erase_battle(hex_index);
             continue;
         }
 

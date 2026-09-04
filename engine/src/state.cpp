@@ -18,13 +18,12 @@ void new_empty(GameState& state, const HexGrid& grid, int num_factions) {
     std::memset(state.city_placer, NO_FACTION, sizeof(state.city_placer));
     std::memset(state.army_faction, NO_FACTION, sizeof(state.army_faction));
     std::memset(state.outpost_upgrade, NO_UPGRADE, sizeof(state.outpost_upgrade));
-    std::memset(state.battle_faction, NO_FACTION, sizeof(state.battle_faction));
 
-    for (int i = 0; i < MAX_HEXES; ++i) {
-        for (int k = 0; k < MAX_BATTLE_CONTRIB; ++k) {
-            state.battle_origin[i][k] = NO_ORIGIN;
-        }
-    }
+    for (int i = 0; i < MAX_HEXES; ++i) state.battle_index[i] = -1;
+    // The battle table is left zeroed rather than filled with NO_FACTION: only
+    // the first `num_battles` entries are ever read, and each is initialised by
+    // new_battle(). Zeroing the whole array keeps memcmp-equality meaningful.
+
     for (int f = 0; f < MAX_FACTIONS; ++f) {
         state.capital_settle_order[f] = -1;
         state.alive[f] = true;
@@ -42,12 +41,10 @@ int count_units_in_play(const GameState& state, int faction, int unit_index) {
     for (int i = 0; i < state.num_hexes; ++i) {
         if (state.army_faction[i] == faction) total += state.army_units[i][unit_index];
     }
-    // Battle contributions: only hexes with a live battle can hold any, so walk
-    // battle_order rather than every hex.
     for (int b = 0; b < state.num_battles; ++b) {
-        const int h = state.battle_order[b];
-        for (int k = 0; k < state.battle_nslots[h]; ++k) {
-            if (state.battle_faction[h][k] == faction) total += state.battle_units[h][k][unit_index];
+        const Battle& battle = state.battles[b];
+        for (int k = 0; k < battle.nslots; ++k) {
+            if (battle.slots[k].faction == faction) total += battle.slots[k].units[unit_index];
         }
     }
     return total;
@@ -63,13 +60,12 @@ void count_all_units_in_play(const GameState& state, int faction, int32_t out[NU
         }
     }
     for (int b = 0; b < state.num_battles; ++b) {
-        const int h = state.battle_order[b];
-        for (int k = 0; k < state.battle_nslots[h]; ++k) {
-            if (state.battle_faction[h][k] == faction) {
-                out[kInfantry] += state.battle_units[h][k][kInfantry];
-                out[kCavalry] += state.battle_units[h][k][kCavalry];
-                out[kArchers] += state.battle_units[h][k][kArchers];
-            }
+        const Battle& battle = state.battles[b];
+        for (int k = 0; k < battle.nslots; ++k) {
+            if (battle.slots[k].faction != faction) continue;
+            out[kInfantry] += battle.slots[k].units[kInfantry];
+            out[kCavalry] += battle.slots[k].units[kCavalry];
+            out[kArchers] += battle.slots[k].units[kArchers];
         }
     }
 }

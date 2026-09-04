@@ -36,7 +36,7 @@ void snapshot_sparse(const GameState& state, std::vector<HexSnapshot>& out) {
             e.upgrade = state.outpost_upgrade[h];
         }
 
-        if (state.locked[h]) {
+        if (state.locked(h)) {
             FactionTotals totals;
             faction_totals(state, h, totals);
             if (totals.count > 0) {
@@ -96,25 +96,24 @@ void run_battle_phase_logged(GameState& state, const TurnDecisions& decisions, R
 
     int16_t pending[MAX_ACTIVE_BATTLES];
     const int n_pending = state.num_battles;
-    for (int i = 0; i < n_pending; ++i) pending[i] = state.battle_order[i];
+    for (int i = 0; i < n_pending; ++i) pending[i] = state.battles[i].hex;
 
     for (int i = 0; i < n_pending; ++i) {
         const int hex_index = pending[i];
-        if (!state.locked[hex_index]) continue;
+        if (!state.locked(hex_index)) continue;
 
         BattleEvent ev{};
         const HexCoord& c = state.grid->coord_of(hex_index);
         ev.q = c.q;
         ev.r = c.r;
         ev.s = c.s;
-        for (int k = 0; k < MAX_BATTLE_CONTRIB; ++k) {
-            if (state.battle_faction[hex_index][k] == NO_FACTION) continue;
+        const Battle* b = state.battle_at(hex_index);
+        for (int k = 0; b != nullptr && k < b->nslots; ++k) {
+            if (b->slots[k].faction == NO_FACTION) continue;
             ContributionStart cs{};
-            cs.faction = state.battle_faction[hex_index][k];
-            cs.origin_hex = state.battle_origin[hex_index][k];
-            for (int t = 0; t < NUM_UNIT_TYPES; ++t) {
-                cs.units[t] = state.battle_units[hex_index][k][t];
-            }
+            cs.faction = b->slots[k].faction;
+            cs.origin_hex = b->slots[k].origin;
+            for (int t = 0; t < NUM_UNIT_TYPES; ++t) cs.units[t] = b->slots[k].units[t];
             ev.contributions_start.push_back(cs);
         }
 
@@ -126,21 +125,7 @@ void run_battle_phase_logged(GameState& state, const TurnDecisions& decisions, R
         if (winner < 0) {
             state.army_faction[hex_index] = NO_FACTION;
             for (int t = 0; t < NUM_UNIT_TYPES; ++t) state.army_units[hex_index][t] = 0;
-            state.locked[hex_index] = false;
-            for (int k = 0; k < MAX_BATTLE_CONTRIB; ++k) {
-                state.battle_faction[hex_index][k] = NO_FACTION;
-                state.battle_origin[hex_index][k] = NO_ORIGIN;
-                state.battle_moved[hex_index][k] = false;
-                for (int t = 0; t < NUM_UNIT_TYPES; ++t) state.battle_units[hex_index][k][t] = 0;
-            }
-            state.battle_nslots[hex_index] = 0;
-            state.battle_round[hex_index] = 0;
-            int w = 0;
-            for (int j = 0; j < state.num_battles; ++j) {
-                if (state.battle_order[j] == hex_index) continue;
-                state.battle_order[w++] = state.battle_order[j];
-            }
-            state.num_battles = static_cast<int16_t>(w);
+            state.erase_battle(hex_index);
         } else {
             const int owner = state.city_owner[hex_index];
             int cap = MAX_STACK_SIZE;

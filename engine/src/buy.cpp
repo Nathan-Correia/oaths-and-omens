@@ -108,7 +108,7 @@ void get_legal_buy_actions(const GameState& state, int faction, LegalBuyActions&
     // 1. Recruit infantry at an owned, unlocked city.
     if (remaining_cap(counts, kInfantry) > 0 && state.gold[faction] >= kInfantryCost) {
         for (int h = 0; h < n; ++h) {
-            if (state.city_owner[h] != faction || state.locked[h]) continue;
+            if (state.city_owner[h] != faction || state.locked(h)) continue;
             if (state.is_capital[h] || !adjacent_enemy_present(state, h, faction)) {
                 out.push_back(BuyAction{BuyType::kBuyInfantry, static_cast<int16_t>(h), 0, 0});
             }
@@ -133,7 +133,7 @@ void get_legal_buy_actions(const GameState& state, int faction, LegalBuyActions&
         bool eligible[MAX_HEXES];
         eligible_outpost_mask(state, faction, eligible);
         for (int h = 0; h < n; ++h) {
-            if (state.army_faction[h] != faction || state.locked[h]) continue;
+            if (state.army_faction[h] != faction || state.locked(h)) continue;
             if (!eligible[h]) continue;
             for (int unit = 0; unit < NUM_UNIT_TYPES; ++unit) {
                 if (state.army_units[h][unit] > 0) {
@@ -147,7 +147,7 @@ void get_legal_buy_actions(const GameState& state, int faction, LegalBuyActions&
     // 4. Upgrade (or convert) an owned outpost. Upgrade order is barracks,
     // workshop, temple - engine_old iterates UPGRADE_COSTS, a dict in that order.
     for (int h = 0; h < n; ++h) {
-        if (state.city_owner[h] != faction || state.is_capital[h] || state.locked[h]) continue;
+        if (state.city_owner[h] != faction || state.is_capital[h] || state.locked(h)) continue;
         const int current = state.outpost_upgrade[h];
         for (int up = 0; up < NUM_UPGRADE_TYPES; ++up) {
             if (up == current) continue;
@@ -167,7 +167,7 @@ bool apply_one(GameState& state, int faction, const BuyAction& action,
     switch (action.type) {
         case BuyType::kBuyInfantry: {
             const int h = action.hex;
-            if (state.city_owner[h] != faction || state.locked[h]) return false;
+            if (state.city_owner[h] != faction || state.locked(h)) return false;
 
             if (!state.is_capital[h]) {
                 if (enemy_adjacent_cache[h] < 0) {
@@ -218,7 +218,7 @@ bool apply_one(GameState& state, int faction, const BuyAction& action,
         case BuyType::kBuildOutpost: {
             const int h = action.hex;
             const int unit = action.unit_type;
-            if (state.army_faction[h] != faction || state.locked[h]) return false;
+            if (state.army_faction[h] != faction || state.locked(h)) return false;
             if (state.army_units[h][unit] <= 0) return false;
             if (state.gold[faction] < kOutpostCost || outpost_count(state, faction) >= kOutpostCap) {
                 return false;
@@ -236,7 +236,7 @@ bool apply_one(GameState& state, int faction, const BuyAction& action,
         case BuyType::kUpgradeOutpost: {
             const int h = action.hex;
             const int up = action.upgrade;
-            if (state.city_owner[h] != faction || state.is_capital[h] || state.locked[h]) return false;
+            if (state.city_owner[h] != faction || state.is_capital[h] || state.locked(h)) return false;
             if (state.outpost_upgrade[h] == up) return false;
             if (!can_afford_resources(state, faction, up)) return false;
 

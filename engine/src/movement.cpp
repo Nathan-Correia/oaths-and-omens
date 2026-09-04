@@ -1,6 +1,7 @@
 #include "oo/movement.hpp"
 
 #include <cassert>
+#include <cstdlib>
 
 namespace oo {
 
@@ -31,7 +32,7 @@ void legal_mask_impl(const GameState& state, int faction, bool require_cavalry, 
     const HexGrid& grid = *state.grid;
     const int n = state.num_hexes;
     for (int h = 0; h < n; ++h) {
-        bool own = state.army_faction[h] == faction && !state.locked[h] && !state.frozen[h];
+        bool own = state.army_faction[h] == faction && !state.locked(h) && !state.frozen[h];
         if (own && require_cavalry) own = state.army_units[h][kCavalry] > 0;
         for (int d = 0; d < NUM_DIRECTIONS; ++d) {
             const int j = grid.neighbour(h, d);
@@ -62,37 +63,30 @@ void subtract_departure(GameState& state, int hex_index, const Units& units) {
     }
 }
 
-int first_empty_battle_slot(const GameState& state, int hex_index) {
-    for (int k = 0; k < MAX_BATTLE_CONTRIB; ++k) {
-        if (state.battle_faction[hex_index][k] == NO_FACTION) return k;
-    }
-    assert(false && "battle contributions exceeded MAX_BATTLE_CONTRIB - raise the cap");
-    return -1;
-}
-
 // Appends contributions to whatever is already at `hex_index`, locking the hex if
 // it was not already. The round number is reset only when the hex NEWLY locks.
 // Records the hex into battle_order at that same moment - creation order, which
 // matters because the dismount cap tally is shared across a turn's battles.
 void start_or_extend_battle(GameState& state, int hex_index, const Contribution* contribs,
                             int n_contribs) {
-    const bool was_locked = state.locked[hex_index];
+    // new_battle appends to the creation-ordered table and sets battle_index,
+    // which is also what makes the hex `locked`. Round is reset only when the hex
+    // NEWLY locks, never when an existing battle is reinforced.
+    Battle* b = state.battle_at(hex_index);
+    if (b == nullptr) b = &state.new_battle(hex_index);
+
     for (int i = 0; i < n_contribs; ++i) {
-        const int slot = first_empty_battle_slot(state, hex_index);
-        state.battle_faction[hex_index][slot] = static_cast<int8_t>(contribs[i].faction);
-        state.battle_origin[hex_index][slot] = contribs[i].origin;
-        for (int t = 0; t < NUM_UNIT_TYPES; ++t) {
-            state.battle_units[hex_index][slot][t] = contribs[i].units.u[t];
-        }
-        state.battle_moved[hex_index][slot] = contribs[i].moved;
-        state.battle_nslots[hex_index] = static_cast<uint8_t>(slot + 1);
+        // Also checked in release - engine_old raises RuntimeError here, and
+        // overflowing the slot array would corrupt neighbouring battles.
+        assert(b->nslots < MAX_BATTLE_CONTRIB &&
+               "battle contributions exceeded MAX_BATTLE_CONTRIB - raise the cap");
+        if (b->nslots >= MAX_BATTLE_CONTRIB) std::abort();
+        BattleSlot& slot = b->slots[b->nslots++];
+        slot.faction = static_cast<int8_t>(contribs[i].faction);
+        slot.origin = contribs[i].origin;
+        for (int t = 0; t < NUM_UNIT_TYPES; ++t) slot.units[t] = contribs[i].units.u[t];
+        slot.moved = contribs[i].moved;
     }
-    if (!was_locked) {
-        state.battle_round[hex_index] = 0;
-        assert(state.num_battles < MAX_ACTIVE_BATTLES);
-        state.battle_order[state.num_battles++] = static_cast<int16_t>(hex_index);
-    }
-    state.locked[hex_index] = true;
     state.clear_army(hex_index);
 }
 
@@ -134,7 +128,7 @@ void apply_movement_step(GameState& state, const MoveActions& actions, Rng& rng,
 
         if (from < 0 || from >= state.num_hexes) continue;
         if (state.army_faction[from] != faction) continue;
-        if (state.locked[from] || state.frozen[from]) continue;
+        if (state.locked(from) || state.frozen[from]) continue;
         const Units units = units_to_move(state, from, cavalry_only);
         if (units.total() <= 0) continue;
         if (dir < 0 || dir >= NUM_DIRECTIONS) continue;
@@ -244,7 +238,7 @@ void apply_movement_step(GameState& state, const MoveActions& actions, Rng& rng,
         const int dest = dests[d];
         const SmallVec<int, MAX_FACTIONS>& group = arrivals[d];
 
-        if (state.locked[dest]) {
+        if (state.locked(dest)) {
             Contribution contribs[MAX_FACTIONS];
             for (int i = 0; i < group.size(); ++i) {
                 const CollectedMove& a = moves[group[i]];

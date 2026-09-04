@@ -37,6 +37,7 @@
 #include "oo/turn.hpp"
 
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -399,8 +400,14 @@ PYBIND11_MODULE(oo_engine, m) {
             copy_in<int8_t, int8_t>(kw["city_placer"], s->city_placer, n);
             copy_in<int8_t, int8_t>(kw["army_faction"], s->army_faction, n);
             copy_in<bool, bool>(kw["frozen"], s->frozen, n);
-            copy_in<bool, bool>(kw["locked"], s->locked, n);
-            copy_in<int16_t, int16_t>(kw["battle_round"], s->battle_round, n);
+            // `locked` and `battle_round` are no longer stored; they are derived
+            // from the sparse battle table built below. Read here only so the
+            // Python side's values can be honoured.
+            auto locked_arr =
+                kw["locked"].cast<py::array_t<bool, py::array::c_style | py::array::forcecast>>();
+            auto round_arr = kw["battle_round"]
+                                 .cast<py::array_t<int16_t,
+                                                   py::array::c_style | py::array::forcecast>>();
             copy_in<int32_t, int32_t>(kw["capital_settle_order"], s->capital_settle_order, nf);
             copy_in<int32_t, int32_t>(kw["gold"], s->gold, nf);
             copy_in<int32_t, int32_t>(kw["kill_xp"], s->kill_xp, nf);
@@ -424,6 +431,9 @@ PYBIND11_MODULE(oo_engine, m) {
                 }
             }
             {
+                // Dense arrays in, sparse table out. Battles are created in
+                // battle_order (the creation order that affects outcomes), then
+                // their slots filled from the dense arrays.
                 auto bf = kw["battle_faction"]
                               .cast<py::array_t<int8_t, py::array::c_style | py::array::forcecast>>();
                 auto bo = kw["battle_origin"]
@@ -436,25 +446,29 @@ PYBIND11_MODULE(oo_engine, m) {
                 auto ro = bo.unchecked<2>();
                 auto rm = bm.unchecked<2>();
                 auto ru = bu.unchecked<3>();
-                for (int i = 0; i < n; ++i) {
-                    int used = 0;
+                auto rr = round_arr.unchecked<1>();
+
+                for (py::handle h : kw["battle_order"].cast<py::sequence>()) {
+                    const int hex_index = h.cast<int>();
+                    Battle& b = s->new_battle(hex_index);
+                    b.round = rr(hex_index);
                     for (int k = 0; k < MAX_BATTLE_CONTRIB; ++k) {
-                        s->battle_faction[i][k] = rf(i, k);
-                        s->battle_origin[i][k] = ro(i, k);
-                        s->battle_moved[i][k] = rm(i, k);
-                        for (int t = 0; t < NUM_UNIT_TYPES; ++t) {
-                            s->battle_units[i][k][t] = ru(i, k, t);
-                        }
-                        if (rf(i, k) != NO_FACTION) used = k + 1;
+                        if (rf(hex_index, k) == NO_FACTION) continue;
+                        BattleSlot& sl = b.slots[k];
+                        sl.faction = rf(hex_index, k);
+                        sl.origin = ro(hex_index, k);
+                        sl.moved = rm(hex_index, k);
+                        for (int t = 0; t < NUM_UNIT_TYPES; ++t) sl.units[t] = ru(hex_index, k, t);
+                        b.nslots = static_cast<uint8_t>(k + 1);
                     }
-                    s->battle_nslots[i] = static_cast<uint8_t>(used);
                 }
-            }
-            {
-                py::sequence order = kw["battle_order"].cast<py::sequence>();
-                s->num_battles = 0;
-                for (py::handle h : order) {
-                    s->battle_order[s->num_battles++] = h.cast<int16_t>();
+
+                auto rl = locked_arr.unchecked<1>();
+                for (int i = 0; i < n; ++i) {
+                    if (rl(i) != s->locked(i)) {
+                        throw std::runtime_error(
+                            "ArrayState: `locked` disagrees with battle_order/battle_faction");
+                    }
                 }
             }
             s->turn_number = kw["turn_number"].cast<int32_t>();
@@ -500,37 +514,101 @@ PYBIND11_MODULE(oo_engine, m) {
             GameState& s = self.cast<GameState&>();
             return view1(self, s.frozen, s.num_hexes);
         })
-        .def_property_readonly("locked", [](py::object self) {
-            GameState& s = self.cast<GameState&>();
-            return view1(self, s.locked, s.num_hexes);
-        })
-        .def_property_readonly("battle_faction", [](py::object self) {
-            GameState& s = self.cast<GameState&>();
-            return view2<int8_t, MAX_BATTLE_CONTRIB>(self, s.battle_faction, s.num_hexes);
-        })
-        .def_property_readonly("battle_origin", [](py::object self) {
-            GameState& s = self.cast<GameState&>();
-            return view2<int32_t, MAX_BATTLE_CONTRIB>(self, s.battle_origin, s.num_hexes);
-        })
-        .def_property_readonly("battle_units", [](py::object self) {
-            GameState& s = self.cast<GameState&>();
-            return view3<int16_t, MAX_BATTLE_CONTRIB, NUM_UNIT_TYPES>(self, s.battle_units,
-                                                                      s.num_hexes);
-        })
-        .def_property_readonly("battle_moved", [](py::object self) {
-            GameState& s = self.cast<GameState&>();
-            return view2<bool, MAX_BATTLE_CONTRIB>(self, s.battle_moved, s.num_hexes);
-        })
-        .def_property_readonly("battle_round", [](py::object self) {
-            GameState& s = self.cast<GameState&>();
-            return view1(self, s.battle_round, s.num_hexes);
-        })
+        // From here down the battle fields are COPIES, not views: the state no
+        // longer stores them densely (M6d). Agents only ever read them, and the
+        // bindings are transitional scaffolding (PLAN.md §5), so materializing on
+        // access is the right trade - correctness for the parity oracles, at a
+        // cost nothing in the shipping path pays.
+        .def_property_readonly("locked",
+                               [](const GameState& s) {
+                                   py::array_t<bool> arr({py::ssize_t(s.num_hexes)});
+                                   auto r = arr.mutable_unchecked<1>();
+                                   for (int i = 0; i < s.num_hexes; ++i) r(i) = s.locked(i);
+                                   return arr;
+                               })
+        .def_property_readonly("battle_faction",
+                               [](const GameState& s) {
+                                   py::array_t<int8_t> arr(
+                                       {py::ssize_t(s.num_hexes), py::ssize_t(MAX_BATTLE_CONTRIB)});
+                                   auto r = arr.mutable_unchecked<2>();
+                                   for (int h = 0; h < s.num_hexes; ++h) {
+                                       for (int k = 0; k < MAX_BATTLE_CONTRIB; ++k) {
+                                           r(h, k) = NO_FACTION;
+                                       }
+                                       const Battle* b = s.battle_at(h);
+                                       for (int k = 0; b && k < b->nslots; ++k) {
+                                           r(h, k) = b->slots[k].faction;
+                                       }
+                                   }
+                                   return arr;
+                               })
+        .def_property_readonly("battle_origin",
+                               [](const GameState& s) {
+                                   py::array_t<int32_t> arr(
+                                       {py::ssize_t(s.num_hexes), py::ssize_t(MAX_BATTLE_CONTRIB)});
+                                   auto r = arr.mutable_unchecked<2>();
+                                   for (int h = 0; h < s.num_hexes; ++h) {
+                                       for (int k = 0; k < MAX_BATTLE_CONTRIB; ++k) {
+                                           r(h, k) = NO_ORIGIN;
+                                       }
+                                       const Battle* b = s.battle_at(h);
+                                       for (int k = 0; b && k < b->nslots; ++k) {
+                                           r(h, k) = b->slots[k].origin;
+                                       }
+                                   }
+                                   return arr;
+                               })
+        .def_property_readonly("battle_units",
+                               [](const GameState& s) {
+                                   py::array_t<int16_t> arr({py::ssize_t(s.num_hexes),
+                                                             py::ssize_t(MAX_BATTLE_CONTRIB),
+                                                             py::ssize_t(NUM_UNIT_TYPES)});
+                                   auto r = arr.mutable_unchecked<3>();
+                                   for (int h = 0; h < s.num_hexes; ++h) {
+                                       for (int k = 0; k < MAX_BATTLE_CONTRIB; ++k) {
+                                           for (int t = 0; t < NUM_UNIT_TYPES; ++t) r(h, k, t) = 0;
+                                       }
+                                       const Battle* b = s.battle_at(h);
+                                       for (int k = 0; b && k < b->nslots; ++k) {
+                                           for (int t = 0; t < NUM_UNIT_TYPES; ++t) {
+                                               r(h, k, t) = b->slots[k].units[t];
+                                           }
+                                       }
+                                   }
+                                   return arr;
+                               })
+        .def_property_readonly("battle_moved",
+                               [](const GameState& s) {
+                                   py::array_t<bool> arr(
+                                       {py::ssize_t(s.num_hexes), py::ssize_t(MAX_BATTLE_CONTRIB)});
+                                   auto r = arr.mutable_unchecked<2>();
+                                   for (int h = 0; h < s.num_hexes; ++h) {
+                                       for (int k = 0; k < MAX_BATTLE_CONTRIB; ++k) {
+                                           r(h, k) = false;
+                                       }
+                                       const Battle* b = s.battle_at(h);
+                                       for (int k = 0; b && k < b->nslots; ++k) {
+                                           r(h, k) = b->slots[k].moved;
+                                       }
+                                   }
+                                   return arr;
+                               })
+        .def_property_readonly("battle_round",
+                               [](const GameState& s) {
+                                   py::array_t<int16_t> arr({py::ssize_t(s.num_hexes)});
+                                   auto r = arr.mutable_unchecked<1>();
+                                   for (int h = 0; h < s.num_hexes; ++h) {
+                                       const Battle* b = s.battle_at(h);
+                                       r(h) = b != nullptr ? b->round : int16_t(0);
+                                   }
+                                   return arr;
+                               })
         // A plain list, matching ArrayState - agents only ever read it.
         .def_property_readonly("battle_order",
                                [](const GameState& s) {
                                    py::list out;
                                    for (int i = 0; i < s.num_battles; ++i) {
-                                       out.append(static_cast<int>(s.battle_order[i]));
+                                       out.append(static_cast<int>(s.battles[i].hex));
                                    }
                                    return out;
                                })
@@ -677,7 +755,7 @@ PYBIND11_MODULE(oo_engine, m) {
 
               py::set out;
               for (int i = 0; i < s.num_hexes; ++i) {
-                  if (s.locked[i]) out.add(py::int_(i));
+                  if (s.locked(i)) out.add(py::int_(i));
               }
               return out;
           },
