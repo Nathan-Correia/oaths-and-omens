@@ -1083,6 +1083,67 @@ Not to be built yet, but the constraints above exist to make it a small change:
   straight into a tensor. The sparse-battle refactor from §4.3 matters here —
   it is the difference between 65 KB and 10 KB per node.
 
+### 7.1 Result (M7)
+
+Built as designed: `run_games` in `include/oo/run.hpp`, a work queue over a
+shared cursor, `--threads N` on `oo_run` (default: all hardware threads, `1`
+spawns nothing).
+
+Determinism verified at 1, 2, 3, 5, 7, 12 and 32 threads — byte-identical
+summaries. `oo_run` tallies afterwards on one thread in game order, so even the
+floating-point sums cannot depend on completion order. `tests/test_run.cpp`
+pins the invariant with no golden data and is mutation-tested: seeding per
+thread is caught (146 failures), writing results in completion order is caught
+(731).
+
+Measured on a 5600X (6 cores / 12 threads), r7 f8:
+
+| threads | greedy games/s | tactician games/s |
+|--------:|---------------:|------------------:|
+| 1  |  900 |  52.0 |
+| 2  | 1774 | 102.0 |
+| 4  | 3332 | 189.0 |
+| 6  | 4353 | 247.7 |
+| 12 | 5732 | 344.4 |
+
+**6.4x on 12 threads, not the ~10x predicted above** — that estimate treated 12
+hardware threads as 12 cores. It is 6 physical cores plus SMT: near-linear to 4
+threads (3.7x), 4.8x at 6, and SMT adds the remaining ~32 %.
+
+A stale comment on `HexGrid::shared` claiming it was not thread-safe is
+corrected; it is mutex-guarded, entries are never removed, and grids are
+heap-allocated, so returned references stay valid for the process lifetime.
+`run_games` still warms the radius before spawning, to keep the lock off the
+hot path.
+
+### 7.2 Profiling (AMD uProf)
+
+Profiled before M7 on the real `/O2 /GL` binary (time-based sampling, 1 kHz).
+Release now emits PDBs — `/OPT:REF` and `/OPT:ICF` are restated explicitly
+because `/DEBUG` otherwise flips them off, which would change the binary being
+measured. `tools/profile.ps1` captures both workloads.
+
+Three hotspots, all fixed, all output-identical (2.7x engine, 1.6x tactician):
+
+| | share before | after |
+|---|---|---|
+| `eligible_outpost_mask` | 63 % of a greedy game | 11x less time |
+| `legal_mask_impl` | 26 % of a tactician game | 2.2x less time |
+| `Rng::seed` (tactician rollouts) | 4.5 % | off the chart |
+
+The first was the big one: it swept all 169 hexes per city to clear a ban
+radius of 2, which covers 7. `HexGrid` now precomputes neighbourhood (ball)
+lists, making the cost independent of board size; `test_grid` gained 346k
+checks pinning `ball()` against the golden distance table, because an
+under-reporting ball would silently make banned hexes legal — a rules change
+no existing parity test would necessarily reach.
+
+**Next tier, not yet done.** The three current leaders are the same shape: a
+full-board scan to find the few hexes a faction occupies (`legal_mask_impl`
+line 50, `mobile_hexes`, `random_movement`'s cell enumeration). A per-faction
+occupied-hex list in `GameState` would collapse all three, at the cost of an
+invariant every army mutation must preserve.
+
 ---
 
 ## 8. Milestones
@@ -1099,7 +1160,7 @@ Not to be built yet, but the constraints above exist to make it a small change:
 | ~~M6b~~ | ~~Native tactician + the six leaf agents~~ | **done — 202 921 decisions and 155/155 games identical; tactician 56–73x (§6.7)** |
 | ~~M6c~~ | ~~`oo_run` / `oo_tournament` + native JSON~~ | **done — 120/120 files byte-identical; `run.py` deleted (§6.8)** |
 | ~~M6d~~ | ~~Sparse battle storage~~ | **done — 68.6 KB -> 17.7 KB; all gates green (§6.9)** |
-| M7 | `run_games` thread pool | ~10x on 12 threads, deterministic per seed |
+| M7 | `run_games` thread pool | **DONE** — 6.4x on 12 threads (6 cores + SMT), deterministic per seed |
 | M8 | **Python removed** | `-DOO_BUILD_PYTHON=OFF` builds and passes everything; `bindings/`, shims, `engine_old/`, `agents/` deleted |
 
 M1–M4 are where nearly all the risk lives. M5 is mechanical. M6 is the largest
