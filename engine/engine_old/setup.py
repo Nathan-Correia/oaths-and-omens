@@ -147,7 +147,13 @@ def _place_round(grid, terrain, rng, start, type_name, round_index, log, bag, ch
                 if j != -1 and terrain[j] == _UNSET:
                     candidates.add(int(j))
         candidates = [
-            c for c in candidates
+            # sorted(): CPython's set iteration order for small ints is
+            # deterministic but is an artifact of hash-table layout, and this
+            # list is fed straight to rng.choice below - so iteration order
+            # decides which hex gets placed. Sorting makes that order a plain
+            # property of the data instead, which is what lets the C++ port
+            # reproduce terrain generation exactly (see engine/PLAN.md §3.2).
+            c for c in sorted(candidates)
             if _can_place(grid, terrain, c, type_name, type_index, len(placed), check_disconnect=check_disconnect)
         ]
         if not candidates:
@@ -190,7 +196,7 @@ def generate_terrain(grid, rng, log=None):
     unset = set(range(grid.num_hexes))
     bag = dict(BAG_COUNTS)
 
-    edge_hexes = [i for i in unset if grid.is_edge(i)]
+    edge_hexes = [i for i in sorted(unset) if grid.is_edge(i)]
     start = rng.choice(edge_hexes)
 
     round_index = 0
@@ -213,7 +219,7 @@ def generate_terrain(grid, rng, log=None):
                 check_disconnect = False
         if unset:
             candidates = [
-                i for i in unset
+                i for i in sorted(unset)  # see _place_round's note on sorted()
                 if any(terrain[j] != _UNSET for j in grid.neighbor_table[i] if j != -1)
             ]
             start = rng.choice(candidates)
