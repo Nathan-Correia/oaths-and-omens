@@ -146,11 +146,15 @@ public:
 
     // random.py:shuffle - Fisher-Yates walking downward, `j = randbelow(i + 1)`.
     template <class T>
-    void shuffle(std::vector<T>& x) {
-        for (int64_t i = static_cast<int64_t>(x.size()) - 1; i >= 1; --i) {
+    void shuffle(T* first, size_t n) {
+        for (int64_t i = static_cast<int64_t>(n) - 1; i >= 1; --i) {
             const int64_t j = static_cast<int64_t>(randbelow(static_cast<uint64_t>(i + 1)));
-            std::swap(x[static_cast<size_t>(i)], x[static_cast<size_t>(j)]);
+            std::swap(first[i], first[j]);
         }
+    }
+    template <class T>
+    void shuffle(std::vector<T>& x) {
+        shuffle(x.data(), x.size());
     }
 
     // random.py:sample, for a population of `n` items, returning the chosen

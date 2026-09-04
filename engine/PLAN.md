@@ -817,6 +817,65 @@ exactly:
    whose per-faction RNGs *are* mutated by rollouts and persist across the game. Their
    stream state is a function of how many rollouts ran. Model it explicitly.
 
+### 6.6 M6a result — DONE
+
+`random`, `greedy`, `heuristic`, `vanguard` and `marshal` are native, along with
+`agent_util` (the shared helpers), `game.cpp`'s `play_game`, and an `oo_tournament`
+app. A game can now run with **no Python in the loop at all**.
+
+**Parity, two independent gates:**
+
+- **Decision level** (`tools/compare_agents.py`): the game is driven by the PYTHON
+  agents so it follows the reference trajectory exactly, and at every decision
+  point the native agent is asked about the same state and its answer compared.
+  **25 255 decisions, 0 differences**, across 3 board sizes x 3 seeds x 12 turns
+  per agent. This pinpoints a divergence at the decision that causes it rather
+  than leaving a diverging final score to be reverse-engineered.
+- **Whole game** (`test_agents`, in ctest): nothing replayed, nothing fed in - a
+  (agent, radius, factions, seed) tuple in, and the native agents must reach the
+  identical winner, turn count and per-faction VP the Python agents did.
+  **80/80 games.** The golden file is checked in, so this needs no Python.
+
+**Speed** — same games all three ways (turn counts identical, confirming parity):
+
+| agents | Python engine | C++ engine (M5) | native (M6a) | total |
+|---|---|---|---|---|
+| random | 0.150 s | 0.0092 s | 0.0027 s | **56x** |
+| greedy | 0.174 s | 0.0317 s | 0.0030 s | **58x** |
+| heuristic | 0.214 s | 0.0606 s | 0.0034 s | **63x** |
+| vanguard | 0.241 s | 0.1173 s | 0.0037 s | **65x** |
+| marshal | 0.270 s | 0.1573 s | 0.0048 s | **56x** |
+
+The M5 column is what the binding layer bought; the gap between it and M6a is
+exactly the Python agent overhead this milestone removed.
+
+**A second reference normalization was needed, and it is the §3.2 decision again.**
+`greedy_rush_move` and `heuristic_move` ranked mobile armies with
+`np.argsort(-sizes)` — and **numpy's default argsort is quicksort, whose order
+among equal keys is an unreproducible implementation artifact**. Army sizes are
+small integers so ties are the common case; measured, the default differs from a
+stable sort in **62 % of random 8-element arrays and ~100 % by 20 elements**. Which
+of two equally sized armies moved first was therefore being decided by numpy
+internals.
+
+My first attempt assumed numpy's sub-16-element insertion-sort path made it
+stable in practice. That was simply wrong, and measuring it is what showed so.
+
+Both call sites now pass `kind="stable"`, making the tie-break plain ascending hex
+order. Same reasoning as §3.2's `sorted()` fix: normalize the reference rather than
+bake a library implementation detail into the permanent C++ engine forever. It does
+change Python agent behaviour on ties, so pre-M6a game outcomes are not comparable.
+
+**Design notes worth keeping:**
+
+- `Agent` carries a no-op `decide_play_cards` from the start (§9), so adding action
+  cards later does not have to touch every agent.
+- Agents are per-game objects seeded `seed * 1_000_003 + faction`, matching every
+  `make_X_agents`; §7's thread pool wants one full set per thread, so construction
+  is deliberately cheap.
+- `NativeAgentSet` is exposed through the bindings purely so decisions can be
+  compared side by side in one process. It goes with the rest of `bindings/` at M8.
+
 ### 6.5 Native game driver
 
 Once agents are native, expose `play_game(config, seeds, assignment)` and
@@ -862,7 +921,7 @@ Not to be built yet, but the constraints above exist to make it a small change:
 | ~~M3~~ | ~~buy + movement + battle + turn~~ | **done — 180 turns / 9 064 decisions, 27 movement scenarios, 194 legal-action states, 23 buy scenarios; 13/13 mutations caught (§3.3b)** |
 | ~~M4~~ | ~~setup + placement~~ | **done — 320 maps / 29 120 hexes regenerated from seed alone, 19 setup cases; 11/11 mutations caught (§3.3c)** |
 | ~~M5~~ | ~~Bindings; `tournament.py` unmodified~~ | **done — 100/100 games identical; 1.7x–15.9x by agent (§5.1). `run.py` deferred to M6c with the native JSON writer.** |
-| M6a | Native random/greedy/heuristic/vanguard/marshal | per-agent parity vs Python |
+| ~~M6a~~ | ~~Native random/greedy/heuristic/vanguard/marshal~~ | **done — 25 255 decisions and 80/80 whole games identical; 56–65x end to end (§6.6)** |
 | M6b | Native tactician + the six leaf agents | per-agent parity; all 12 native |
 | M6c | `oo_run` / `oo_tournament` executables + native JSON | all three JSON files byte-identical (§1.3); `web_visualizer.html` loads it; 100x+ |
 | M6d | Sparse battle storage | `GameState` ~10 KB, parity holds |

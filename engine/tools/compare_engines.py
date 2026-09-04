@@ -29,6 +29,14 @@ _REPO = os.path.dirname(os.path.dirname(_HERE))
 
 # agents x board sizes. Deliberately includes tactician, whose search calls the
 # engine thousands of extra times per turn through the binding layer.
+# The M6a subset: the agents implemented natively so far. MUST match
+# apps/oo_tournament.cpp's kMatrix entry for entry, in order.
+MATRIX_M6A = [
+    ("random", 7, 8), ("random", 4, 4), ("random", 5, 6), ("random", 8, 8),
+    ("greedy", 7, 8), ("greedy", 4, 4), ("greedy", 5, 6), ("greedy", 8, 8),
+    ("heuristic", 7, 8), ("vanguard", 7, 8), ("marshal", 7, 8), ("marshal", 5, 6),
+]
+
 MATRIX = [
     ("random", 7, 8), ("random", 4, 4), ("random", 5, 6), ("random", 8, 8),
     ("greedy", 7, 8), ("greedy", 4, 4), ("greedy", 5, 6), ("greedy", 8, 8),
@@ -40,7 +48,8 @@ SEEDS_PER_ENTRY = 5
 MAX_TURNS = 60
 
 
-def run(which):
+def run(which, matrix=None):
+    matrix = matrix or MATRIX
     sys.path.insert(0, _REPO)
     if which == "old":
         sys.path.insert(0, _HERE)
@@ -53,7 +62,7 @@ def run(which):
     import tournament
 
     results = []
-    for agent, radius, num_factions in MATRIX:
+    for agent, radius, num_factions in matrix:
         for s in range(SEEDS_PER_ENTRY):
             seed = 5000 + s
             r = tournament.play_game({f: agent for f in range(num_factions)}, radius,
@@ -89,4 +98,4 @@ def diff(path_a, path_b):
 if __name__ == "__main__":
     if sys.argv[1] == "diff":
         sys.exit(diff(sys.argv[2], sys.argv[3]))
-    run(sys.argv[1])
+    run(sys.argv[1], MATRIX_M6A if "--m6a" in sys.argv else None)

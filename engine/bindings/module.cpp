@@ -25,6 +25,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include "oo/agent.hpp"
 #include "oo/battle.hpp"
 #include "oo/buy.hpp"
 #include "oo/collect.hpp"
@@ -854,6 +855,96 @@ PYBIND11_MODULE(oo_engine, m) {
           },
           py::arg("state"), py::arg("decide_placement"), py::arg("decide_draft"),
           py::arg("decide_swap"), py::arg("rng"), py::arg("log") = py::none());
+
+    // --- native agents, exposed for side-by-side decision comparison --------
+    // Lets one process ask the Python agent and the native agent for a decision
+    // about the SAME state and diff them. That is how M6a parity is verified:
+    // comparing decisions directly rather than inferring from game outcomes, the
+    // same "compare the menu, not the effect" lesson as §3.3c.
+    py::class_<AgentSet>(m, "NativeAgentSet")
+        .def(py::init([](const std::string& kind, int num_factions, int64_t seed) {
+            AgentKind k;
+            if (!agent_kind_from_name(kind.c_str(), k)) {
+                throw std::runtime_error("unknown native agent: " + kind);
+            }
+            auto set = std::make_unique<AgentSet>();
+            build_agents(*set, k, num_factions, seed);
+            return set;
+        }))
+        .def("decide_buy",
+             [](AgentSet& self, const GameState& s, int faction) {
+                 LegalBuyActions legal;
+                 get_legal_buy_actions(s, faction, legal);
+                 ChosenBuyActions chosen;
+                 chosen.clear();
+                 self.get(faction)->decide_buy(s, faction, legal, chosen);
+                 py::list out;
+                 for (int i = 0; i < chosen.size(); ++i) out.append(buy_action_to_dict(chosen[i]));
+                 return out;
+             })
+        .def("decide_movement",
+             [](AgentSet& self, const GameState& s, int faction, int step) -> py::object {
+                 LegalMask legal;
+                 legal_movement_mask(s, faction, legal);
+                 Move mv{};
+                 if (!self.get(faction)->decide_movement(s, faction, step, legal, mv)) {
+                     return py::none();
+                 }
+                 return py::make_tuple(static_cast<int>(mv.hex), static_cast<int>(mv.dir));
+             })
+        .def("decide_cavalry",
+             [](AgentSet& self, const GameState& s, int faction, int step) -> py::object {
+                 LegalMask legal;
+                 legal_cavalry_mask(s, faction, legal);
+                 Move mv{};
+                 if (!self.get(faction)->decide_cavalry(s, faction, step, legal, mv)) {
+                     return py::none();
+                 }
+                 return py::make_tuple(static_cast<int>(mv.hex), static_cast<int>(mv.dir));
+             })
+        .def("decide_target",
+             [](AgentSet& self, const GameState& s, int hex_index, int faction) -> py::object {
+                 const int t = self.get(faction)->decide_target(s, hex_index, faction);
+                 return t < 0 ? py::none() : py::cast(t);
+             })
+        .def("decide_rectification",
+             [](AgentSet& self, const GameState& s, int hex_index, int winner, int cap) {
+                 SendBack sb;
+                 sb.clear();
+                 self.get(winner)->decide_rectification(s, hex_index, winner, cap, sb);
+                 py::list out;
+                 for (int i = 0; i < sb.size(); ++i) {
+                     py::dict d;
+                     d["origin_hex"] = sb[i].origin_hex;
+                     d["units"] = py::make_tuple(sb[i].units[0], sb[i].units[1], sb[i].units[2]);
+                     out.append(d);
+                 }
+                 return out;
+             })
+        .def("decide_resource_choice",
+             [](AgentSet& self, const GameState& s, int faction, int hex_index) {
+                 return self.get(faction)->decide_resource_choice(s, faction, hex_index) == kIron
+                            ? "iron"
+                            : "fish";
+             })
+        .def("decide_placement",
+             [](AgentSet& self, const GameState& s, int faction) {
+                 bool legal[MAX_HEXES];
+                 legal_placement_mask(s, legal);
+                 return self.get(faction)->decide_placement(s, faction, legal);
+             })
+        .def("decide_draft",
+             [](AgentSet& self, const GameState& s, int faction, py::sequence pool) {
+                 SmallVec<int16_t, MAX_HEXES> p;
+                 p.clear();
+                 for (py::handle h : pool) p.push_back(h.cast<int16_t>());
+                 return self.get(faction)->decide_draft(s, faction, p.items, p.size());
+             })
+        .def("decide_swap",
+             [](AgentSet& self, const GameState& s, int faction, int leftover, int placer,
+                int placer_hex) {
+                 return self.get(faction)->decide_swap(s, faction, leftover, placer, placer_hex);
+             });
 
     // Debug helper for verifying the getstate/setstate RNG bridge (see the file
     // header). Draws n values natively through the borrow path, so a Python

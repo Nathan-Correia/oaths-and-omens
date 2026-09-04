@@ -50,8 +50,15 @@ add_library(oo_core STATIC
   src/turn.cpp
   src/setup.cpp
   src/placement.cpp
+  src/agent_util.cpp
+  src/agents.cpp
+  src/game.cpp
 )
 target_include_directories(oo_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
+# --- apps (the eventual replacements for run.py / tournament.py) ------------
+add_executable(oo_tournament apps/oo_tournament.cpp)
+target_link_libraries(oo_tournament PRIVATE oo_core)
 
 # --- transitional pybind11 module (PLAN.md 1.2, 5) --------------------------
 # Deleted at M8. Nothing in oo_core depends on this; it depends on oo_core.
@@ -98,6 +105,11 @@ add_executable(test_phases tests/test_phases.cpp)
 target_link_libraries(test_phases PRIVATE oo_core)
 add_test(NAME phase_parity
          COMMAND test_phases ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/phase_cases.txt)
+
+add_executable(test_agents tests/test_agents.cpp)
+target_link_libraries(test_agents PRIVATE oo_core)
+add_test(NAME agent_parity
+         COMMAND test_agents ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/agent_games.txt)
 
 add_executable(test_setup tests/test_setup.cpp)
 target_link_libraries(test_setup PRIVATE oo_core)
