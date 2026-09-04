@@ -109,8 +109,12 @@ public:
     int direction_between(int from_index, int to_index) const;
 
     // Grids are immutable and a few hundred KB; build each radius once and share.
-    // Not thread-safe to call concurrently for a radius not yet built - build the
-    // radii you need before starting a thread pool.
+    //
+    // Thread-safe: the cache is mutex-guarded, entries are never removed, and the
+    // grids themselves are heap-allocated, so a returned reference stays valid
+    // for the life of the process no matter what else is inserted afterwards.
+    // Callers that are about to spin up workers should still warm the radii they
+    // need first (run_games does), purely to keep the lock off the hot path.
     static const HexGrid& shared(int radius);
 
 private:

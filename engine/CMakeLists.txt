@@ -66,10 +66,16 @@ add_library(oo_core STATIC
   src/agent_util.cpp
   src/agents.cpp
   src/game.cpp
+  src/run.cpp
   src/turn_log.cpp
   src/json.cpp
 )
 target_include_directories(oo_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
+# std::thread for the §7 game-level pool. A no-op on MSVC; the explicit link is
+# what makes the same source build on a POSIX toolchain.
+find_package(Threads REQUIRED)
+target_link_libraries(oo_core PUBLIC Threads::Threads)
 
 # --- apps (the eventual replacements for run.py / tournament.py) ------------
 add_executable(oo_run apps/oo_run.cpp)
@@ -149,6 +155,12 @@ add_executable(test_movement tests/test_movement.cpp)
 target_link_libraries(test_movement PRIVATE oo_core)
 add_test(NAME movement_scenarios
          COMMAND test_movement ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/movement_scenarios.txt)
+
+# No golden data: this one asserts an invariant (thread count cannot change
+# results), so it stays valid as the rules evolve.
+add_executable(test_run tests/test_run.cpp)
+target_link_libraries(test_run PRIVATE oo_core)
+add_test(NAME run_determinism COMMAND test_run)
 
 add_executable(test_turn tests/test_turn.cpp)
 target_link_libraries(test_turn PRIVATE oo_core)
