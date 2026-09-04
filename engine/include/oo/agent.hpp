@@ -71,11 +71,21 @@ enum class AgentKind {
     kTactician,                                              // M6b, the search agent
 };
 
+inline constexpr int kNumAgentKinds = 12;
+
 // `seed` is the per-GAME seed; each faction's generator is seeded
 // seed * 1_000_003 + faction, exactly as engine_old does.
 void build_agents(AgentSet& out, AgentKind kind, int num_factions, int64_t seed);
 
+// A different kind per seat. Builds ONE full set per distinct kind and takes seat
+// f from the set for f's kind - which is exactly what compose_agents does, and it
+// matters: an agent's generator is seeded from its faction index, so seat f's
+// agent has to come from a set built for f.
+void build_mixed_agents(AgentSet& out, const AgentKind* per_seat, int num_factions,
+                        int64_t seed);
+
 // Returns false for an unrecognised name.
 bool agent_kind_from_name(const char* name, AgentKind& out);
+const char* agent_kind_name(AgentKind kind);
 
 }  // namespace oo

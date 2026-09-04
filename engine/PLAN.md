@@ -989,6 +989,36 @@ GIL round trips, and with `_clone_state` collapsed to a `memcpy`.
 
 ---
 
+### 6.8a Running the engine
+
+`run.bat` at the repo root wraps `engine/build/oo_run.exe` so the build path does
+not have to be remembered; every argument passes straight through.
+
+```
+run                                              one logged game, r7 f8, all tactician
+run --list-agents
+run --radius 5 --factions 4 --agents tactician,greedy,greedy,random
+run --games 200 --agents tactician,marshal --rotate
+run --games 50 --agent marshal --replay 7        summary, plus game 7's replay
+```
+
+| option | meaning |
+|---|---|
+| `--radius N` | board radius, 1–8 (radius 9+ cannot be filled — §9) |
+| `--factions N` | 1–10 |
+| `--games N` | default 1 |
+| `--agent NAME` | one kind for every seat |
+| `--agents A,B,…` | per-seat kinds, **cycled** if fewer names than factions |
+| `--seed N` | base seed; game *g* uses `seed + g` (default: clock) |
+| `--rotate` | shift the assignment one seat per game, cancelling seat bias |
+| `--replay K` | with `--games > 1`, also write game K's replay files |
+| `--max-turns N`, `--out-dir DIR` | safety cap (not a rule) and output location |
+
+A single game also writes the three replay files, so `web_visualizer.html` can
+open the result immediately; a batch prints a summary instead, broken down **both**
+by agent kind and by seat. The per-seat table is worth having: it shows whether
+position mattered, which is exactly what `--rotate` is there to neutralise.
+
 ### 6.9 M6d result — DONE
 
 `GameState` is **70 200 -> 18 128 bytes**, a 3.9x reduction, with every gate still

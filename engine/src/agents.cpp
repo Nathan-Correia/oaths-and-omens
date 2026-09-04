@@ -1445,6 +1445,40 @@ void build_agents(AgentSet& out, AgentKind kind, int num_factions, int64_t seed)
     }
 }
 
+void build_mixed_agents(AgentSet& out, const AgentKind* per_seat, int num_factions,
+                        int64_t seed) {
+    out.num_factions = num_factions;
+    AgentSet sets[kNumAgentKinds];
+    bool built[kNumAgentKinds] = {};
+    for (int f = 0; f < num_factions; ++f) {
+        const int k = static_cast<int>(per_seat[f]);
+        if (!built[k]) {
+            build_agents(sets[k], per_seat[f], num_factions, seed);
+            built[k] = true;
+        }
+    }
+    for (int f = 0; f < num_factions; ++f) {
+        out.agents[f] = std::move(sets[static_cast<int>(per_seat[f])].agents[f]);
+    }
+}
+
+const char* agent_kind_name(AgentKind kind) {
+    switch (kind) {
+        case AgentKind::kRandom: return "random";
+        case AgentKind::kGreedy: return "greedy";
+        case AgentKind::kHeuristic: return "heuristic";
+        case AgentKind::kVanguard: return "vanguard";
+        case AgentKind::kMarshal: return "marshal";
+        case AgentKind::kTurtle: return "turtle";
+        case AgentKind::kDenier: return "denier";
+        case AgentKind::kWarlord: return "warlord";
+        case AgentKind::kLegion: return "legion";
+        case AgentKind::kHussar: return "hussar";
+        case AgentKind::kSentinel: return "sentinel";
+        default: return "tactician";
+    }
+}
+
 bool agent_kind_from_name(const char* name, AgentKind& out) {
     const std::string n(name);
     if (n == "random") { out = AgentKind::kRandom; return true; }
