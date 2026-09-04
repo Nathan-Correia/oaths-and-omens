@@ -11,3 +11,7 @@ engine/build/
 *.pyd
 *.lib
 *.exp
+
+# profiler sessions and symbols
+engine/prof/
+*.pdb
