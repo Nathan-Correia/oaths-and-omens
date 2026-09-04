@@ -225,6 +225,20 @@ public:
         return lo;
     }
 
+    // Raw MT state, in CPython's random.getstate()/setstate() layout: 624 words
+    // followed by the index. Used by the transitional Python bindings to borrow a
+    // live random.Random's state, run a phase natively, and hand the advanced
+    // state back - which keeps the stream exactly shared with Python instead of
+    // paying a Python call per die roll.
+    void get_state(uint32_t out[625]) const {
+        for (int i = 0; i < kN; ++i) out[i] = mt_[i];
+        out[kN] = static_cast<uint32_t>(index_);
+    }
+    void set_state(const uint32_t in[625]) {
+        for (int i = 0; i < kN; ++i) mt_[i] = in[i];
+        index_ = static_cast<int>(in[kN]);
+    }
+
 private:
     static constexpr int kN = 624;
     static constexpr int kM = 397;

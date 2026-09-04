@@ -122,10 +122,12 @@ void apply_movement_step(GameState& state, const MoveActions& actions, Rng& rng,
     const HexGrid& grid = *state.grid;
 
     // --- validate and collect ------------------------------------------------
-    // Faction order, ascending - engine_old iterates a dict built by turn.py in
-    // range order, so this matches. Anything invalid is silently dropped.
+    // SUBMISSION order, not ascending faction order - see MoveActions. This is
+    // what engine_old's dict iteration gives, and it decides battle creation
+    // order further down. Anything invalid is silently dropped.
     SmallVec<CollectedMove, MAX_FACTIONS> moves;
-    for (int faction = 0; faction < state.num_factions; ++faction) {
+    for (int oi = 0; oi < actions.n_order; ++oi) {
+        const int faction = actions.order[oi];
         if (!actions.has[faction]) continue;
         const int from = actions.move[faction].hex;
         const int dir = actions.move[faction].dir;

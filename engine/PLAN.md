@@ -643,6 +643,64 @@ where the engine's share of the runtime is higher.
 
 ---
 
+### 5.1 M5 result — DONE
+
+`tournament.py` and all twelve agents run **unmodified** on the C++ engine.
+
+**Parity: 100/100 games identical** — 20 (agent × board-size) combinations × 5
+seeds, comparing winner, turn count and every faction's victory points.
+`tools/compare_engines.py` runs the matrix under each engine (two processes; only
+one can own the `engine` module name) and diffs.
+
+**Speed**, same games both sides (`tools/bench_engines.py`, 5 games each):
+
+| agents | board | Python s/game | C++ s/game | speedup |
+|---|---|---|---|---|
+| random | r7f8 | 0.150 | 0.0094 | **15.9x** |
+| greedy | r7f8 | 0.190 | 0.035 | 5.5x |
+| heuristic | r7f8 | 0.211 | 0.065 | 3.2x |
+| vanguard | r7f8 | 0.240 | 0.119 | 2.0x |
+| marshal | r7f8 | 0.267 | 0.158 | 1.7x |
+| tactician | r7f8 | 1.851 | 0.875 | 2.1x |
+| tactician | r5f6 | 0.799 | 0.357 | 2.2x |
+
+This is §0's prediction landing exactly: the speedup tracks how much of a game was
+engine rather than agent. `random_agent` barely thinks, so it gets 16x; marshal and
+tactician are agent-dominated and get ~2x. **The remaining time is now almost
+entirely Python agent code**, which is what M6 is for.
+
+**Two things found that the C++ test suite could not have caught**, both worth
+recording:
+
+1. **`MoveActions` lost submission order** — a real API gap, not a binding slip.
+   `engine_old` iterates `actions_by_faction`, a dict, in *insertion* order, and
+   that order decides how simultaneous arrivals are grouped by destination, which
+   becomes battle *creation* order, which is load-bearing for the shared dismount
+   cap. `run_turn` always inserts ascending, so an array indexed by faction
+   matched everywhere the trace tests looked. But `tactician_agent`'s rollout
+   builds `{faction: first_action}` and only then adds the others — submitting the
+   searching faction **first**. The two engines resolved the same two battles in
+   opposite order, which drifted the rollout opponents' RNGs, which eventually
+   changed a real move. `MoveActions` now carries an explicit `order[]`.
+2. **RNG bridging works by state transfer, not callbacks.** `run_turn` is handed a
+   live `random.Random`; because `oo::Rng` is bit-compatible (§3.1) we borrow via
+   `getstate()`, run the phase natively, and write back with `setstate()`. Verified
+   directly (`oo_engine._rng_draw`): zero-draw borrows leave the generator
+   untouched, native draws match Python's exactly, repeated one-draw borrows match,
+   and 2 000 draws across the 624-word regeneration boundary match.
+
+**Deliberately deferred: `run.py`.** It needs `run_turn_and_log`, which builds the
+per-checkpoint replay record. That belongs in C++ (§1.3 — the JSON must be written
+natively or replay stays Python-dependent forever), so building a Python-side
+version now would be precisely the throwaway work §1.2 warns against. `run.py`
+therefore does **not** work at M5; `oo_run` covers it at M6c. `tournament.py`,
+which drives `run_turn` with no logging, is the M5 integration test and works fully.
+
+Also verified: `-DOO_BUILD_PYTHON=OFF` still configures, builds and passes all 8
+tests, producing no `.pyd` — the §1.2 guarantee holds.
+
+---
+
 ## 6. Step 5 — rewrite the agents in C++ (where the real speedup is)
 
 50–60 % of current runtime is in `agents/`, and every Python callback additionally
@@ -803,7 +861,7 @@ Not to be built yet, but the constraints above exist to make it a small change:
 | ~~M2~~ | ~~Grid + state + terrain + collect~~ | **done — 43 105 grid checks over 11 radii; 970 phase cases, 0 failures; 4/4 mutations caught (§3.3a)** |
 | ~~M3~~ | ~~buy + movement + battle + turn~~ | **done — 180 turns / 9 064 decisions, 27 movement scenarios, 194 legal-action states, 23 buy scenarios; 13/13 mutations caught (§3.3b)** |
 | ~~M4~~ | ~~setup + placement~~ | **done — 320 maps / 29 120 hexes regenerated from seed alone, 19 setup cases; 11/11 mutations caught (§3.3c)** |
-| M5 | Bindings; `run.py` / `tournament.py` unmodified | identical results, ~2x |
+| ~~M5~~ | ~~Bindings; `tournament.py` unmodified~~ | **done — 100/100 games identical; 1.7x–15.9x by agent (§5.1). `run.py` deferred to M6c with the native JSON writer.** |
 | M6a | Native random/greedy/heuristic/vanguard/marshal | per-agent parity vs Python |
 | M6b | Native tactician + the six leaf agents | per-agent parity; all 12 native |
 | M6c | `oo_run` / `oo_tournament` executables + native JSON | all three JSON files byte-identical (§1.3); `web_visualizer.html` loads it; 100x+ |

@@ -48,6 +48,9 @@ int main(int argc, char** argv) {
         in >> tag >> cavalry_only;
         in >> tag >> n_actions;
 
+        // Actions are read in the order the file lists them, which is the order
+        // Python submitted them - and submission order decides battle creation
+        // order (see MoveActions).
         oo::MoveActions actions;
         actions.clear();
         for (int a = 0; a < n_actions; ++a) {

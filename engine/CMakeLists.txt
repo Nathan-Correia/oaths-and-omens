@@ -53,6 +53,24 @@ add_library(oo_core STATIC
 )
 target_include_directories(oo_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
+# --- transitional pybind11 module (PLAN.md 1.2, 5) --------------------------
+# Deleted at M8. Nothing in oo_core depends on this; it depends on oo_core.
+if(OO_BUILD_PYTHON)
+  find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
+  execute_process(
+    COMMAND "${Python_EXECUTABLE}" -c "import pybind11; print(pybind11.get_cmake_dir())"
+    OUTPUT_VARIABLE pybind11_DIR OUTPUT_STRIP_TRAILING_WHITESPACE)
+  find_package(pybind11 CONFIG REQUIRED)
+  pybind11_add_module(oo_engine bindings/module.cpp)
+  target_link_libraries(oo_engine PRIVATE oo_core)
+  # Put the .pyd beside the engine/ shim package so `import engine` finds it
+  # without any PYTHONPATH juggling.
+  set_target_properties(oo_engine PROPERTIES
+    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    LIBRARY_OUTPUT_DIRECTORY_RELEASE ${CMAKE_CURRENT_SOURCE_DIR}
+    LIBRARY_OUTPUT_DIRECTORY_DEBUG ${CMAKE_CURRENT_SOURCE_DIR})
+endif()
+
 # --- tests ------------------------------------------------------------------
 enable_testing()
 

@@ -46,14 +46,29 @@ struct Move {
 
 // Per-faction movement actions for one simultaneous step. `has[f]` false means
 // that faction is not moving this step (Python's None).
+//
+// SUBMISSION ORDER IS PART OF THE STATE, not just which factions moved. Movement
+// groups simultaneous arrivals by destination in first-arrival order, and that
+// grouping order becomes battle CREATION order - which is load-bearing, since the
+// dismount infantry-cap tally is shared across a turn's battles.
+//
+// engine_old carries this implicitly: it iterates `actions_by_faction`, a dict, in
+// insertion order. run_turn inserts ascending so it never shows... except in
+// tactician_agent's rollout, which builds `{faction: first_action}` and only then
+// adds everyone else, submitting the searching faction FIRST. An array indexed by
+// faction cannot express that, and silently reordered the battles. Hence `order`.
 struct MoveActions {
     Move move[MAX_FACTIONS];
     bool has[MAX_FACTIONS];
+    int8_t order[MAX_FACTIONS];  // factions in submission order
+    int n_order;
 
     void clear() {
         for (int f = 0; f < MAX_FACTIONS; ++f) has[f] = false;
+        n_order = 0;
     }
     void set(int faction, int hex, int dir) {
+        if (!has[faction]) order[n_order++] = static_cast<int8_t>(faction);
         move[faction] = Move{static_cast<int16_t>(hex), static_cast<int8_t>(dir)};
         has[faction] = true;
     }
