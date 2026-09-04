@@ -48,6 +48,8 @@ add_library(oo_core STATIC
   src/movement.cpp
   src/battle.cpp
   src/turn.cpp
+  src/setup.cpp
+  src/placement.cpp
 )
 target_include_directories(oo_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
@@ -78,6 +80,11 @@ add_executable(test_phases tests/test_phases.cpp)
 target_link_libraries(test_phases PRIVATE oo_core)
 add_test(NAME phase_parity
          COMMAND test_phases ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/phase_cases.txt)
+
+add_executable(test_setup tests/test_setup.cpp)
+target_link_libraries(test_setup PRIVATE oo_core)
+add_test(NAME setup_parity
+         COMMAND test_setup ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/setup_cases.txt)
 
 add_executable(test_buy tests/test_buy.cpp)
 target_link_libraries(test_buy PRIVATE oo_core)

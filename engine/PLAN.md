@@ -398,6 +398,43 @@ turn traces replay what an agent *chose* and never check the menu it chose from,
 even though all twelve agents index into it. Their order is part of the contract,
 so `legal_cases` compares element by element.
 
+### 3.3c Full-pipeline parity — DONE (M4)
+
+**§3.2's `sorted()` change paid off exactly as intended.** Terrain generation is
+pure — a radius and a seed in, a map out, no decisions anywhere — so there is
+nothing to replay: the C++ engine regenerates from the same seed and the map must
+be identical hex for hex, plus the generation log in the same order.
+
+**320 maps across radii 1–8, 29 120 hexes, 0 failures.** That is only possible if
+the RNG, the bag weighting *order*, the blob shape rules, the island check and the
+round structure all agree exactly.
+
+The trap worth recording: `BAG_COUNTS` is a dict in the order **plains, lake,
+mountain, desert, marsh** — *not* terrain-index order — and that order decides
+which weight pairs with which type inside `rng.choices`. Using the "obvious"
+index order produces a perfectly plausible-looking map that diverges from
+Python's. Mutation testing scored it at **274 of 320 maps wrong**.
+
+Setup cases go further: each carries `PARAMS <radius> <factions> <seed>`, so the C++
+side *builds* the starting state from the seed alone via `create_initial_state` and
+checks it against Python's before replaying the placement decisions. Each case is
+therefore a genuine from-seed pipeline check, not just a placement replay.
+
+**Mutation testing found the same class of gap for the third time.** Eleven
+mutations; ten caught immediately, and one — "the placement mask always relaxes
+past tier 1", i.e. the 5–7 player edge ban silently dropped — **caught nothing**.
+The reason is the same one that hid the buy-action list in M3: the trace recorded
+the agent's *choice*, and a mask that is merely LARGER than the correct one still
+validates that choice. Comparing effects is not comparing the menu.
+
+Fixed by recording the legal placement mask and the draft pool themselves and
+comparing them element by element. The edge-ban mutation now fails 6 cases, and
+"capital spacing 3 → 2" went from 2 failures to 19 — every case.
+
+> **The rule this establishes for M5 onward:** any function that hands an agent a
+> set of options is part of the contract and must be compared directly. Testing
+> what the agent did with the options is not enough, three times over now.
+
 ### 3.3 Golden traces
 
 - `tools/dump_trace.py` — runs `engine_old` with a given seed and agent assignment,
@@ -765,7 +802,7 @@ Not to be built yet, but the constraints above exist to make it a small change:
 | ~~M1~~ | ~~`rng.hpp` matches CPython~~ | **done — 4 617 edge-case checks + 10⁷ draws over 10⁴ seeds, 0 failures (§3.1)** |
 | ~~M2~~ | ~~Grid + state + terrain + collect~~ | **done — 43 105 grid checks over 11 radii; 970 phase cases, 0 failures; 4/4 mutations caught (§3.3a)** |
 | ~~M3~~ | ~~buy + movement + battle + turn~~ | **done — 180 turns / 9 064 decisions, 27 movement scenarios, 194 legal-action states, 23 buy scenarios; 13/13 mutations caught (§3.3b)** |
-| M4 | setup + placement | full-pipeline parity from seed alone |
+| ~~M4~~ | ~~setup + placement~~ | **done — 320 maps / 29 120 hexes regenerated from seed alone, 19 setup cases; 11/11 mutations caught (§3.3c)** |
 | M5 | Bindings; `run.py` / `tournament.py` unmodified | identical results, ~2x |
 | M6a | Native random/greedy/heuristic/vanguard/marshal | per-agent parity vs Python |
 | M6b | Native tactician + the six leaf agents | per-agent parity; all 12 native |
