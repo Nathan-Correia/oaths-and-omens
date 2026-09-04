@@ -117,15 +117,36 @@ engine-that-lives-inside-Python would do:
 
 | file | fate |
 |---|---|
-| `web_visualizer.html` | **survives untouched** — pure JS, loads `board_state.json` from a file picker. No Python anywhere in it. |
-| `hex_visualizer.py`, `city_placement_visualizer.py`, `hex_gen_visualizer.py`, `hex_common.py` | pygame. Port to C++/SDL, or drop in favour of the web one, or keep as the sole Python holdout. Your call — see §9. |
+| `web_visualizer.html` | **survives untouched** — pure JS, loads `board_state.json` from a file picker. No Python anywhere in it. The only visualizer going forward. |
+| `hex_visualizer.py`, `city_placement_visualizer.py`, `hex_gen_visualizer.py` | **deprecated and deleted** (commit `1e21ffd`). Not ported. |
+| `hex_common.py` | orphaned by that deletion — nothing imports it any more. Delete. |
 | `run.py`, `tournament.py` | replaced by `oo_run` / `oo_tournament` |
 | `engine_old/`, `agents/` | parity oracles; deleted or archived at M8 |
 | numpy | only ever reached through the bindings — gone with them |
 
+### 1.3 The three JSON files are a hard requirement
+
+`oo_run` must keep writing **all three**, natively, in the current format:
+
+| file | written by | consumed by |
+|---|---|---|
+| `board_state.json` | `run_turn_and_log` per-turn checkpoints | `web_visualizer.html` |
+| `terrain_gen_log.json` | `generate_terrain`'s placement log | the deleted `hex_gen_visualizer` — **keep emitting anyway** |
+| `city_placement_log.json` | `run_city_setup`'s step log | the deleted `city_placement_visualizer` — **keep emitting anyway** |
+
+Two of the three no longer have a Python consumer, and they are kept deliberately:
+they are the highest-resolution record of exactly what terrain generation and the
+capital draft did, which makes them the natural diffing surface for parity work
+(§3.3) and for any future replacement viewer. Dropping them would throw away the
+easiest way to see *where* a C++ map generator diverged from the Python one.
+
+So: the log-emitting code paths stay fully populated even though only
+`board_state.json` currently has a reader. Verify all three byte-for-byte against
+Python-produced files at M6c.
+
 The web visualizer covering the main use case is what makes "delete all Python"
-genuinely cheap. Keeping `board_state.json`'s format byte-identical is therefore a
-hard requirement of the port, not a nicety.
+genuinely cheap. Keeping these formats byte-identical is therefore a hard requirement
+of the port, not a nicety.
 
 ---
 
@@ -173,6 +194,17 @@ Build config: C++20, `/O2 /fp:fast /arch:AVX2 /GL` (LTCG) for release,
 `/Od /Zi /RTC1` plus assertions for debug. Keep both configured from day one — the
 debug build with bounds-checked accessors is what makes the parity work tractable.
 
+`engine/dev.bat` wraps `vcvars64` so the x64 compiler is used; everything goes
+through it:
+
+```
+engine\dev.bat cmake -S engine -B engine\build -G Ninja -DCMAKE_BUILD_TYPE=Release -DOO_BUILD_PYTHON=OFF
+engine\dev.bat cmake --build engine\build
+engine\dev.bat ctest --test-dir engine\build --output-on-failure
+```
+
+Confirmed picking up `Hostx64\x64\cl.exe` (MSVC 19.44.35228.0).
+
 ---
 
 ## 3. Step 2 — bit-exact parity infrastructure (build this *before* the engine)
@@ -199,8 +231,39 @@ order that `battle.py`'s docstring already calls out as load-bearing. To match i
   by `k` vs `n` ratio); `run_city_setup` calls it with `k == n`.
 - `choices(pop, weights, k)` — cumulative weights + `bisect` on `random() * total`.
 
-Test it standalone against Python before anything else: for a few thousand seeds,
-dump long call sequences from Python and assert the C++ matches.
+**DONE — M1 green.** `include/oo/rng.hpp`, verified two ways:
+
+- **`tests/data/rng_golden.txt`** (from `tools/dump_rng_reference.py`) — a
+  self-describing trace: every line is an operation plus the result CPython
+  produced, so `tests/test_rng.cpp` parses and replays it rather than duplicating
+  the battery. Extending the Python dumper automatically extends the C++ test.
+  4 617 checks across 19 seeds, covering `getrandbits` at every width 1–64,
+  `_randbelow`'s rejection loop around powers of two, both of `sample`'s branches,
+  and `choices` with skewed weights. **0 failures.**
+- **`tests/data/rng_stress.txt`** (from `tools/dump_rng_stress.py`) — 10 000 seeds ×
+  1 000 mixed ops ≈ **10⁷ draws**, compared as one FNV-1a hash per seed so the
+  volume stays a 10 001-line file. **0 failures**, in 1.2 s (Python needs 18 s just
+  to generate it).
+
+Negative control run on both: corrupting a golden value is detected, including a
+**single-ULP** change to a `random()` result — `random()` is compared by raw bits
+via `float.hex()`, not through a decimal round-trip.
+
+The golden files are checked in, so `ctest` needs no Python (§1.2). Python is only
+required to *regenerate* them, when the battery changes.
+
+Two things worth keeping in mind:
+
+- `tools/dump_rng_stress.py`'s op cycle is **duplicated** in
+  `tests/test_rng_stress.cpp` and the two must stay in lockstep. Accepted
+  deliberately — a hash tells you *that* something diverged, never what, so the
+  self-describing golden trace is the diagnosis tool and this is only the volume
+  check.
+- `sample()` has two branches with **different draw counts** (pool vs. selected-set,
+  split at `setsize`). Both are reachable here — `placement.py` takes the pool
+  branch, `random_agent`'s `sample(legal, k<=3)` over hundreds of legal actions
+  takes the other — so picking one would silently desync everything downstream.
+  Both are implemented and both are covered astride the boundary.
 
 This is a *parity* requirement, not a permanent constraint — but there is no reason
 to swap it out later either. RNG draws are nowhere near a bottleneck (a few hundred
@@ -597,14 +660,14 @@ Not to be built yet, but the constraints above exist to make it a small change:
 | # | Deliverable | Gate |
 |---|---|---|
 | ~~M0~~ | ~~Toolchain, pybind11 zero-copy view smoke test~~ | **done — §2** |
-| M1 | `rng.hpp` matches CPython | 10⁴ seeds × 10⁴ draws identical |
+| ~~M1~~ | ~~`rng.hpp` matches CPython~~ | **done — 4 617 edge-case checks + 10⁷ draws over 10⁴ seeds, 0 failures (§3.1)** |
 | M2 | Grid + state + terrain + collect | unit tests + parity |
 | M3 | buy + movement + battle + turn | full-game parity, random agent, 1000 seeds |
 | M4 | setup + placement | full-pipeline parity from seed alone |
 | M5 | Bindings; `run.py` / `tournament.py` unmodified | identical results, ~2x |
 | M6a | Native random/greedy/heuristic/vanguard/marshal | per-agent parity vs Python |
 | M6b | Native tactician + the six leaf agents | per-agent parity; all 12 native |
-| M6c | `oo_run` / `oo_tournament` executables + native JSON | `board_state.json` byte-identical; `web_visualizer.html` loads it; 100x+ |
+| M6c | `oo_run` / `oo_tournament` executables + native JSON | all three JSON files byte-identical (§1.3); `web_visualizer.html` loads it; 100x+ |
 | M6d | Sparse battle storage | `GameState` ~10 KB, parity holds |
 | M7 | `run_games` thread pool | ~10x on 12 threads, deterministic per seed |
 | M8 | **Python removed** | `-DOO_BUILD_PYTHON=OFF` builds and passes everything; `bindings/`, shims, `engine_old/`, `agents/` deleted |
@@ -619,26 +682,37 @@ against its Python original independently and the dependency graph is a clean tr
 
 - ~~**§3.2** — modify `setup.py`'s set iterations for full-pipeline bit parity?~~
   **Resolved: yes. Applied and verified — see §3.2.**
-- **The pygame visualizers** (`hex_visualizer.py`, `city_placement_visualizer.py`,
-  `hex_gen_visualizer.py`, `hex_common.py` — ~1 400 lines) are the only real cost of
-  going fully Python-free. Three options: port to C++/SDL, drop them in favour of
-  `web_visualizer.html` (which already covers the main replay-scrubbing use case and
-  needs no changes at all), or keep them as a deliberate Python-tooling holdout
-  outside the engine. Recommend dropping them and investing in the web one if it is
-  missing anything — but this is a taste question about how you like to debug.
-- There is currently a **duplicate `engine_old/` at the repo root** as well as
-  `engine/engine_old/`. Only the latter has the §3.2 fix, so they have already
-  diverged. Recommend deleting the root copy — it is committed, so it stays in
-  history. Say the word and I'll remove it.
+- ~~The pygame visualizers~~ **Resolved: deprecated and deleted** (`1e21ffd`).
+  `web_visualizer.html` is the only visualizer going forward. All three JSON files
+  are still emitted regardless — see §1.3.
+- ~~Duplicate `engine_old/` at the repo root~~ **Resolved: removed; the canonical
+  copy is `engine/engine_old/`.**
+- `hex_common.py` is now orphaned — the deleted visualizers were its only importers,
+  and `web_visualizer.html` has its geometry inlined already ("ported from
+  hex_common.py"). Safe to delete; say the word.
+- **Action cards and trading are in the rulebook but entirely absent from the engine**
+  — no deck, no hands, no per-faction trade actions; `action_cards.md` says the pool
+  is still undesigned. Not a reason to delay the port, but worth one cheap decision
+  now: **add a no-op `decide_play_cards` to the `Agent` interface (§6.3) up front.**
+  Adding a field to a POD `GameState` later is trivial; adding a tenth decision
+  method to twelve already-written C++ agents is not. One virtual with a default
+  empty implementation costs nothing and removes the only expensive part of adding
+  cards later. Same argument for a `decide_trade` hook, though trading between
+  scripted agents is close to meaningless until there is a policy that can value an
+  offer.
 - The two `_revert_departure` edge cases are ported bugs. Keep bug-compatible for
   now — parity is worth more than tidiness — but they should be revisited on their
   own once the port is green.
 - `radius >= 9` currently crashes terrain generation (`BAG_COUNTS` totals 250 hexes
   vs a radius-9 board's 271, per `tournament.py`'s comment). Fix during the port, or
   keep bug-compatible? Recommend fixing, and recording it as an intentional divergence.
-- `alive[]` is vestigial (always true, never set false) and its only reason to exist
-  was visualizer compatibility. If the pygame tools go, drop the field; if they stay,
-  keep it. Decide alongside the visualizer question above.
+- `alive[]` is vestigial (always true, never set false). Now safely droppable from
+  `GameState`: nothing in `engine_old` or `agents/` reads it except the log snapshot
+  and `tactician._clone_state`, and `web_visualizer.html` tests it defensively
+  (`stats.alive !== false`, line 850) so a missing field reads as alive. Recommend
+  dropping the field and emitting `"alive": true` in the log for format
+  compatibility — or dropping it from the log too and letting the viewer's default
+  handle it, if we accept a one-line viewer-format change.
 - Once all twelve agents are native (M6b), `agents/` and `engine_old/` are the parity
   oracles and nothing else. They must be deleted at M8 to hit "no Python in the repo"
   — worth being deliberate that this trades away the fastest place to prototype a new

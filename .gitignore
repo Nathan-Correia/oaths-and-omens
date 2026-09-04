@@ -3,3 +3,11 @@ __pycache__/
 board_state.json
 terrain_gen_log.json
 city_placement_log.json
+
+# C++ build output. The golden traces under engine/tests/data/ ARE checked in -
+# running the test suite must not require Python (see engine/PLAN.md §1.2).
+engine/build/
+*.obj
+*.pyd
+*.lib
+*.exp
