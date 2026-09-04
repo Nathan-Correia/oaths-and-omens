@@ -141,6 +141,46 @@ int main(int argc, char** argv) {
                 check(mutual, "adjacency is symmetric");
             }
         }
+        // --- ball() is exactly the set the distance table says it is ---------
+        // eligible_outpost_mask now trusts ball() to be the complete radius-r
+        // neighbourhood. If it ever under-reports, hexes that should be banned
+        // silently become legal outpost sites - a rules change that no parity
+        // test would necessarily catch, because it only shows up once a game
+        // reaches that board configuration. So check it exhaustively against
+        // distance(), which the golden data above already pins.
+        for (int i = 0; i < num_hexes; ++i) {
+            for (int r = 0; r <= oo::kMaxBallRadius; ++r) {
+                const int16_t* ball = g.ball(i, r);
+                const int m = g.ball_size(i, r);
+
+                bool in_ball[oo::MAX_HEXES] = {};
+                for (int k = 0; k < m; ++k) {
+                    const int j = ball[k];
+                    check(j >= 0 && j < num_hexes, "ball entry in range");
+                    check(!in_ball[j], "ball has no duplicates");
+                    in_ball[j] = true;
+                    check(g.distance(i, j) <= r, "ball entry is within r");
+                }
+                // ...and nothing within r is missing.
+                int expected = 0;
+                for (int j = 0; j < num_hexes; ++j) {
+                    if (g.distance(i, j) > r) continue;
+                    ++expected;
+                    check(in_ball[j], "ball omits a hex within r");
+                }
+                check(m == expected, "ball size matches the distance table");
+                check(m >= 1 && ball[0] == i, "ball starts with the centre itself");
+            }
+            // Prefix property: the radius-r ball is the first ball_size(i, r)
+            // entries of the SAME array. eligible_outpost_mask depends on this -
+            // ball() ignores its r argument entirely.
+            for (int r = 1; r <= oo::kMaxBallRadius; ++r) {
+                check(g.ball_size(i, r) >= g.ball_size(i, r - 1),
+                      "ball sizes are non-decreasing in r");
+                check(g.ball(i, r) == g.ball(i, r - 1), "balls share one backing array");
+            }
+        }
+
         // Off-board coordinates must be rejected rather than aliasing onto a hex.
         check(g.index_of(oo::HexCoord{static_cast<int8_t>(radius + 1), 0,
                                       static_cast<int8_t>(-(radius + 1))}) == -1,

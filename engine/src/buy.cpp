@@ -64,21 +64,35 @@ void eligible_outpost_mask(const GameState& state, int faction, bool out[MAX_HEX
         }
     }
 
-    for (int16_t c : own_capitals) {
-        for (int h = 0; h < n; ++h) {
-            if (out[h] && grid.distance(h, c) < kOutpostMinDistOwnCapital) out[h] = false;
-        }
-    }
-    for (int16_t c : enemy_capitals) {
-        for (int h = 0; h < n; ++h) {
-            if (out[h] && grid.distance(h, c) < kOutpostMinDistEnemyCapital) out[h] = false;
-        }
-    }
-    for (int16_t c : all_outposts) {
-        for (int h = 0; h < n; ++h) {
-            if (out[h] && grid.distance(h, c) < kOutpostMinDistOtherOutpost) out[h] = false;
-        }
-    }
+    // Each ban clears a small NEIGHBOURHOOD, so enumerate that neighbourhood
+    // rather than sweeping the board and testing every hex against it. The old
+    // form scanned all `n` hexes per city to clear at most 19 of them; at radius
+    // 7 that was 169 iterations to do 7 hexes' worth of work, and it was 63 % of
+    // a greedy game's total runtime. This version's cost depends on the ban
+    // radius only, not on the board size.
+    //
+    // Identical output, not merely equivalent: the loops below only ever CLEAR
+    // hexes strictly inside the radius and never touch anything outside it, so
+    // restricting the iteration to that ball changes nothing. The dropped
+    // `out[h] &&` guard was an optimization to skip a redundant store, not a
+    // condition on the result.
+    static_assert(kOutpostMinDistOwnCapital - 1 <= kMaxBallRadius &&
+                      kOutpostMinDistEnemyCapital - 1 <= kMaxBallRadius &&
+                      kOutpostMinDistOtherOutpost - 1 <= kMaxBallRadius,
+                  "a ban radius outgrew the precomputed ball table - raise kMaxBallRadius");
+
+    auto ban_around = [&](int16_t c, int min_dist) {
+        // `distance < min_dist` is `distance <= min_dist - 1`.
+        const int r = min_dist - 1;
+        if (r < 0) return;
+        const int16_t* ball = grid.ball(c, r);
+        const int m = grid.ball_size(c, r);
+        for (int i = 0; i < m; ++i) out[ball[i]] = false;
+    };
+
+    for (int16_t c : own_capitals) ban_around(c, kOutpostMinDistOwnCapital);
+    for (int16_t c : enemy_capitals) ban_around(c, kOutpostMinDistEnemyCapital);
+    for (int16_t c : all_outposts) ban_around(c, kOutpostMinDistOtherOutpost);
 }
 
 bool can_build_outpost(const GameState& state, int hex_index, int faction) {

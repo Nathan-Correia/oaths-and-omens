@@ -60,6 +60,28 @@ HexGrid::HexGrid(int radius) : radius_(radius) {
         }
     }
 
+    // Neighbourhood lists, built off the distance table above. O(n^2) at
+    // construction - the same order as dist_ itself, and grids are built once
+    // per radius and shared, so this is not on any hot path.
+    ball_.assign(static_cast<size_t>(num_hexes_) * kBallCapacity, -1);
+    ball_end_.assign(static_cast<size_t>(num_hexes_) * (kMaxBallRadius + 1), 0);
+    for (int i = 0; i < num_hexes_; ++i) {
+        int written = 0;
+        for (int r = 0; r <= kMaxBallRadius; ++r) {
+            // Append the ring at exactly distance r, in ascending index order.
+            for (int j = 0; j < num_hexes_; ++j) {
+                if (dist_[static_cast<size_t>(i) * num_hexes_ + j] != r) continue;
+                assert(written < kBallCapacity);
+                ball_[static_cast<size_t>(i) * kBallCapacity + written] =
+                    static_cast<int16_t>(j);
+                ++written;
+            }
+            // Prefix count: every hex within r is one of the first `written`.
+            ball_end_[static_cast<size_t>(i) * (kMaxBallRadius + 1) + r] =
+                static_cast<int16_t>(written);
+        }
+    }
+
     is_edge_.resize(static_cast<size_t>(num_hexes_));
     for (int i = 0; i < num_hexes_; ++i) {
         const HexCoord& c = coords_[static_cast<size_t>(i)];

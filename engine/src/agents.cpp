@@ -1320,10 +1320,16 @@ private:
         // One seed for the whole decision, reused for every candidate, so they
         // are compared against identical dice rather than different luck.
         const int64_t seed = rng.randrange(static_cast<int64_t>(1) << 31);
+        // Seeded ONCE and copied per candidate. Constructing an Rng runs
+        // MT19937's init_by_array over 624 words; doing that inside the loop made
+        // Rng::seed 4.5 % of a tactician game on its own. A copy is a 2.5 KB
+        // memcpy of the identical resulting state, so every candidate still faces
+        // exactly the same dice.
+        const Rng seeded(seed);
         bool have_best = false;
         double best_score = 0.0;
         for (int i = 0; i < candidates.size(); ++i) {
-            Rng rollout_rng(seed);
+            Rng rollout_rng = seeded;
             const double score =
                 rollout_and_score(state, faction, candidates[i], *shared_, rollout_rng, *scratch_);
             if (!have_best || score > best_score) {  // strict: first maximum wins

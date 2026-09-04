@@ -2,6 +2,7 @@
 
 #include <cassert>
 #include <cstdlib>
+#include <cstring>
 
 namespace oo {
 
@@ -31,18 +32,28 @@ struct Contribution {
 void legal_mask_impl(const GameState& state, int faction, bool require_cavalry, LegalMask& out) {
     const HexGrid& grid = *state.grid;
     const int n = state.num_hexes;
+
+    // Clear everything first, then fill only the hexes this faction actually has
+    // an army on. The previous version walked all MAX_HEXES x 6 cells writing a
+    // computed bool into each, which is ~2 KB of byte-at-a-time stores per call -
+    // and this is called once per faction per movement step, plus once per
+    // opponent per rollout, so it was 26 % of a tactician game.
+    //
+    // A faction occupies a handful of hexes out of hundreds, so nearly every one
+    // of those stores was writing false over false. memset does the same work
+    // vectorised, and also subsumes the separate n..MAX_HEXES tail clear that
+    // used to cost an extra pass. Same output, including for hexes past
+    // num_hexes, which stay deterministic false.
+    std::memset(out.cell, 0, sizeof(out.cell));
+
     for (int h = 0; h < n; ++h) {
-        bool own = state.army_faction[h] == faction && !state.locked(h) && !state.frozen[h];
-        if (own && require_cavalry) own = state.army_units[h][kCavalry] > 0;
+        if (state.army_faction[h] != faction || state.locked(h) || state.frozen[h]) continue;
+        if (require_cavalry && state.army_units[h][kCavalry] <= 0) continue;
+        const int16_t* nb = grid.neighbours_of(h);
         for (int d = 0; d < NUM_DIRECTIONS; ++d) {
-            const int j = grid.neighbour(h, d);
-            out.cell[h][d] = own && j >= 0 && !kImpassableByTerrain[state.terrain[j]];
+            const int j = nb[d];
+            out.cell[h][d] = j >= 0 && !kImpassableByTerrain[state.terrain[j]];
         }
-    }
-    // Hexes past num_hexes are never legal but must be deterministic - a caller
-    // scanning the whole fixed array must not read uninitialised memory.
-    for (int h = n; h < MAX_HEXES; ++h) {
-        for (int d = 0; d < NUM_DIRECTIONS; ++d) out.cell[h][d] = false;
     }
 }
 

@@ -26,7 +26,20 @@ if(MSVC)
                       $<$<CONFIG:Release>:/fp:fast>
                       $<$<CONFIG:Release>:/arch:AVX2>
                       $<$<CONFIG:Release>:/GL>)
-  add_link_options($<$<CONFIG:Release>:/LTCG>)
+  # Symbols in the OPTIMIZED build. A sampling profiler (AMD uProf, Very Sleepy,
+  # WPA) can only name a hot address if there is a PDB for it, and profiling a
+  # separate unoptimized build would measure a program we do not ship.
+  #
+  # /Zi does not change codegen. /DEBUG does change the LINKER: it flips the
+  # defaults to /OPT:NOREF,NOICF, which would leave dead code in and stop
+  # identical-function folding - a different binary from the one we benchmark.
+  # So both are re-stated explicitly, and the executable is byte-equivalent to
+  # what it was before, plus a .pdb beside it.
+  add_compile_options($<$<CONFIG:Release>:/Zi>)
+  add_link_options($<$<CONFIG:Release>:/LTCG>
+                   $<$<CONFIG:Release>:/DEBUG>
+                   $<$<CONFIG:Release>:/OPT:REF>
+                   $<$<CONFIG:Release>:/OPT:ICF>)
   # Debug keeps assertions on - the bounds-checked, invariant-asserting build is
   # what makes the parity work tractable (PLAN.md §4.5).
   add_compile_options($<$<CONFIG:Debug>:/Od> $<$<CONFIG:Debug>:/RTC1>)

@@ -38,6 +38,13 @@ struct HexCoord {
     }
 };
 
+// Largest radius for which HexGrid precomputes a neighbourhood ("ball") list.
+// Sized by the widest ban radius the rules use: kOutpostMinDistOwnCapital is 3
+// and the test is `distance < 3`, so a ball of radius 2 covers it. The extra
+// level is headroom, and costs 331 * 37 * 2 B = 24 KB at the largest board.
+inline constexpr int kMaxBallRadius = 3;
+inline constexpr int kBallCapacity = 3 * kMaxBallRadius * (kMaxBallRadius + 1) + 1;  // 37
+
 // engine_old/geometry.py: hex_distance. Only for coordinates not on the board
 // (or during grid construction) - prefer HexGrid::distance, which is a lookup.
 inline int hex_distance(const HexCoord& a, const HexCoord& b) {
@@ -71,6 +78,30 @@ public:
     // Precomputed cube distance. See the header comment for why this exists.
     uint8_t distance(int a, int b) const { return dist_[a * num_hexes_ + b]; }
 
+    // The hexes within distance `r` of `center`, center included. `r` must be
+    // <= kMaxBallRadius.
+    //
+    // This exists because sweeping the whole board to touch a radius-2
+    // neighbourhood was, measured, 63 % of a greedy game's entire runtime
+    // (eligible_outpost_mask). A ball of radius 2 is 19 hexes; the board at
+    // radius 7 is 169. Enumerating the ball instead makes that work independent
+    // of board size.
+    //
+    // Ordering is by ascending distance, then ascending index. Nothing currently
+    // depends on the order - callers only clear flags - but it is deterministic
+    // so that anything which comes to depend on it stays reproducible.
+    const int16_t* ball(int center, int r) const {
+        // `r` selects nothing here: entries are stored in ascending-distance
+        // order, so the radius-r ball is a PREFIX of the same array and only the
+        // length (ball_size) depends on r. Kept in the signature so call sites
+        // read as a matched pair.
+        (void)r;
+        return &ball_[static_cast<size_t>(center) * kBallCapacity];
+    }
+    int ball_size(int center, int r) const {
+        return ball_end_[static_cast<size_t>(center) * (kMaxBallRadius + 1) + r];
+    }
+
     // engine_old/geometry.py: is_edge - on the board's outer ring.
     bool is_edge(int index) const { return is_edge_[index]; }
 
@@ -88,6 +119,9 @@ private:
     std::vector<HexCoord> coords_;
     std::vector<int16_t> neighbours_;  // [num_hexes * 6]
     std::vector<uint8_t> dist_;        // [num_hexes * num_hexes]
+    std::vector<int16_t> ball_;        // [num_hexes * kBallCapacity]
+    std::vector<int16_t> ball_end_;    // [num_hexes * (kMaxBallRadius+1)]; prefix counts,
+                                       // so ball_end_[h][r] is the size for radius r
     std::vector<uint8_t> is_edge_;
     std::vector<int> col_base_;        // prefix sum of column lengths, for index_of
 };
