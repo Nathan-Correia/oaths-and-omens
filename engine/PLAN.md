@@ -1162,6 +1162,7 @@ invariant every army mutation must preserve.
 | ~~M6d~~ | ~~Sparse battle storage~~ | **done — 68.6 KB -> 17.7 KB; all gates green (§6.9)** |
 | M7 | `run_games` thread pool | **DONE** — 6.4x on 12 threads (6 cores + SMT), deterministic per seed |
 | M8 | **Python removed** | `-DOO_BUILD_PYTHON=OFF` builds and passes everything; `bindings/`, shims, `engine_old/`, `agents/` deleted |
+| M9 | Neural policy (§10) | resumable `play_game`, batched encoder, TensorRT inference; a learned policy that beats `tactician` head to head |
 
 M1–M4 are where nearly all the risk lives. M5 is mechanical. M6 is the largest
 *volume* of work (~1 200 lines, §6.1) but low risk, since each agent is parity-tested
@@ -1208,3 +1209,394 @@ against its Python original independently and the dependency graph is a clean tr
   oracles and nothing else. They must be deleted at M8 to hit "no Python in the repo"
   — worth being deliberate that this trades away the fastest place to prototype a new
   heuristic. Archiving them on a branch or tag costs nothing and keeps that option.
+
+---
+
+## 10. Step 7 — a neural policy (design)
+
+Target hardware: RTX 3080 Ti (GA102, 12 GB, ~68 TFLOP/s fp16 tensor with fp32
+accumulate, ~20 TFLOP/s realistically achievable on our shapes) plus the 5600X
+already driving the engine. CUDA 12.6 is installed.
+
+### 10.1 Scope: policy-only, no search
+
+The first network replaces an agent's decision functions with a learned policy.
+No MCTS. That is a deliberate ordering, not timidity:
+
+- The hard part of this milestone is **not the network**, it is restructuring
+  `play_game` so many games can be in flight at once (§10.9). Search adds a
+  second hard part on top. Do them one at a time.
+- Training data is nearly free: the engine produces 5 732 greedy games/s and
+  344 tactician games/s on 12 threads. Behaviour-cloning tactician gives a
+  working policy and validates the entire pipeline — encoder, batching,
+  inference, masking — before any of it has to also be correct under search.
+- A policy-only net at the sizes below runs at tens of games/s against
+  tactician's 344. It is *slower*. The point is strength and the ability to
+  improve by training rather than by hand-editing heuristics.
+
+Search comes after this works.
+
+### 10.2 Why a transformer, and why the usual argument is the weak one
+
+The common case for attention is "long-range information". That is true here
+but not decisive: a radius-7 board is 14 hexes across and a hex-conv's
+receptive field grows one hex per layer, so ~14 conv layers already see
+everything. AlphaZero-scale ResNets are deeper than that.
+
+The real argument is that this game's difficulty is **assignment**, not
+perception. Which army goes to which objective, given what the other armies are
+doing and where the enemy stacks are, is pairwise relational reasoning over
+entities. Every hand-written agent is built from exactly this —
+`ranked_attack_targets`, `move_toward(nearest enemy capital)`,
+`mobile_hexes_by_size_desc` are all global matching or ranking. Attention
+computes that natively; convolution has to launder it through many layers of
+local mixing.
+
+The economics happen to be unusually favourable. Per transformer layer with a
+4x FFN, cost is `8nd^2` (projections) + `4n^2 d` (attention) + `16nd^2` (FFN).
+At d=128 and n=180 that is 70.8 + 16.6 MFLOP = **87 MFLOP, of which attention is
+only 19%**. A 128-channel hex-conv residual block is 77.6 MFLOP. So:
+
+> A transformer layer costs about what a residual conv block costs at the same
+> width, and has a global receptive field from layer one.
+
+n is small enough that the quadratic term never dominates — 19% of the layer at
+r7, 23% at r8, 31% at r10.
+
+**The baseline that must be beaten first.** A ResNet with squeeze-excite blocks
+gets global context by channel-wise pooling at a fraction of attention's cost,
+and Leela Chess Zero was very strong that way for years. Much of what is
+globally relevant here (VP race, front location, army totals) is low-dimensional
+aggregate information that pooling captures. Build `ResNet+SE, 64ch x 8` first
+as a control. If the transformer cannot beat it, the transformer is not earning
+its complexity.
+
+### 10.3 Multi-size is a requirement
+
+Decided: **one network across radii 1–8 and 1–10 factions**, not a net per
+configuration. `oo_run` exposes radius and faction count as first-class knobs
+and an agent that only works at r7/f8 would quietly retire them.
+
+This costs roughly 15% throughput (padding waste, masking) and buys a single net
+trainable on pooled data from every configuration — worth it given how cheaply
+games are generated.
+
+Everything below is size-agnostic by construction. The three things that make it
+so, each of which has a fixed-size alternative that would have been simpler:
+
+1. **Relative distance bias, not learned absolute position embeddings**
+   (§10.5). Absolute embeddings would pin the net to one board.
+2. **Per-token heads** (§10.6). The movement action space is `n x 6 + 1`, a
+   linear `d -> 6` applied to every hex token — it scales with the board rather
+   than being a fixed 1015 logits.
+3. **Faction tokens with masking** (§10.4), sized `MAX_FACTIONS`, not 8.
+
+**The game is not scale-invariant, though, and that is a separate problem.**
+Measured turn counts: r3 = 83.8 turns/game with 19/40 hitting the 100-turn cap,
+r5 = 23.3, r7 = 16.0, r8 = 14.9. A radius-3 game is a different game — dense,
+all contact, VP accrual barely outrunning the cap. A size-agnostic architecture
+will happily run on both and play one of them badly. So `radius`, `num_hexes`
+and `num_factions` are fed explicitly into the CLS token, and training must mix
+the sizes we care about. Conditioning is cheap; assuming invariance is the
+mistake.
+
+### 10.4 Token encoding
+
+Sequence = `n_hex` hex tokens + `MAX_FACTIONS` faction tokens + 1 CLS.
+At r7/f8 that is 169 + 10 + 1 = 180 tokens; at r8, 228.
+
+**Everything is encoded relative to the acting faction.** Faction *f*'s relative
+index is `(f - acting + num_factions) % num_factions`, so slot 0 is always "me".
+This is the single cheapest sample-efficiency win available and it must be in
+the encoder from day one — retrofitting it invalidates every checkpoint.
+
+**Hex token** (~55 dims, projected to d):
+
+| feature | dims | encoding |
+|---|---:|---|
+| terrain | 5 | one-hot (plains/mountain/lake/desert/marsh) |
+| passable | 1 | derived, saves the net learning it |
+| is_edge | 1 | from `HexGrid::is_edge` |
+| city owner | 11 | one-hot: none, then relative faction 0–9 |
+| is_capital | 1 | |
+| outpost upgrade | 4 | one-hot: none/barracks/workshop/temple |
+| army owner | 11 | one-hot: none, then relative faction 0–9 |
+| army units | 3 | `log1p` of infantry/cavalry/archers |
+| army total | 1 | `log1p`, and `/MAX_STACK_SIZE` |
+| frozen | 1 | |
+| has_battle | 1 | |
+| battle round | 1 | scaled |
+| battle participants | 10 | multi-hot over relative faction index |
+| is_query_hex | 1 | see below |
+| is_query_secondary | 1 | see below |
+
+The two query flags are what let one trunk serve the hex-specific decisions.
+`decide_target`, `decide_rectification` and `decide_resource_choice` all ask
+about a particular `hex_index`; `decide_swap` involves two hexes (the leftover
+and the placer's). Marking them in the token stream means the trunk sees *which*
+hex is being asked about, instead of needing a separate model per decision type.
+
+`city_placer` is deliberately excluded — it is setup-only bookkeeping and
+`city_owner`/`is_capital` are authoritative afterwards (see `state.hpp`).
+`alive[]` is excluded because it is vestigial (§9).
+
+**Faction token** (~25 dims):
+
+| feature | dims |
+|---|---:|
+| is_me | 1 |
+| relative index | 10 (one-hot) |
+| is_active | 1 (`f < num_factions`; padding mask) |
+| gold | 1 (`log1p`) |
+| resources | 4 (`log1p`: wood/iron/clay/fish) |
+| victory_points | 1 (`/kVpToWin`) |
+| VP gap to the current leader | 1 |
+| kill_xp | 1 (`log1p`) |
+| outpost count | 1 (`/kOutpostCap`) |
+| capital_settle_order | 1 (normalised; it is the VP tie-break) |
+| units in play by type | 3 (`log1p`) |
+
+Putting faction state in tokens rather than broadcasting it across 169 hex
+planes is a transformer-native advantage with no clean conv equivalent: hexes
+attend to faction state and factions attend to the board, and the VP race
+becomes directly visible to the policy.
+
+**CLS token** (~18 dims): turn number, turns remaining to the cap, radius,
+`num_hexes`, `num_factions`, max VP on the board, movement/cavalry step index,
+and a 9-way one-hot for **which decision is being asked**. The phase one-hot
+matters even with separate heads — it lets the trunk allocate attention
+differently for a buy decision than for a battle target.
+
+### 10.5 Positional information: relative hex-distance bias
+
+No absolute position embeddings. Instead, add a learned bias to the attention
+logits indexed by hex distance:
+
+```
+logits[head][i][j] += bias[head][bucket(dist(i, j))]
+```
+
+`HexGrid` already precomputes the full distance table (§4.2), so this is a table
+lookup we have already paid for.
+
+**Bucket logarithmically** — `{0, 1, 2, 3, 4, 5, 6-7, 8-11, 12+}`, 9 buckets.
+Two reasons, and the second is the one that matters:
+
+- Max hex distance is `2 x radius`: 14 at r7, 16 at r8, 20 at r10. Train at r7
+  and play at r8 and the un-bucketed bins 15–16 are untrained noise. Bucketing
+  makes far-apart hexes share a bin, so distances never seen still work.
+- It is 9 parameters per head instead of 21, which is a rounding error either
+  way, but the prior is better: the model should care a lot about the difference
+  between distance 1 and 2, and almost nothing about 15 vs 16.
+
+Richer variant worth trying once the basic version trains: index by
+`(distance bucket, direction sector)` over 6 sectors, which captures
+directionality — useful because movement is directional and the ban radii in
+`eligible_outpost_mask` are not.
+
+Faction and CLS tokens sit outside the hex metric; give them their own bias
+buckets (hex-faction, hex-CLS, faction-faction, and so on) rather than a fake
+distance.
+
+### 10.6 Trunk and heads
+
+**Trunk:** 2 hex-conv layers as a stem (7-tap, over `HexGrid::neighbours_of`),
+then 4–6 pre-LN transformer blocks with the distance bias. The stem is cheap and
+encodes adjacency directly, so attention does not have to rediscover "who is
+next to me" — which is precisely what the movement action space is defined over.
+
+**One trunk, nine heads.** Not nine networks.
+
+| decision | head | output |
+|---|---|---|
+| `decide_movement` / `decide_cavalry` | per-hex linear `d->6`, plus a pass logit from CLS | `n x 6 + 1` |
+| `decide_placement` | per-hex linear `d->1` | `n` |
+| `decide_draft` | same per-hex head, restricted to the pool | `pool_size` |
+| `decide_swap` | CLS `d->2` (query hexes are marked in the tokens) | 2 |
+| `decide_resource_choice` | query-hex token `d->2` (iron / fish) | 2 |
+| `decide_target` | score faction tokens, `d->1`, masked to battle participants | <=10 |
+| `decide_rectification` | see below | autoregressive |
+| `decide_buy` | see below | autoregressive |
+| `decide_play_cards` | none yet (§9) | — |
+
+The movement head falling out of the token layout for free is the strongest
+practical argument for one-token-per-hex: the action space *is* the sequence.
+
+**`decide_buy` is a set, not a choice.** `LegalBuyActions` runs to hundreds of
+entries (sized 4096) and `ChosenBuyActions` holds up to 512 — the agent picks a
+*subset*, under a gold/resource budget and the per-turn batch caps. Proposal:
+score each legal action as `MLP([action embedding ; trunk output at action.hex ;
+CLS])`, where the action embedding is `(BuyType one-hot 4, unit_type one-hot 3,
+upgrade one-hot 3)`, then **decode autoregressively** — pick the best action,
+append it, re-score with the chosen set folded into the CLS, repeat until a
+learned STOP wins. Budget feasibility is enforced by masking, exactly as
+`get_legal_buy_actions` already computes it. Typically 2–5 passes per buy
+decision.
+
+**`decide_rectification` is an assignment.** The winner's stack exceeds `cap`
+(`MAX_STACK_SIZE = 6`, or 0 when evicted from an enemy capital) and units must
+be sent back to the origins recorded in the battle's slots, or lost. Model it
+over the battle's `BattleSlot`s (at most `MAX_BATTLE_CONTRIB` = 16), scoring
+`(slot, unit_type)` pairs and decoding one unit at a time until the stack is
+under cap. Slots are the natural entities; a flat "how many of each type" head
+cannot express *which origin* they return to, and `SendBackEntry` requires it.
+
+**Value head:** predict final VP (or win probability) from CLS. Include it even
+though this milestone is policy-only — it costs almost nothing, reliably
+improves the trunk's representation as an auxiliary loss, and is needed anyway
+the moment search is added.
+
+### 10.7 Masking
+
+Legality masking is not optional and the engine already computes every mask
+needed: `LegalMask` for movement/cavalry, `legal[MAX_HEXES]` for placement,
+`LegalBuyActions` for buys, the battle's participant list for targets. Set
+illegal logits to `-inf` before the softmax.
+
+Three padding hazards, all of which fail silently:
+
+- **Hex padding.** Boards are padded to the bucket's token count. Padded tokens
+  must be masked as **both queries and keys** — mask them only as keys and the
+  padding still attends outward and contributes gradient noise.
+- **Faction padding.** Same, for slots `>= num_factions`.
+- **`n_hex` vs `MAX_HEXES`.** `legal_mask_impl` already zeroes the
+  `n..MAX_HEXES` tail deterministically, so the mask is safe to read at full
+  width — but the encoder must not treat those hexes as real terrain, since
+  `terrain[]` past `num_hexes` is zero, which decodes as *plains*, not *absent*.
+
+### 10.8 Batching, and a free 8x
+
+`run_turn` takes every faction's decision against the **same `const` state** and
+only then applies:
+
+```cpp
+for (int f = 0; f < state.num_factions; ++f) {
+    legal_movement_mask(state, f, legal);
+    decisions.movement(state, f, step, legal, chosen, decisions.ctx);
+}
+apply_movement_step(state, actions, rng, false);
+```
+
+The buy phase has the identical shape. So **all factions' evaluations at a given
+step are one batch** — a single game yields batch-8 with no restructuring at
+all, and ~128 games in flight gives batch ~1024 naturally.
+
+**Bucket by radius.** Padding r5 (102 tokens) up to r8 (228) wastes 2.6x. Since
+the driver chooses which games are in flight, group them by radius and run each
+batch at one size:
+
+| board | tokens | MFLOP/layer @ d=128 | padded to r8 |
+|---|---:|---:|---:|
+| r5 | 102 | 45.4 | 116.3 (2.6x waste) |
+| r7 | 180 | 87.4 | 116.3 (1.3x) |
+| r8 | 228 | 116.3 | — |
+
+**Send bytes, not planes.** A ~55-plane fp16 encoding is 11.8 KB/position; at
+batch 1024 that is 12 MB per batch, 0.48 ms over PCIe 4.0 — which caps
+throughput at ~2.1M evals/s regardless of how fast the GPU is. For small nets
+the bus, not the GPU, is the bottleneck. Instead transfer a compact byte form
+(terrain, city owner, flags, army faction, three unit counts, about 7 B/hex,
+~1.3 KB per position) and **expand to planes in a CUDA kernel**. 9x less
+traffic, and the bottleneck goes back to compute where it belongs.
+
+### 10.9 Engine work required
+
+The network is the easy part. This is the milestone's real cost:
+
+1. **`play_game` must become resumable.** Today it is a blocking loop; batched
+   inference needs N games in flight, each advancing to its next decision point
+   and parking while one batched evaluation serves all of them. A state machine
+   or coroutine over the phase sequence. This is a larger change than M7.
+   Storage is not a concern — 2048 games x 17.7 KB = 36 MB, which is the M6d
+   sparse-battle refactor paying off again.
+2. **Batched encoder** writing directly into a pinned host buffer in the compact
+   byte format, one row per (game, faction) pair.
+3. **Inference thread**, double-buffered H2D -> infer -> D2H so CPU and GPU
+   overlap. CUDA graphs to kill per-kernel launch overhead, which at ~50 kernels
+   x ~5 us is otherwise 250 us per batch.
+4. **Determinism.** M7's contract (§7) is that results depend only on the seed.
+   A GPU policy breaks that unless inference is deterministic *and* batch
+   composition cannot change results. Batch-invariance is the subtle one: fp16
+   reductions can vary with batch shape. Either accept that NN games are
+   reproducible only at fixed batch size, or keep a deterministic CPU reference
+   path for parity runs. **Decide before building** — it changes how the test
+   suite is written.
+
+### 10.10 Sizes and expected throughput
+
+Evaluations per game, at r7/f8 with the net making *every* decision (15.9
+turns/game measured):
+
+| decision | evals/game |
+|---|---:|
+| movement (3 steps x 8 factions) | 381 |
+| cavalry (2 x 8) | 254 |
+| buy (8/turn x ~3 autoregressive passes) | 381 |
+| resource choice | ~254 |
+| target + rectification | ~127 |
+| setup (placement, draft, swap) | ~24 |
+| **total** | **~1 420** |
+
+That is 2.2x the 636 decisions tactician searches, because tactician only
+searches movement and cavalry. **Worth considering: leave the low-stakes
+decisions to heuristics.** Dropping resource choice (a binary iron/fish pick) to
+the existing greedy rule saves ~18% of all evaluations for almost no strategic
+loss.
+
+At ~20 TFLOP/s effective, r7/f8, ~1 420 evals/game:
+
+| config | MFLOP/eval | params | evals/s | games/s |
+|---|---:|---:|---:|---:|
+| d=128 x 4 blocks | ~370 | ~0.9M | 54k | **38** |
+| d=128 x 6 blocks | ~550 | ~1.3M | 36k | 26 |
+| d=192 x 6 blocks | ~1 105 | ~2.9M | 18k | 13 |
+
+Against tactician's 344 games/s, so 9–26x slower. That is the expected trade.
+
+**Do not go below d=128.** Tensor cores want K, N >= 128; a d=64 net will not
+approach 20 TFLOP/s and buys far less real speed than its FLOP count suggests.
+Parameter counts are small by board-game standards (AlphaZero chess was ~40M) —
+start at ~1M and grow only when data volume justifies it.
+
+Inference stack: **TensorRT** (or LibTorch), fp16, CUDA graphs. Both are pure
+C++, so §1.2's "no Python at run time" survives intact. Training is the one
+place Python is hard to avoid; recommendation is a single offline trainer script
+kept physically outside `engine/`, since the constraint that matters is the
+*engine* not depending on Python, not the research tooling.
+
+### 10.11 Training
+
+**Stage 1 — behaviour cloning.** Log `(state, legal mask, chosen action)` from
+tactician self-play; train cross-entropy on the chosen action, plus the value
+head on final VP. This validates the entire pipeline against a known-good
+teacher and yields an agent that should approach tactician's strength at a
+fraction of its per-decision search.
+
+**Stage 2 — policy improvement.** Self-play with the trained policy, keeping
+what wins. Without search this is closer to iterated behaviour cloning / league
+play than to AlphaZero, and it is where search would take over.
+
+**D6 augmentation is not free.** The hex board has 12-fold symmetry (6 rotations
+x reflection), which looks like a 12x data multiplier, and `HexGrid` could
+precompute the index and direction permutations cheaply. But the engine breaks
+ties by scanning directions 0–5 and taking the first extremum, so a rotated
+board resolves a tie to a *different* action — the augmented label is wrong on
+exactly the positions where the policy is most uncertain. Use it freely for
+**value** targets; for **policy** targets either accept the noise or emit
+soft/multi-hot targets on ties.
+
+### 10.12 Open questions
+
+- **Determinism under GPU inference** (§10.9 item 4) — must be settled before
+  the test suite is written.
+- **Which decisions get a network at all.** Full coverage is ~1 420 evals/game;
+  movement + cavalry + buy only is ~1 020. Recommend starting narrow and
+  widening once each head is shown to beat its heuristic.
+- **Does the ResNet+SE control beat the transformer?** If it does, take it — it
+  is simpler and TensorRT-friendlier. Build the control first.
+- **Board-size curriculum.** Train on pooled r5–r8, or start at r7 and widen?
+  Pooled is more honest but slower to converge; r3 in particular is nearly a
+  different game and may deserve exclusion rather than inclusion.
+- **`decide_play_cards` / `decide_trade`** (§9) — if action cards ever land, the
+  buy head's autoregressive set-decode is the natural template, which is a
+  further argument for building it that way rather than as a fixed-width head.
