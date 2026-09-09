@@ -62,6 +62,7 @@ add_library(oo_core STATIC
   src/run.cpp
   src/batch.cpp
   src/encode.cpp
+  src/train_data.cpp
   src/turn_log.cpp
   src/json.cpp
 )
@@ -110,6 +111,9 @@ endif()
 # --- apps (the eventual replacements for run.py / tournament.py) ------------
 add_executable(oo_run apps/oo_run.cpp)
 target_link_libraries(oo_run PRIVATE oo_core oo_neural)
+
+add_executable(oo_dump_training apps/oo_dump_training.cpp)
+target_link_libraries(oo_dump_training PRIVATE oo_core)
 
 add_executable(oo_tournament apps/oo_tournament.cpp)
 target_link_libraries(oo_tournament PRIVATE oo_core)

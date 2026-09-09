@@ -15,3 +15,8 @@ engine/build/
 # profiler sessions and symbols
 engine/prof/
 *.pdb
+
+# training data and checkpoints
+data/
+checkpoints/
+__pycache__/
