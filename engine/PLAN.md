@@ -452,6 +452,54 @@ The RNG-draw counter matters as much as the state: two engines can agree on stat
 while having consumed a different number of rolls, and that divergence surfaces
 several turns later somewhere unrelated.
 
+### 3.4 Retiring the parity corpus (decided, do at M8)
+
+Once Python is gone the CPython-compatible RNG (§3.1) stops earning its keep,
+and it is replaced with a native generator — recommended: **xoshiro256++ seeded
+through SplitMix64**.
+
+**What this buys.** Speed is the smallest part: `Rng::seed` + `genrand_uint32` +
+`randbelow` measure 0.85 s of 18.5 s (engine profile) and 0.84 s of 20.0 s
+(tactician), so ~4.5%. The two real gains:
+
+- **State size: 2.5 KB -> 32 bytes.** MT19937 carries 624 words plus an index.
+  Every agent owns one, tactician copies a whole `Rng` per rollout candidate
+  (§7.2 item 3), and §10 wants thousands of games in flight each holding one.
+- **Deleting the intricate part.** `_randbelow_with_getrandbits`, the
+  dual-branch `sample`, `genrand_res53`, `choices` with `hi = n - 1` — the
+  fiddliest code in the engine, and all of it exists only to match CPython.
+
+**This is a one-way door.** The golden corpus is what proves the C++ engine
+implements the same game as the Python original; change the RNG and it can
+never be re-derived. So: **tag the last Python-verifiable commit first** (the
+same tag that archives `agents/` and `engine_old/`, §9), and do the RNG swap as
+the final act of M8, after everything else is green.
+
+The corpus splits cleanly:
+
+| survives untouched — no RNG, stays a Python-verified oracle | regenerate from C++ — downgrades to a regression test |
+|---|---|
+| `grid_golden`, `legal_cases`, `buy_scenarios`, `movement_scenarios`, `phase_cases` | `turn_traces`, `agent_games`, `replay_hashes`, `setup_cases` |
+
+The left column is pure geometry, explicit states, or hand-built action lists —
+no seed is involved, so those files stay valid forever and keep some
+Python-derived ground truth in the repo. The right column is generated from
+seeds; regenerate each file once from the C++ engine in the same commit as the
+swap. Those tests still catch "I broke something today"; they stop proving
+"matches Python". That is the correct trade at M8 and not before.
+
+`rng_golden` and `rng_stress` become meaningless outright — their entire purpose
+is CPython bit-compatibility. Replace them with basic property tests on the new
+generator (range, period, uniformity of `randbelow` across moduli, `shuffle`
+producing every permutation).
+
+**Do not use `std::uniform_int_distribution`, `std::shuffle`, or
+`std::mt19937`.** All three are implementation-defined or
+implementation-seeded, so MSVC and libstdc++ produce different sequences from
+the same seed. Cross-platform reproducibility is weaker than the CPython parity
+being given up, but it is still worth keeping, and it costs one hand-written
+bounded-integer draw.
+
 ---
 
 ## 4. Step 3 — the core engine
@@ -1161,7 +1209,7 @@ invariant every army mutation must preserve.
 | ~~M6c~~ | ~~`oo_run` / `oo_tournament` + native JSON~~ | **done — 120/120 files byte-identical; `run.py` deleted (§6.8)** |
 | ~~M6d~~ | ~~Sparse battle storage~~ | **done — 68.6 KB -> 17.7 KB; all gates green (§6.9)** |
 | M7 | `run_games` thread pool | **DONE** — 6.4x on 12 threads (6 cores + SMT), deterministic per seed |
-| M8 | **Python removed** | `-DOO_BUILD_PYTHON=OFF` builds and passes everything; `bindings/`, shims, `engine_old/`, `agents/` deleted |
+| M8 | **Python removed** | `-DOO_BUILD_PYTHON=OFF` builds and passes everything; `bindings/`, shims, `engine_old/`, `agents/` deleted. Finish by swapping the CPython RNG for a native one and regenerating the seed-derived corpus (§3.4) — tag first, it is a one-way door |
 | M9 | Neural policy (§10) | resumable `play_game`, batched encoder, TensorRT inference; a learned policy that beats `tactician` head to head |
 
 M1–M4 are where nearly all the risk lives. M5 is mechanical. M6 is the largest
@@ -1179,25 +1227,27 @@ against its Python original independently and the dependency graph is a clean tr
   are still emitted regardless — see §1.3.
 - ~~Duplicate `engine_old/` at the repo root~~ **Resolved: removed; the canonical
   copy is `engine/engine_old/`.**
-- `hex_common.py` is now orphaned — the deleted visualizers were its only importers,
-  and `web_visualizer.html` has its geometry inlined already ("ported from
-  hex_common.py"). Safe to delete; say the word.
+- ~~`hex_common.py` is orphaned~~ **Resolved: deleted** (`1467630`).
 - **Action cards and trading are in the rulebook but entirely absent from the engine**
   — no deck, no hands, no per-faction trade actions; `action_cards.md` says the pool
   is still undesigned. Not a reason to delay the port, but worth one cheap decision
   now: **add a no-op `decide_play_cards` to the `Agent` interface (§6.3) up front.**
   Adding a field to a POD `GameState` later is trivial; adding a tenth decision
-  method to twelve already-written C++ agents is not. One virtual with a default
-  empty implementation costs nothing and removes the only expensive part of adding
-  cards later. Same argument for a `decide_trade` hook, though trading between
-  scripted agents is close to meaningless until there is a policy that can value an
-  offer.
+  method to twelve already-written C++ agents is not. **Done — the hook is in
+  `agent.hpp` with an empty default.** Still open: whether to add the same for
+  `decide_trade`, and the design of the cards themselves. Trading between
+  scripted agents is close to meaningless until there is a policy that can value
+  an offer — which §10 would be the first thing to provide.
 - The two `_revert_departure` edge cases are ported bugs. Keep bug-compatible for
   now — parity is worth more than tidiness — but they should be revisited on their
   own once the port is green.
 - `radius >= 9` currently crashes terrain generation (`BAG_COUNTS` totals 250 hexes
   vs a radius-9 board's 271, per `tournament.py`'s comment). Fix during the port, or
   keep bug-compatible? Recommend fixing, and recording it as an intentional divergence.
+  Currently `oo_run` just rejects `--radius > 8` with an explanatory error. Note
+  §10.3 assumes radii 1–8, so lifting this would widen the network's size range
+  (max hex distance 18 at r9, 20 at r10) — cheap under log-bucketed distance bias,
+  but it should be decided before training runs start.
 - `alive[]` is vestigial (always true, never set false). Now safely droppable from
   `GameState`: nothing in `engine_old` or `agents/` reads it except the log snapshot
   and `tactician._clone_state`, and `web_visualizer.html` tests it defensively
@@ -1209,6 +1259,8 @@ against its Python original independently and the dependency graph is a clean tr
   oracles and nothing else. They must be deleted at M8 to hit "no Python in the repo"
   — worth being deliberate that this trades away the fastest place to prototype a new
   heuristic. Archiving them on a branch or tag costs nothing and keeps that option.
+  **§3.4 makes this mandatory rather than optional:** the RNG swap at the end of M8
+  is a one-way door, so the tag is the only way back to a Python-verifiable state.
 
 ---
 
@@ -1506,13 +1558,25 @@ The network is the easy part. This is the milestone's real cost:
 3. **Inference thread**, double-buffered H2D -> infer -> D2H so CPU and GPU
    overlap. CUDA graphs to kill per-kernel launch overhead, which at ~50 kernels
    x ~5 us is otherwise 250 us per batch.
-4. **Determinism.** M7's contract (§7) is that results depend only on the seed.
-   A GPU policy breaks that unless inference is deterministic *and* batch
-   composition cannot change results. Batch-invariance is the subtle one: fp16
-   reductions can vary with batch shape. Either accept that NN games are
-   reproducible only at fixed batch size, or keep a deterministic CPU reference
-   path for parity runs. **Decide before building** — it changes how the test
-   suite is written.
+4. **Determinism, decided: reproducible at a fixed batch size.** M7's contract
+   (§7) is that a game's result depends only on its seed, independent of thread
+   count. A GPU policy weakens that, because fp16 reductions are not
+   batch-invariant — the same position can produce fractionally different logits
+   depending on how many other positions shared its batch, and an argmax near a
+   tie will then flip.
+
+   The decision is to **accept batch-size-dependent reproducibility** rather
+   than pay for deterministic reductions or maintain a parallel CPU inference
+   path. Consequences to build around:
+
+   - A replay must record the batch size it ran at, and reproduces only at that
+     size. `GameSpec` (§7) gains a batch-size field for NN runs.
+   - The M7 `test_run` invariant (thread count cannot change results) still
+     holds for scripted agents and must keep running for them. It cannot cover
+     NN agents; do not weaken it to accommodate them.
+   - Batch composition must therefore be a deterministic function of the seed
+     set, not of completion order — so the resumable driver has to fill batches
+     in a fixed order, which is a constraint on §10.9 item 1, not a free choice.
 
 ### 10.10 Sizes and expected throughput
 
@@ -1568,19 +1632,41 @@ fraction of its per-decision search.
 what wins. Without search this is closer to iterated behaviour cloning / league
 play than to AlphaZero, and it is where search would take over.
 
-**D6 augmentation is not free.** The hex board has 12-fold symmetry (6 rotations
-x reflection), which looks like a 12x data multiplier, and `HexGrid` could
-precompute the index and direction permutations cheaply. But the engine breaks
-ties by scanning directions 0–5 and taking the first extremum, so a rotated
-board resolves a tie to a *different* action — the augmented label is wrong on
-exactly the positions where the policy is most uncertain. Use it freely for
-**value** targets; for **policy** targets either accept the noise or emit
-soft/multi-hot targets on ties.
+**D6 augmentation: don't bother.** The hex board has 12-fold symmetry (6
+rotations x reflection), so any training example `(S, A)` yields 11 more as
+`(g.S, g.A)` — two permutation tables, hex index and direction index, both
+cheap for `HexGrid` to precompute. AlphaGo used the square board's 8-fold
+symmetry exactly this way.
+
+It is not worth it here, for a reason specific to this project: **augmentation
+stretches scarce data, and our data is not scarce.** The engine generates 5 732
+greedy and 344 tactician games/s. Twelve rotations of one game carry strictly
+less information than twelve fresh games, which bring new terrain, new openings
+and new positions. Generate more games instead.
+
+There is also a second-order wrinkle worth recording, because it will show up
+in metrics whether or not augmentation is used. The teacher's tie-breaks are
+enumeration-order artifacts: tactician keeps the first maximum
+(`score > best_score`, strict), and candidate order comes from hex and
+direction index order — the same reason the port needed `std::stable_sort` and
+`std::min_element` throughout (§4). Rotate the board and the index order
+changes, so a *different* one of several equally-scored moves comes first.
+`g.A` is therefore still a tied-optimal move, just not the one the teacher
+would have picked. Consequences:
+
+- "Top-1 agreement with tactician" reads lower than the policy deserves on
+  tied positions. Do not read that as weakness.
+- Hard cross-entropy cannot reach zero on ties; the net learns to spread mass
+  across tied moves, which is arguably better play than cloning an index-order
+  artifact.
+
+The symmetry remains useful in two other forms: as an architectural prior (an
+equivariant trunk gets it for free rather than learning it), and as test-time
+augmentation — average the policy over all 12 rotations for a smoother output,
+at 12x inference cost.
 
 ### 10.12 Open questions
 
-- **Determinism under GPU inference** (§10.9 item 4) — must be settled before
-  the test suite is written.
 - **Which decisions get a network at all.** Full coverage is ~1 420 evals/game;
   movement + cavalry + buy only is ~1 020. Recommend starting narrow and
   widening once each head is shown to beat its heuristic.
