@@ -1246,7 +1246,7 @@ invariant every army mutation must preserve.
 | ~~M6b~~ | ~~Native tactician + the six leaf agents~~ | **done — 202 921 decisions and 155/155 games identical; tactician 56–73x (§6.7)** |
 | ~~M6c~~ | ~~`oo_run` / `oo_tournament` + native JSON~~ | **done — 120/120 files byte-identical; `run.py` deleted (§6.8)** |
 | ~~M6d~~ | ~~Sparse battle storage~~ | **done — 68.6 KB -> 17.7 KB; all gates green (§6.9)** |
-| M7 | `run_games` thread pool | **DONE** — 6.4x on 12 threads (6 cores + SMT), deterministic per seed |
+| ~~M7~~ | ~~`run_games` thread pool~~ | **done — 6.4x on 12 threads (6 cores + SMT), deterministic per seed (§7.1)** |
 | ~~M8~~ | ~~**Python removed**~~ | **done — zero `.py` files in the repo; no Python in `CMakeLists.txt` and none probed at configure time; 11/11 tests green and `oo_run` output unchanged (§1.2)** |
 | ~~M8b~~ | ~~Rules + cleanup window (§11)~~ | **done — auto-clamp (§11.1), xoshiro256++ (§3.4), `alive[]` dropped (§11.2); corpus reblessed via `tools/rewrite_goldens.ps1`, 11/11 green** |
 | M9 | Neural policy (§10) | resumable `play_game`, batched encoder, TensorRT inference; a learned policy that beats `tactician` head to head |
