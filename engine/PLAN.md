@@ -1228,26 +1228,58 @@ against its Python original independently and the dependency graph is a clean tr
 - ~~Duplicate `engine_old/` at the repo root~~ **Resolved: removed; the canonical
   copy is `engine/engine_old/`.**
 - ~~`hex_common.py` is orphaned~~ **Resolved: deleted** (`1467630`).
-- **Action cards and trading are in the rulebook but entirely absent from the engine**
-  — no deck, no hands, no per-faction trade actions; `action_cards.md` says the pool
-  is still undesigned. Not a reason to delay the port, but worth one cheap decision
-  now: **add a no-op `decide_play_cards` to the `Agent` interface (§6.3) up front.**
-  Adding a field to a POD `GameState` later is trivial; adding a tenth decision
-  method to twelve already-written C++ agents is not. **Done — the hook is in
-  `agent.hpp` with an empty default.** Still open: whether to add the same for
-  `decide_trade`, and the design of the cards themselves. Trading between
-  scripted agents is close to meaningless until there is a policy that can value
-  an offer — which §10 would be the first thing to provide.
-- The two `_revert_departure` edge cases are ported bugs. Keep bug-compatible for
-  now — parity is worth more than tidiness — but they should be revisited on their
-  own once the port is green.
-- `radius >= 9` currently crashes terrain generation (`BAG_COUNTS` totals 250 hexes
-  vs a radius-9 board's 271, per `tournament.py`'s comment). Fix during the port, or
-  keep bug-compatible? Recommend fixing, and recording it as an intentional divergence.
-  Currently `oo_run` just rejects `--radius > 8` with an explanatory error. Note
-  §10.3 assumes radii 1–8, so lifting this would widen the network's size range
-  (max hex distance 18 at r9, 20 at r10) — cheap under log-bucketed distance bias,
-  but it should be decided before training runs start.
+- ~~**Action cards and trading are in the rulebook but absent from the engine.**~~
+  **Resolved: dropped from scope.** The no-op `decide_play_cards` hook is already
+  in `agent.hpp` and costs nothing, so it stays; no `decide_trade` hook is added
+  and no card design work is planned. If cards are ever revived, §10.6's
+  autoregressive set-decode for `decide_buy` is the template to copy.
+- **The two `_revert_departure` edge cases** (`src/movement.cpp`, `revert_departure`).
+  Still open, and now the only substantive question left in this section.
+
+  *Context.* Movement is simultaneous, so `apply_movement_step` removes every
+  mover's units from its origin first and only then resolves destinations —
+  meaning all origin hexes sit emptied while destinations are worked out. One
+  destination outcome is a peaceful merge that would exceed `MAX_STACK_SIZE`;
+  outside battle that cap is strict, so the merge is refused and
+  `revert_departure` puts the units back. The trouble is that the origin may no
+  longer be what it was.
+
+  **Quirk 1 — a refused move can start a battle on the mover's own origin.** If
+  another faction peacefully moved *into* that origin during the same step, the
+  revert falls to the `else` branch and starts a battle there. An army that
+  tried to move, was refused for overstacking, and never actually went anywhere
+  now fights on the hex it started from. The `moved` flags show how odd this is:
+  the other faction is `true` (they did move in), the reverting army `false`
+  (its move was voided, so by end of step it never left) — and `moved` gates the
+  Archers ability, so this changes combat, not just bookkeeping.
+
+  **Quirk 2 — a peaceful army can be recreated on a locked hex.**
+  `revert_departure` tests `army_faction[origin]` but never `locked(origin)`. If
+  an unrelated battle formed on the origin this same step it absorbed the army
+  and left `NO_FACTION`, so the first branch fires and writes a peaceful army
+  onto a hex with a pending battle — violating the invariant that a locked hex
+  holds a battle rather than an army. The cost is visible in `state_io.cpp`:
+  `validate_state` had to exempt locked hexes from the strict 6-unit check
+  purely to tolerate this. `engine_old`'s docstring calls it "a latent quirk
+  present in v1 too, not introduced here", so it predates the port entirely.
+
+  *Assessment.* Quirk 2 is a plain bug — it produces a state the engine's own
+  invariant checker had to be weakened for, and no reading of the rules wants
+  it. Quirk 1 is a **rules** question rather than a correctness one: "shoved back
+  into occupied ground, so fight" is defensible, it is simply nowhere in the
+  rulebook. That one is a design decision, not a fix.
+
+  *When.* Both change game outcomes, so either is the same one-way door as the
+  RNG swap (§3.4). Do them in that same window — after M8, with the seed-derived
+  corpus regenerated — or pay to regenerate it twice. Frequency in real play is
+  unknown; that `tools/dump_movement_scenarios.py` had to construct these
+  deliberately suggests it is rare.
+- ~~`radius >= 9` crashes terrain generation (`BAG_COUNTS` totals 250 hexes vs a
+  radius-9 board's 271). Fix, or keep bug-compatible?~~ **Resolved: boards of
+  radius 9+ are out of scope.** `oo_run` rejects `--radius > 8` with an
+  explanatory error and that stands. Radii 1–8 is therefore a hard bound, which
+  §10.3 already assumes — the network's distance-bias buckets never need to
+  cover more than distance 16.
 - `alive[]` is vestigial (always true, never set false). Now safely droppable from
   `GameState`: nothing in `engine_old` or `agents/` reads it except the log snapshot
   and `tactician._clone_state`, and `web_visualizer.html` tests it defensively
@@ -1258,9 +1290,9 @@ against its Python original independently and the dependency graph is a clean tr
 - Once all twelve agents are native (M6b), `agents/` and `engine_old/` are the parity
   oracles and nothing else. They must be deleted at M8 to hit "no Python in the repo"
   — worth being deliberate that this trades away the fastest place to prototype a new
-  heuristic. Archiving them on a branch or tag costs nothing and keeps that option.
-  **§3.4 makes this mandatory rather than optional:** the RNG swap at the end of M8
-  is a one-way door, so the tag is the only way back to a Python-verifiable state.
+  heuristic. ~~Archive them on a branch or tag first?~~ **Resolved: no tag. Git
+  history is sufficient** — the deleting commit is the boundary, and `git show`
+  against any earlier commit recovers the Python oracle if it is ever needed.
 
 ---
 
