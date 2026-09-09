@@ -1249,7 +1249,7 @@ invariant every army mutation must preserve.
 | ~~M7~~ | ~~`run_games` thread pool~~ | **done — 6.4x on 12 threads (6 cores + SMT), deterministic per seed (§7.1)** |
 | ~~M8~~ | ~~**Python removed**~~ | **done — zero `.py` files in the repo; no Python in `CMakeLists.txt` and none probed at configure time; 11/11 tests green and `oo_run` output unchanged (§1.2)** |
 | ~~M8b~~ | ~~Rules + cleanup window (§11)~~ | **done — auto-clamp (§11.1), xoshiro256++ (§3.4), `alive[]` dropped (§11.2); corpus reblessed via `tools/rewrite_goldens.ps1`, 11/11 green** |
-| ~~M9~~ | ~~Neural policy runtime (§10)~~ | **done — `oo_run --neural` plays full games on random weights: 19 812 evals/s, 6.7 games/s at r7/f8, d=128 x4 (§10.9). Launch-bound, not compute-bound** |
+| ~~M9~~ | ~~Neural policy runtime (§10)~~ | **done — `oo_run --neural` plays full games on random weights: 27 225 evals/s, 9.3 games/s at r7/f8, d=128 x4, after three answer-preserving optimisations (§10.9)** |
 | M10a | Evaluation harness (§12.1) | head-to-head with confidence intervals, paired seeds, seat rotation, a fixed ladder. Before any training |
 | M10b | Imitate tactician (§12.2) | behaviour cloning on engine-generated data. **Exit: beats `marshal`, close to `tactician`** |
 | M10c | Self-play (§12.3) | league of past checkpoints; where search would later take over |
@@ -1679,9 +1679,64 @@ The network is the easy part. This is the milestone's real cost:
 
    Writing directly into a *pinned* buffer waits for M9c, when there is a CUDA
    allocator to pin with.
-3. **Inference thread**, double-buffered H2D -> infer -> D2H so CPU and GPU
-   overlap. CUDA graphs to kill per-kernel launch overhead, which at ~50 kernels
-   x ~5 us is otherwise 250 us per batch.
+3. ~~**Inference thread**~~ **Done (M9c).** `include/oo/neural.hpp` +
+   `src/neural.cpp`, LibTorch 2.14 cu126, optional behind `-DOO_LIBTORCH_DIR`
+   with `neural_stub.cpp` providing the same symbols otherwise - so both
+   configurations build and pass, and the core still requires nothing external
+   (§1.2).
+
+   Measured at r7/f8, d=128 x4 blocks (1 044k params), fp16 on a 3080 Ti, 512
+   games in flight: **27 225 evals/s, 9.3 games/s.**
+
+   **How it got there.** The first working version managed 19 812 evals/s
+   against §10.10's predicted 54 000. Solving `batch_time = fixed + flops/rate`
+   from two points (4 blocks and 1) said **6.4 ms of fixed overhead per batch**
+   against ~12.8 TFLOP/s while computing - 43 % of every batch was overhead, and
+   the trunk was never the problem. Three answer-preserving fixes, 1.37x total:
+
+   1. **Gather the query hex before the single-hex heads.** `head_rect` was
+      computed over EVERY hex, making it `[B, n_hex, 48]` - 9.6 MB at batch 296,
+      **72 % of all download traffic**, ~99 % of it discarded, when
+      rectification asks about one hex. Same numbers, 160x fewer of them. Same
+      for `head_resource`. This was the win.
+   2. **One fused download instead of eight.** Each `.to(kCPU)` is a full device
+      synchronisation, so eight of them serialised every batch eight times over.
+   3. **Pinned host buffers** both ways - worth only +2.2 % once (1) had shrunk
+      the download 4x, which is itself the useful result: transfer had stopped
+      being the bottleneck.
+
+   Re-solving afterwards: **fixed 6.4 -> ~4.1 ms**, rate 12.8 -> 17.0 TFLOP/s.
+   Still ~45 % overhead, but now spread thinly across ~50 kernel launches, the
+   encode and synchronisation rather than concentrated anywhere.
+
+   **A negative result, recorded so it is not re-attempted:** narrowing the GPU
+   mutex so the CPU decode runs in parallel changed nothing measurable, so the
+   decode was never a bottleneck. The narrower scope was kept anyway - it is
+   correct, and it stops being free at higher thread counts.
+
+   **Still available, deferred:** CUDA graphs (the natural next step, and it
+   wants the fixed batch shape §10.9 already commits to), a fused
+   byte-expansion kernel, and a GPU-side masked argmax so only chosen indices
+   come back. The mean batch is also 295.7 against a 512 cap, so simply keeping
+   more games in flight helps on its own.
+
+   **Answer equivalence.** In fp32 the optimisations are exact: `test_neural`
+   compares 26 requests covering all nine decision kinds across four batch
+   groupings - one batch, singly, reversed, ragged chunks - and finds zero
+   differences. That test is the real deliverable, because batch invariance is
+   the property the whole threading design in item 1 rests on, and a
+   per-position gather is exactly what breaks it. In fp16 they shift 0.002 % of
+   decisions (61 of 3 013 674): gathering one row instead of 169 changes the
+   GEMM shape and so the accumulation order, flipping the occasional near-tie
+   argmax. That is the documented fixed-batch-size behaviour of item 5, not a
+   regression - at a fixed batch size results are reproducible run to run,
+   verified.
+
+   **Note the games/s figure is held down by random weights**, which play badly
+   enough to run 52.4 turns/game against the 14.9 a real agent produces - so a
+   game costs ~2 943 evaluations rather than the ~1 420 §10.10 assumes. That
+   half of the gap closes by training, not by optimising, and it is why M10b
+   should re-measure before anyone tunes further.
 4. **Determinism, decided: reproducible at a fixed batch size.** M7's contract
    (§7) is that a game's result depends only on its seed, independent of thread
    count. A GPU policy weakens that, because fp16 reductions are not
