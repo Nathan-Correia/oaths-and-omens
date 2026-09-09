@@ -396,17 +396,40 @@ void TorchPolicy::evaluate_impl(const DecisionRequest* requests, DecisionAnswer*
     // games can keep arriving, which means two threads can be in here at once -
     // a shared staging buffer is a straight data race, and it announces itself
     // as a stack-buffer-overrun crash rather than anything legible.
-    thread_local std::vector<EncodedPosition> staging;
-    staging.resize(static_cast<size_t>(n));
-    encode_batch(requests, n, staging.data());
+    // PINNED, when there is a device to talk to. A copy out of ordinary pageable
+    // memory has to be staged through a driver bounce buffer first; pinned pages
+    // can be DMA'd straight across, which is worth roughly 2x on both directions.
+    // Reallocated only when the batch size changes, which after warm-up it does
+    // not.
+    thread_local torch::Tensor staging;
+    thread_local std::vector<EncodedPosition> staging_fallback;
+    EncodedPosition* dst = nullptr;
+    if (cfg_.cuda) {
+        if (!staging.defined() || staging.size(0) != n) {
+            staging = torch::empty(
+                {n, kPosBytes},
+                torch::TensorOptions().dtype(torch::kUInt8).pinned_memory(true));
+        }
+        dst = reinterpret_cast<EncodedPosition*>(staging.data_ptr<uint8_t>());
+    } else {
+        staging_fallback.resize(static_cast<size_t>(n));
+        dst = staging_fallback.data();
+    }
+    encode_batch(requests, n, dst);
 
-    auto raw = torch::from_blob(staging.data(), {n, kPosBytes}, torch::kUInt8)
-                   .to(device_, /*non_blocking=*/false);
+    auto raw = cfg_.cuda
+                   ? staging.to(device_, /*non_blocking=*/false)
+                   : torch::from_blob(dst, {n, kPosBytes}, torch::kUInt8).clone();
 
-    // One batch on the GPU at a time. Encoding above is parallel and worth
-    // keeping so; overlapping the forward passes themselves would only multiply
+    // One batch on the GPU at a time. Encoding above is parallel and worth keeping
+    // so; overlapping the forward passes themselves would only multiply
     // working-set memory for no throughput, since the device is the bottleneck.
-    std::lock_guard<std::mutex> gpu_lock(gpu_mu_);
+    //
+    // SCOPED to the device work only. Holding it across the decode loop below
+    // serialised that too, and the decode is pure CPU work over a thread-local
+    // buffer - several milliseconds per batch of argmaxes and sorts that has no
+    // reason to be single-file.
+    std::unique_lock<std::mutex> gpu_lock(gpu_mu_);
 
     auto x = net_->trunk(raw);
     auto hex_tok = x.slice(1, 0, hexes_);
@@ -416,23 +439,80 @@ void TorchPolicy::evaluate_impl(const DecisionRequest* requests, DecisionAnswer*
     // Every head runs for the whole batch. They are a rounding error next to the
     // trunk (~0.7 MFLOP against ~370), and computing them all keeps the GPU path
     // branch-free - the CPU then reads only what each request asked for.
-    auto move = net_->head_move->forward(hex_tok).to(torch::kFloat32).to(torch::kCPU);
-    auto pass = net_->head_pass->forward(cls_tok).to(torch::kFloat32).to(torch::kCPU);
-    auto hexs = net_->head_hex->forward(hex_tok).to(torch::kFloat32).to(torch::kCPU);
-    auto buy = net_->head_buy->forward(hex_tok).to(torch::kFloat32).to(torch::kCPU);
-    auto target = net_->head_target->forward(fac_tok).to(torch::kFloat32).to(torch::kCPU);
-    auto resource = net_->head_resource->forward(hex_tok).to(torch::kFloat32).to(torch::kCPU);
-    auto swap = net_->head_swap->forward(cls_tok).to(torch::kFloat32).to(torch::kCPU);
-    auto rect = net_->head_rect->forward(hex_tok).to(torch::kFloat32).to(torch::kCPU);
+    // Two heads ask about ONE hex - the query hex carried in the request - so
+    // gather that row per position before running them. Computing head_rect over
+    // every hex made it [B, n_hex, 48], which at batch 296 is 9.6 MB, 72 % of all
+    // download traffic, of which ~99 % was discarded. Same numbers, 160x less of
+    // them.
+    std::vector<int64_t> query(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i) {
+        const int h = requests[i].hex;
+        query[static_cast<size_t>(i)] =
+            (h >= 0 && h < requests[i].state->num_hexes) ? h : 0;
+    }
+    auto query_idx = torch::from_blob(query.data(), {n, 1}, torch::kLong).to(device_);
+    // [B, 1, d] -> the trunk row for each position's own query hex.
+    auto query_tok =
+        hex_tok.gather(1, query_idx.unsqueeze(-1).expand({n, 1, hex_tok.size(2)})).squeeze(1);
 
-    auto move_a = move.accessor<float, 3>();
-    auto pass_a = pass.accessor<float, 2>();
-    auto hex_a = hexs.accessor<float, 3>();
-    auto buy_a = buy.accessor<float, 3>();
-    auto target_a = target.accessor<float, 3>();
-    auto res_a = resource.accessor<float, 3>();
-    auto swap_a = swap.accessor<float, 2>();
-    auto rect_a = rect.accessor<float, 3>();
+    // ONE download, not eight. Each `.to(kCPU)` is a full device synchronisation,
+    // so eight of them serialised the batch eight times over. Concatenating on
+    // the device and copying once costs a single sync.
+    //
+    // Widths, in order: move 6, pass 1, hex 1, buy 9, target nf, resource 2,
+    // swap 2, rect 48. Per-hex heads are flattened so everything is [B, W].
+    const int nf = cfg_.num_factions;
+    auto flat = torch::cat(
+        {
+            net_->head_move->forward(hex_tok).reshape({n, hexes_ * NUM_DIRECTIONS}),
+            net_->head_pass->forward(cls_tok),
+            net_->head_hex->forward(hex_tok).reshape({n, hexes_}),
+            net_->head_buy->forward(hex_tok).reshape({n, hexes_ * 9}),
+            net_->head_target->forward(fac_tok).reshape({n, nf}),
+            net_->head_resource->forward(query_tok),
+            net_->head_swap->forward(cls_tok),
+            net_->head_rect->forward(query_tok),
+        },
+        1);
+    auto device_f32 = flat.to(torch::kFloat32);
+    thread_local torch::Tensor host_pinned;
+    torch::Tensor host;
+    if (cfg_.cuda) {
+        if (!host_pinned.defined() || host_pinned.sizes() != device_f32.sizes()) {
+            host_pinned = torch::empty(
+                device_f32.sizes(),
+                torch::TensorOptions().dtype(torch::kFloat32).pinned_memory(true));
+        }
+        host_pinned.copy_(device_f32);
+        host = host_pinned;
+    } else {
+        host = device_f32.to(torch::kCPU);
+    }
+    // The copy above is complete, and `host` is this thread's own buffer, so the
+    // device is free from here on.
+    gpu_lock.unlock();
+
+    const float* base = host.data_ptr<float>();
+    const int64_t row = host.size(1);
+
+    // Column offsets into each row of the fused result.
+    const int64_t off_move = 0;
+    const int64_t off_pass = off_move + int64_t(hexes_) * NUM_DIRECTIONS;
+    const int64_t off_hex = off_pass + 1;
+    const int64_t off_buy = off_hex + hexes_;
+    const int64_t off_target = off_buy + int64_t(hexes_) * 9;
+    const int64_t off_resource = off_target + nf;
+    const int64_t off_swap = off_resource + 2;
+    const int64_t off_rect = off_swap + 2;
+
+    auto move_at = [&](int i, int h, int d) { return base[i * row + off_move + h * NUM_DIRECTIONS + d]; };
+    auto pass_at = [&](int i) { return base[i * row + off_pass]; };
+    auto hex_at = [&](int i, int h) { return base[i * row + off_hex + h]; };
+    auto buy_at = [&](int i, int h, int v) { return base[i * row + off_buy + h * 9 + v]; };
+    auto target_at = [&](int i, int f) { return base[i * row + off_target + f]; };
+    auto res_at = [&](int i, int k) { return base[i * row + off_resource + k]; };
+    auto swap_at = [&](int i, int k) { return base[i * row + off_swap + k]; };
+    auto rect_at = [&](int i, int k) { return base[i * row + off_rect + k]; };
 
     for (int i = 0; i < n; ++i) {
         const DecisionRequest& r = requests[i];
@@ -444,12 +524,12 @@ void TorchPolicy::evaluate_impl(const DecisionRequest* requests, DecisionAnswer*
             case DecisionKind::kCavalry: {
                 // Legality masking is not optional (§10.7): the argmax runs over
                 // legal cells only, and `pass` competes with them.
-                float best = pass_a[i][0];
+                float best = pass_at(i);
                 int best_h = -1, best_d = -1;
                 for (int h = 0; h < s.num_hexes; ++h) {
                     for (int dir = 0; dir < NUM_DIRECTIONS; ++dir) {
                         if (!r.legal_mask->cell[h][dir]) continue;
-                        const float v = move_a[i][h][dir];
+                        const float v = move_at(i, h, dir);
                         if (v > best) {
                             best = v;
                             best_h = h;
@@ -467,7 +547,7 @@ void TorchPolicy::evaluate_impl(const DecisionRequest* requests, DecisionAnswer*
                 float best = 0.0f;
                 for (int h = 0; h < s.num_hexes; ++h) {
                     if (!r.legal_hexes[h]) continue;
-                    const float v = hex_a[i][h][0];
+                    const float v = hex_at(i, h);
                     if (best_h < 0 || v > best) {
                         best = v;
                         best_h = h;
@@ -480,7 +560,7 @@ void TorchPolicy::evaluate_impl(const DecisionRequest* requests, DecisionAnswer*
                 int best_k = 0;
                 float best = 0.0f;
                 for (int k = 0; k < r.pool_size; ++k) {
-                    const float v = hex_a[i][r.pool[k]][0];
+                    const float v = hex_at(i, r.pool[k]);
                     if (k == 0 || v > best) {
                         best = v;
                         best_k = k;
@@ -499,7 +579,7 @@ void TorchPolicy::evaluate_impl(const DecisionRequest* requests, DecisionAnswer*
                         const int f = b->slots[slot].faction;
                         if (f == NO_FACTION || f == r.faction) continue;
                         const int rel = (f - r.faction + s.num_factions) % s.num_factions;
-                        const float v = target_a[i][rel][0];
+                        const float v = target_at(i, rel);
                         if (best_f < 0 || v > best) {
                             best = v;
                             best_f = f;
@@ -509,13 +589,12 @@ void TorchPolicy::evaluate_impl(const DecisionRequest* requests, DecisionAnswer*
                 a.index = best_f;
                 break;
             }
-            case DecisionKind::kResource: {
-                const int h = r.hex >= 0 && r.hex < s.num_hexes ? r.hex : 0;
-                a.resource = res_a[i][h][0] > res_a[i][h][1] ? kIron : kFish;
+            case DecisionKind::kResource:
+                // Already gathered at the query hex, so there is no hex index here.
+                a.resource = res_at(i, 0) > res_at(i, 1) ? kIron : kFish;
                 break;
-            }
             case DecisionKind::kSwap:
-                a.flag = swap_a[i][0] > swap_a[i][1];
+                a.flag = swap_at(i, 0) > swap_at(i, 1);
                 break;
             case DecisionKind::kBuy: {
                 // Score every legal action by its (hex, variant) cell and take
@@ -539,7 +618,7 @@ void TorchPolicy::evaluate_impl(const DecisionRequest* requests, DecisionAnswer*
                         default: variant = 6 + act.upgrade; break;
                     }
                     if (variant > 8) variant = 8;
-                    scored.push_back({buy_a[i][act.hex][variant], k});
+                    scored.push_back({buy_at(i, act.hex, variant), k});
                 }
                 std::stable_sort(scored.begin(), scored.end(),
                                  [](const Scored& p, const Scored& q) { return p.score > q.score; });
@@ -556,7 +635,6 @@ void TorchPolicy::evaluate_impl(const DecisionRequest* requests, DecisionAnswer*
                 a.send_back->clear();
                 const Battle* b = s.battle_at(r.hex);
                 if (!b) break;
-                const int h = r.hex;
                 int have[MAX_BATTLE_CONTRIB][NUM_UNIT_TYPES] = {};
                 int total = 0;
                 for (int slot = 0; slot < b->nslots; ++slot) {
@@ -573,7 +651,7 @@ void TorchPolicy::evaluate_impl(const DecisionRequest* requests, DecisionAnswer*
                     for (int slot = 0; slot < b->nslots; ++slot) {
                         for (int t = 0; t < NUM_UNIT_TYPES; ++t) {
                             if (have[slot][t] <= 0) continue;
-                            const float v = rect_a[i][h][slot * NUM_UNIT_TYPES + t];
+                            const float v = rect_at(i, slot * NUM_UNIT_TYPES + t);
                             if (bs < 0 || v > best) {
                                 best = v;
                                 bs = slot;
