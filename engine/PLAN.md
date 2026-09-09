@@ -1210,6 +1210,7 @@ invariant every army mutation must preserve.
 | ~~M6d~~ | ~~Sparse battle storage~~ | **done — 68.6 KB -> 17.7 KB; all gates green (§6.9)** |
 | M7 | `run_games` thread pool | **DONE** — 6.4x on 12 threads (6 cores + SMT), deterministic per seed |
 | M8 | **Python removed** | `-DOO_BUILD_PYTHON=OFF` builds and passes everything; `bindings/`, shims, `engine_old/`, `agents/` deleted. Finish by swapping the CPython RNG for a native one and regenerating the seed-derived corpus (§3.4) — tag first, it is a one-way door |
+| M8b | Rules + cleanup window (§11) | auto-clamp merges, RNG swap, `alive[]` dropped; corpus regenerated once. **Must close before M9 generates training data** |
 | M9 | Neural policy (§10) | resumable `play_game`, batched encoder, TensorRT inference; a learned policy that beats `tactician` head to head |
 
 M1–M4 are where nearly all the risk lives. M5 is mechanical. M6 is the largest
@@ -1233,60 +1234,37 @@ against its Python original independently and the dependency graph is a clean tr
   in `agent.hpp` and costs nothing, so it stays; no `decide_trade` hook is added
   and no card design work is planned. If cards are ever revived, §10.6's
   autoregressive set-decode for `decide_buy` is the template to copy.
-- **The two `_revert_departure` edge cases** (`src/movement.cpp`, `revert_departure`).
-  Still open, and now the only substantive question left in this section.
+- ~~**The two `_revert_departure` edge cases**~~ **Resolved by §11.1.** Both are
+  reached only through the peaceful-merge overstack revert, which is
+  `revert_departure`'s single call site. Clamping the merge at collect time
+  means nothing is ever sent back, so the lambda becomes dead code and both
+  quirks are deleted rather than fixed — and `validate_state` regains the strict
+  6-unit check it had to give up for quirk 2. Kept here as the description of
+  what is being removed:
 
-  *Context.* Movement is simultaneous, so `apply_movement_step` removes every
-  mover's units from its origin first and only then resolves destinations —
-  meaning all origin hexes sit emptied while destinations are worked out. One
-  destination outcome is a peaceful merge that would exceed `MAX_STACK_SIZE`;
-  outside battle that cap is strict, so the merge is refused and
-  `revert_departure` puts the units back. The trouble is that the origin may no
-  longer be what it was.
+  *Quirk 1 — a refused move could start a battle on the mover's own origin.* If
+  another faction peacefully moved into that origin during the same step, the
+  revert fell to the `else` branch and started a battle there, with the
+  reverting army marked `moved = false` (its move was voided, so by end of step
+  it never left) — and `moved` gates the Archers ability, so it changed combat.
 
-  **Quirk 1 — a refused move can start a battle on the mover's own origin.** If
-  another faction peacefully moved *into* that origin during the same step, the
-  revert falls to the `else` branch and starts a battle there. An army that
-  tried to move, was refused for overstacking, and never actually went anywhere
-  now fights on the hex it started from. The `moved` flags show how odd this is:
-  the other faction is `true` (they did move in), the reverting army `false`
-  (its move was voided, so by end of step it never left) — and `moved` gates the
-  Archers ability, so this changes combat, not just bookkeeping.
-
-  **Quirk 2 — a peaceful army can be recreated on a locked hex.**
-  `revert_departure` tests `army_faction[origin]` but never `locked(origin)`. If
-  an unrelated battle formed on the origin this same step it absorbed the army
-  and left `NO_FACTION`, so the first branch fires and writes a peaceful army
-  onto a hex with a pending battle — violating the invariant that a locked hex
-  holds a battle rather than an army. The cost is visible in `state_io.cpp`:
-  `validate_state` had to exempt locked hexes from the strict 6-unit check
-  purely to tolerate this. `engine_old`'s docstring calls it "a latent quirk
-  present in v1 too, not introduced here", so it predates the port entirely.
-
-  *Assessment.* Quirk 2 is a plain bug — it produces a state the engine's own
-  invariant checker had to be weakened for, and no reading of the rules wants
-  it. Quirk 1 is a **rules** question rather than a correctness one: "shoved back
-  into occupied ground, so fight" is defensible, it is simply nowhere in the
-  rulebook. That one is a design decision, not a fix.
-
-  *When.* Both change game outcomes, so either is the same one-way door as the
-  RNG swap (§3.4). Do them in that same window — after M8, with the seed-derived
-  corpus regenerated — or pay to regenerate it twice. Frequency in real play is
-  unknown; that `tools/dump_movement_scenarios.py` had to construct these
-  deliberately suggests it is rare.
+  *Quirk 2 — a peaceful army could be recreated on a locked hex.*
+  `revert_departure` tested `army_faction[origin]` but never `locked(origin)`,
+  so an unrelated battle on the origin (which leaves `NO_FACTION`) let the first
+  branch write a peaceful army onto a hex with a pending battle. `engine_old`'s
+  docstring calls this "a latent quirk present in v1 too", so it predates the
+  port.
 - ~~`radius >= 9` crashes terrain generation (`BAG_COUNTS` totals 250 hexes vs a
   radius-9 board's 271). Fix, or keep bug-compatible?~~ **Resolved: boards of
   radius 9+ are out of scope.** `oo_run` rejects `--radius > 8` with an
   explanatory error and that stands. Radii 1–8 is therefore a hard bound, which
   §10.3 already assumes — the network's distance-bias buckets never need to
   cover more than distance 16.
-- `alive[]` is vestigial (always true, never set false). Now safely droppable from
-  `GameState`: nothing in `engine_old` or `agents/` reads it except the log snapshot
-  and `tactician._clone_state`, and `web_visualizer.html` tests it defensively
-  (`stats.alive !== false`, line 850) so a missing field reads as alive. Recommend
-  dropping the field and emitting `"alive": true` in the log for format
-  compatibility — or dropping it from the log too and letting the viewer's default
-  handle it, if we accept a one-line viewer-format change.
+- ~~`alive[]` is vestigial (always true, never set false) — drop it?~~
+  **Resolved: yes, in the §11.2 window.** Not done now because `state_io`
+  serializes an `ALIVE` row, so every state-bearing golden file carries one;
+  removing the field today would cost either a fake constant row or a corpus
+  regeneration, to save 10 bytes of an 18 128-byte `GameState`.
 - Once all twelve agents are native (M6b), `agents/` and `engine_old/` are the parity
   oracles and nothing else. They must be deleted at M8 to hit "no Python in the repo"
   — worth being deliberate that this trades away the fastest place to prototype a new
@@ -1708,3 +1686,117 @@ at 12x inference cost.
 - **`decide_play_cards` / `decide_trade`** (§9) — if action cards ever land, the
   buy head's autoregressive set-decode is the natural template, which is a
   further argument for building it that way rather than as a fixed-width head.
+
+---
+
+## 11. Rules and cleanup changes — the post-M8 window
+
+Everything here **changes game outcomes or the golden state format**, so all of it
+lands in one window, after M8, and the seed-derived corpus (§3.4) is regenerated
+exactly once rather than once per change. Doing any of it earlier means
+maintaining parity against a Python engine that plays a different game.
+
+**Ordering constraint:** this window must close *before* §10 generates training
+data. Encoder features, net width, even multi-size support can all be revised
+incrementally; the **action space cannot** — changing it invalidates every
+checkpoint and forces retraining from scratch.
+
+Contents of the window: the RNG swap (§3.4), the movement clamp (§11.1), and
+`alive[]` (§11.2).
+
+### 11.1 Peaceful merges auto-clamp to the stack cap
+
+**Decided.** Today, a move whose peaceful merge would exceed `MAX_STACK_SIZE`
+is submitted, accepted as legal, silently refused at resolution, and reverted —
+which is where both `_revert_departure` quirks (§9) come from. The new rule:
+
+> A move carries at most as many units as the destination can hold. If the
+> destination already holds `MAX_STACK_SIZE` of your own units, the move is
+> illegal.
+
+So a 5-stack moving onto your own 2-stack moves 4 and leaves 1 behind; onto your
+own 6-stack, the move is not offered at all.
+
+**The clamp goes at COLLECT time, not at resolution time.** This is the whole
+decision, and picking the other placement loses most of the benefit:
+
+- *Collect time* — `units_to_move` clamps against the destination's occupancy in
+  the **pre-step** state. The remainder never leaves the origin, so nothing ever
+  has to be sent back, `revert_departure` becomes dead code, and **both §9
+  quirks are deleted rather than fixed**. `validate_state` can then go back to
+  enforcing the 6-unit cap strictly, dropping the locked-hex exemption added
+  purely to tolerate quirk 2.
+- *Resolution time* — clamping inside the peaceful branch and returning the
+  excess keeps the revert path alive, so both quirks survive, merely with fewer
+  units involved. Cheaper to write, fixes nothing.
+
+Collect-time clamping is also the better **design**, not just the cheaper one.
+The clamp is computed against the board as the player sees it when deciding, so
+how many units will move is knowable at decision time. Resolution-time clamping
+would depend on what opponents did simultaneously, which the player cannot see.
+
+*Accepted cost.* Because the clamp reads the pre-step board, an opponent moving
+into the same destination turns the merge into a battle — and battles are not
+stack-capped, so the clamped units would ideally all have joined. You arrive with
+fewer than the uncapped rules would allow. This is deliberate: the rule is "a
+move carries what fits at its destination", evaluated once, deterministically.
+
+*Legal-mask change.* Only the fully-blocked case becomes illegal — destination
+holds `MAX_STACK_SIZE` of your own units. This is exactly maskable with no
+simultaneity hazard: `MoveActions` holds one move per faction per step, so for a
+peaceful merge both stacks are yours and the sitting one cannot also be moving.
+The condition is a pure function of the acting faction's own pre-step state:
+
+```
+units_to_move(from) + units_at(neighbour(from, dir)) > MAX_STACK_SIZE   // clamp
+units_at(neighbour(from, dir)) >= MAX_STACK_SIZE                        // illegal
+```
+
+Masking the blocked case matters because a faction gets **one move per step** —
+offering a move that carries zero units would waste it.
+
+*Scope.* Clamping applies only when the destination holds the mover's own army.
+Empty destinations and enemy-held destinations are unaffected: the latter start
+battles, which are uncapped by design and reconciled afterwards by
+`rectify_overflow`.
+
+*Cavalry steps* already move a partial stack (`units_to_move(cavalry_only)` takes
+cavalry and leaves infantry and archers behind), so they clamp the same way with
+no additional machinery.
+
+**Explicit unit selection was considered and rejected for now.** Letting the
+player name which units move is the richer game, and the engine would take it
+more easily than expected — partial-stack movement already exists for cavalry,
+and multi-slot-per-faction battles are already supported
+(`MAX_BATTLE_CONTRIB` = 16 against `MAX_FACTIONS` = 10). The cost is elsewhere:
+the action space grows from `(hex, dir)` = 1015 to ~84 000 (83 non-empty splits
+of a 6-stack across 3 unit types), and all twelve scripted agents need a split
+policy. If it is ever revisited, the §10 policy head extends cleanly — add a
+second per-hex head emitting 83 split logits (169 x 83 = 14k outputs, riding the
+same forward pass), decode `(hex, dir)` first and read that hex's split
+distribution. Note it would have to happen in this same window, before training
+data exists.
+
+### 11.2 Remove `alive[]`
+
+**Decided: remove, but here rather than now.** The field is vestigial — always
+true, never set false (§9).
+
+It is not as free as it looks. `state_io` serializes an `ALIVE` row into the
+canonical state format, so every state-bearing golden file carries one (970
+phase cases, plus turn traces, movement scenarios, setup cases). Removing the
+field today would mean either emitting a fake constant row purely to keep the
+corpus valid, or regenerating the corpus — to save 10 bytes of an 18 128-byte
+`GameState`. Neither is worth doing on its own; in this window the corpus is
+regenerated anyway.
+
+Three call sites to settle when it happens:
+
+- `state_io` — drop the `ALIVE` row from both writer and reader, and from
+  `compare_states`.
+- `json.cpp` — `board_state.json` emits `"alive"`. `web_visualizer.html` already
+  reads a missing value as alive (`stats.alive !== false`, line 850), so it can
+  be dropped from the JSON too; that is a one-line viewer-format change, and the
+  replay hashes are being regenerated regardless.
+- `log.hpp` / `turn_log.cpp` — `RoundLog`'s per-faction snapshot carries it.
+
