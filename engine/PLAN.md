@@ -1628,14 +1628,57 @@ traffic, and the bottleneck goes back to compute where it belongs.
 
 The network is the easy part. This is the milestone's real cost:
 
-1. **`play_game` must become resumable.** Today it is a blocking loop; batched
-   inference needs N games in flight, each advancing to its next decision point
-   and parking while one batched evaluation serves all of them. A state machine
-   or coroutine over the phase sequence. This is a larger change than M7.
-   Storage is not a concern — 2048 games x 17.7 KB = 36 MB, which is the M6d
-   sparse-battle refactor paying off again.
-2. **Batched encoder** writing directly into a pinned host buffer in the compact
-   byte format, one row per (game, faction) pair.
+1. ~~**`play_game` must become resumable.**~~ **Done (M9a), but NOT as a state
+   machine — and the deviation is worth recording.**
+
+   The plan called for a coroutine or state machine over the phase sequence.
+   That is genuinely invasive: decision points are not only in `run_turn`'s
+   phase loops but inside `resolve_full_battle`'s per-round target queries, so
+   the whole call chain would have to become suspendable.
+
+   It is also unnecessary, because of a property of the network. **A
+   transformer's batch dimension is fully independent** — attention runs over a
+   position's own token sequence, layer norm is per token, and every GEMM
+   reduces over features rather than over the batch. So which other positions
+   share a batch cannot change a position's result. Batch *composition* is free
+   to vary; only batch *size* can matter, and only through kernel selection
+   inside the GEMM library, which is why inference runs at a fixed padded size.
+
+   That collapses the requirement. Games never had to reach decision points in
+   a deterministic order — they only have to be evaluated in fixed-size
+   batches. So each game runs on its own thread and simply BLOCKS at a decision
+   point: threads are the coroutines. Oversubscribing them is fine precisely
+   because they are almost always parked on inference rather than running.
+   `include/oo/batch.hpp`.
+
+   Verified the M8b way, by proving the new path reproduces the old one before
+   anything about behaviour changed: `test_batch` runs 48 mixed games through
+   nine thread/batch configurations, from 1 thread to 48-way oversubscription,
+   and every one is byte-identical to `run_games`. Mutation-tested — dropping
+   the movement step from the request is caught by all nine.
+
+   Measured batching: 48 games in flight give a mean batch of 29.2. Storage is
+   a non-issue, as predicted — 2048 games x 17.7 KB = 36 MB.
+2. ~~**Batched encoder**~~ **Done (M9b).** `include/oo/encode.hpp`. Fixed-size
+   `EncodedPosition` records so a batch is a flat array with no offset table.
+
+   Measured wire sizes: **r5 1 348 B, r6 1 780 B, r7 2 284 B, r8 2 860 B**,
+   against ~11 800 B for the ~55 fp16 planes of §10.4 — a 4.1x reduction, which
+   is what moves the bottleneck off PCIe and back onto compute. Expansion to
+   planes is a CUDA kernel, M9c.
+
+   `test_encode` asserts properties rather than a golden file, since §10.11
+   says the layout is not frozen until M9 ships. The ones that would otherwise
+   fail silently: faction data really is relative to the acting seat (checked
+   through every seat, not just self-consistently); padding past `num_hexes` is
+   marked ABSENT rather than decoding as plains, since `terrain[]` is zeroed
+   there and zero *is* plains; units mid-battle stay visible on the hex and in
+   their owner's in-play totals, which a reader of `army_units` alone would
+   miss because a contested hex has `army_faction` cleared; and exactly the
+   query hex is marked, so one trunk can serve all nine decision kinds.
+
+   Writing directly into a *pinned* buffer waits for M9c, when there is a CUDA
+   allocator to pin with.
 3. **Inference thread**, double-buffered H2D -> infer -> D2H so CPU and GPU
    overlap. CUDA graphs to kill per-kernel launch overhead, which at ~50 kernels
    x ~5 us is otherwise 250 us per batch.

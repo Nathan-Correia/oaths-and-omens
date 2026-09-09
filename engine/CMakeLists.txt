@@ -60,6 +60,8 @@ add_library(oo_core STATIC
   src/agents.cpp
   src/game.cpp
   src/run.cpp
+  src/batch.cpp
+  src/encode.cpp
   src/turn_log.cpp
   src/json.cpp
 )
@@ -129,6 +131,17 @@ add_test(NAME movement_scenarios
 add_executable(test_clamp tests/test_clamp.cpp)
 target_link_libraries(test_clamp PRIVATE oo_core)
 add_test(NAME movement_clamp COMMAND test_clamp)
+
+# The batched runner must be indistinguishable from run_games (M9a).
+# The state encoder (M9b). Property-based: the layout is not frozen until M9
+# ships (PLAN.md 10.11), so a golden file would only get in the way.
+add_executable(test_encode tests/test_encode.cpp)
+target_link_libraries(test_encode PRIVATE oo_core)
+add_test(NAME encode_properties COMMAND test_encode)
+
+add_executable(test_batch tests/test_batch.cpp)
+target_link_libraries(test_batch PRIVATE oo_core)
+add_test(NAME batch_equivalence COMMAND test_batch)
 
 add_executable(test_run tests/test_run.cpp)
 target_link_libraries(test_run PRIVATE oo_core)
