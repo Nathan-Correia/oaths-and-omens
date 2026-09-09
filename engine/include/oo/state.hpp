@@ -80,8 +80,6 @@ struct GameState {
     int32_t resources[MAX_FACTIONS][NUM_RESOURCES];
     int32_t kill_xp[MAX_FACTIONS];
     int32_t victory_points[MAX_FACTIONS];
-    bool alive[MAX_FACTIONS];  // vestigial: always true, never set false. Kept only for
-                               // board_state.json compatibility (PLAN.md §9).
 
     // --- scalars -------------------------------------------------------------
     int32_t turn_number;
@@ -158,7 +156,7 @@ static_assert(std::is_trivially_copyable<GameState>::value,
               "entire point of the layout (PLAN.md §4.3)");
 
 // engine_old/state.py: new_empty. Zeroes everything and applies the non-zero
-// defaults (NO_FACTION / NO_UPGRADE / -1 settle order / alive).
+// defaults (NO_FACTION / NO_UPGRADE / -1 settle order).
 void new_empty(GameState& state, const HexGrid& grid, int num_factions);
 
 // engine_old/state.py: count_units_in_play - how many of `faction`'s units of one

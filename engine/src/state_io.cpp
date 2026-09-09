@@ -139,11 +139,6 @@ void write_state(std::ostream& out, const GameState& state) {
     }
     write_array(out, "KILL_XP", state.kill_xp, f);
     write_array(out, "VICTORY_POINTS", state.victory_points, f);
-    {
-        std::vector<int> tmp(static_cast<size_t>(f));
-        for (int i = 0; i < f; ++i) tmp[static_cast<size_t>(i)] = state.alive[i] ? 1 : 0;
-        write_array(out, "ALIVE", tmp.data(), f);
-    }
     out << "END\n";
 }
 
@@ -273,11 +268,45 @@ bool read_state(std::istream& in, GameState& state, std::string& error) {
     }
     if (!read_array(in, "KILL_XP", state.kill_xp, f, error)) return false;
     if (!read_array(in, "VICTORY_POINTS", state.victory_points, f, error)) return false;
-    tmp.assign(static_cast<size_t>(f), 0);
-    if (!read_array(in, "ALIVE", tmp.data(), f, error)) return false;
-    for (int i = 0; i < f; ++i) state.alive[i] = tmp[static_cast<size_t>(i)] != 0;
 
-    return expect_token(in, "END", error);
+    // An ALIVE row is accepted and discarded. `alive[]` was dropped from
+    // GameState at M8b (§11.2), but the golden files that are deliberately never
+    // reblessed - phase_cases and buy_scenarios - embed states that still carry
+    // it. Tolerating it on input keeps those files valid, and Python-verified,
+    // instead of rewriting a 7.9 MB corpus to delete a column nothing reads. The
+    // writer no longer emits it, so the row disappears from whatever does get
+    // reblessed.
+    // Read the next token once and branch on it, rather than peeking and seeking
+    // back: tellg/seekg round-tripping on a text-mode stream is not reliable
+    // enough to build a parser on, and getting it wrong lands mid-number.
+    std::string tok;
+    if (!(in >> tok)) {
+        error = "unexpected end of state";
+        return false;
+    }
+    if (tok == "ALIVE") {
+        int n = 0;
+        if (!(in >> n)) {
+            error = "malformed ALIVE row";
+            return false;
+        }
+        for (int i = 0; i < n; ++i) {
+            int ignored = 0;
+            if (!(in >> ignored)) {
+                error = "malformed ALIVE row";
+                return false;
+            }
+        }
+        if (!(in >> tok)) {
+            error = "unexpected end of state after ALIVE";
+            return false;
+        }
+    }
+    if (tok != "END") {
+        error = "expected 'END', got '" + tok + "'";
+        return false;
+    }
+    return true;
 }
 
 namespace {
@@ -377,7 +406,6 @@ bool compare_states(const GameState& a, const GameState& b, std::string& diff) {
     }
     if (!diff_array(a.kill_xp, b.kill_xp, f, "kill_xp", diff)) return false;
     if (!diff_array(a.victory_points, b.victory_points, f, "victory_points", diff)) return false;
-    if (!diff_array(a.alive, b.alive, f, "alive", diff)) return false;
 
     if (a.turn_number != b.turn_number) {
         diff = "turn_number";

@@ -105,7 +105,6 @@ struct PlayerStats {
     int32_t resources[NUM_RESOURCES];
     int32_t kill_xp;
     int32_t victory_points;
-    bool alive;
 };
 
 struct TurnRecord {

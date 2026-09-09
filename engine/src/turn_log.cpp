@@ -71,7 +71,6 @@ void snapshot_player_stats(const GameState& state, std::vector<PlayerStats>& out
         for (int r = 0; r < NUM_RESOURCES; ++r) p.resources[r] = state.resources[f][r];
         p.kill_xp = state.kill_xp[f];
         p.victory_points = state.victory_points[f];
-        p.alive = state.alive[f];
         out.push_back(p);
     }
 }

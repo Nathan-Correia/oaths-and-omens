@@ -295,8 +295,6 @@ void write_player_stats(std::string& o, const std::vector<PlayerStats>& stats) {
         put_int(o, stats[f].kill_xp);
         key(o, "victory_points");
         put_int(o, stats[f].victory_points);
-        key(o, "alive");
-        o += stats[f].alive ? "true" : "false";
         o += '}';
     }
     o += '}';

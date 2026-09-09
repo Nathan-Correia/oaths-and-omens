@@ -1248,7 +1248,7 @@ invariant every army mutation must preserve.
 | ~~M6d~~ | ~~Sparse battle storage~~ | **done — 68.6 KB -> 17.7 KB; all gates green (§6.9)** |
 | M7 | `run_games` thread pool | **DONE** — 6.4x on 12 threads (6 cores + SMT), deterministic per seed |
 | ~~M8~~ | ~~**Python removed**~~ | **done — zero `.py` files in the repo; no Python in `CMakeLists.txt` and none probed at configure time; 11/11 tests green and `oo_run` output unchanged (§1.2)** |
-| M8b | Rules + cleanup window (§11) | auto-clamp merges, RNG swap, `alive[]` dropped; corpus regenerated once. **Must close before M9 generates training data** |
+| ~~M8b~~ | ~~Rules + cleanup window (§11)~~ | **done — auto-clamp (§11.1), xoshiro256++ (§3.4), `alive[]` dropped (§11.2); corpus reblessed via `tools/rewrite_goldens.ps1`, 11/11 green** |
 | M9 | Neural policy (§10) | resumable `play_game`, batched encoder, TensorRT inference; a learned policy that beats `tactician` head to head |
 
 M1–M4 are where nearly all the risk lives. M5 is mechanical. M6 is the largest
@@ -1815,10 +1815,27 @@ same forward pass), decode `(hex, dir)` first and read that hex's split
 distribution. Note it would have to happen in this same window, before training
 data exists.
 
-### 11.2 Remove `alive[]`
+### 11.2 Remove `alive[]` — DONE
 
-**Decided: remove, but here rather than now.** The field is vestigial — always
-true, never set false (§9).
+**Done.** The field is gone from `GameState`, from `state_io`'s canonical
+format, from `RoundLog`'s per-faction snapshot, and from `board_state.json`.
+
+**The reader tolerates an `ALIVE` row rather than requiring its absence**, and
+that turned out to be the whole trick. Removing the field changes the state
+FORMAT, so on the face of it every state-bearing golden had to be rewritten —
+including `phase_cases` (7.9 MB) and `buy_scenarios`, which are deliberately
+never reblessed because they are Python-verified specifications rather than
+recordings. Accepting and discarding the row on input keeps those files valid
+and Python-verified forever, while the writer's silence means the column
+disappears from anything that does get reblessed.
+
+Implementation note: the tolerance branch reads the next token once and
+branches, rather than peeking and seeking back. The first attempt used
+`tellg`/`seekg`, which is not reliable enough on a text-mode stream to build a
+parser on — it landed mid-number and failed every case.
+
+`web_visualizer.html` needed no change: it reads `stats.alive !== false`
+(line 850), so a missing field already means alive.
 
 It is not as free as it looks. `state_io` serializes an `ALIVE` row into the
 canonical state format, so every state-bearing golden file carries one (970
@@ -1828,13 +1845,7 @@ corpus valid, or regenerating the corpus — to save 10 bytes of an 18 128-byte
 `GameState`. Neither is worth doing on its own; in this window the corpus is
 regenerated anyway.
 
-Three call sites to settle when it happens:
-
-- `state_io` — drop the `ALIVE` row from both writer and reader, and from
-  `compare_states`.
-- `json.cpp` — `board_state.json` emits `"alive"`. `web_visualizer.html` already
-  reads a missing value as alive (`stats.alive !== false`, line 850), so it can
-  be dropped from the JSON too; that is a one-line viewer-format change, and the
-  replay hashes are being regenerated regardless.
-- `log.hpp` / `turn_log.cpp` — `RoundLog`'s per-faction snapshot carries it.
+It is not as free as it looks. `state_io` serialized an `ALIVE` row into the
+canonical state format, so every state-bearing golden file carried one — which
+is why this waited for a window where the corpus was being regenerated anyway.
 

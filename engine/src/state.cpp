@@ -26,7 +26,6 @@ void new_empty(GameState& state, const HexGrid& grid, int num_factions) {
 
     for (int f = 0; f < MAX_FACTIONS; ++f) {
         state.capital_settle_order[f] = -1;
-        state.alive[f] = true;
     }
 
     state.num_factions = num_factions;
