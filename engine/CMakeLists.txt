@@ -80,22 +80,11 @@ target_link_libraries(oo_tournament PRIVATE oo_core)
 # --- tests ------------------------------------------------------------------
 enable_testing()
 
+# Property tests, no golden file - the CPython-compatibility traces retired with
+# the RNG swap (PLAN.md 3.4). test_rng_stress went with them.
 add_executable(test_rng tests/test_rng.cpp)
 target_link_libraries(test_rng PRIVATE oo_core)
-
-# The golden traces under tests/data/ were generated from the Python reference
-# before it was deleted at M8. They are checked in and are now the only record
-# of it. Nothing can regenerate them from Python any more; PLAN.md §3.4
-# describes the --rewrite path that reblesses the seed-derived ones from the
-# C++ engine when the RNG is swapped at M8b.
-add_test(NAME rng_parity
-         COMMAND test_rng ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/rng_golden.txt)
-
-add_executable(test_rng_stress tests/test_rng_stress.cpp)
-target_link_libraries(test_rng_stress PRIVATE oo_core)
-
-add_test(NAME rng_stress
-         COMMAND test_rng_stress ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/rng_stress.txt)
+add_test(NAME rng_properties COMMAND test_rng)
 
 add_executable(test_grid tests/test_grid.cpp)
 target_link_libraries(test_grid PRIVATE oo_core)

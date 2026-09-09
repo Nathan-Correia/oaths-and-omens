@@ -1,32 +1,41 @@
-// Bit-compatible reimplementation of CPython's `random.Random`.
+// xoshiro256++ with SplitMix64 seeding.
 //
-// WHY THIS EXISTS (see engine/PLAN.md §3.1): the Python engine threads one
-// random.Random through a whole turn and consumes it in a fixed order that
-// engine_old/battle.py's docstring calls out as load-bearing. Reproducing that
-// stream exactly is what lets a C++ game and a Python game, given the same seed,
-// produce byte-identical states after every phase - which turns "is the port
-// correct?" from an argument into a test.
+// This replaced a bit-compatible reimplementation of CPython's `random.Random`
+// at M8b (PLAN.md §3.4). That reimplementation existed for one reason: to make a
+// C++ game and a Python game, from the same seed, produce byte-identical states
+// after every phase. With the Python engine deleted at M8 there is nothing left
+// to be identical to, and the cost of keeping it was real:
 //
-// Every method below mirrors a specific piece of CPython, and the reference is
-// named in a comment so divergences can be checked against the source:
-//   - Modules/_randommodule.c  for the Mersenne Twister core, seeding, random(),
-//     and getrandbits()
-//   - Lib/random.py            for _randbelow, randrange, randint, choice,
-//     sample, shuffle and choices
+//   - 2.5 KB of state (624 words plus an index) per generator. Every agent owns
+//     one, tactician copies a whole Rng per rollout candidate, and §10 wants
+//     thousands of games in flight each holding one. xoshiro256++ is 32 bytes.
+//   - ~4.5 % of runtime (measured: Rng::seed + genrand_uint32 + randbelow were
+//     0.85 s of 18.5 s engine / 0.84 s of 20.0 s tactician).
+//   - The fiddliest code in the engine. `_randbelow_with_getrandbits`, sample's
+//     setsize heuristic, `genrand_res53`, and bisect's `hi = n - 1` were all
+//     bug-for-bug reproductions of CPython, and every one of them was a trap for
+//     anyone reading this file expecting ordinary code.
 //
-// Do NOT "improve" any of this. Every apparent oddity (bisect's `hi = n - 1`,
-// sample's setsize heuristic, getrandbits' word order) is load-bearing for parity.
-// It is also fast enough to keep permanently: a game consumes a few hundred draws,
-// so there is no reason to swap in PCG64 later and invalidate the golden traces.
+// WHAT IS STILL LOAD-BEARING. Determinism did not stop mattering, it only
+// stopped being cross-language. A game must still be a pure function of its seed
+// (PLAN.md §7's threading contract depends on it), and reproducibility should
+// survive a change of compiler or platform. So:
+//
+//   Do NOT use <random>. std::mt19937 seeds differently per implementation, and
+//   std::uniform_int_distribution and std::shuffle are explicitly
+//   implementation-defined - MSVC and libstdc++ produce different sequences from
+//   the same seed. Everything below is written out for that reason, not from
+//   not-invented-here.
+//
+// Algorithms: xoshiro256++ 1.0 and SplitMix64, both by Blackman and Vigna, both
+// public domain. xoshiro256++ has a 2^256-1 period, passes BigCrush, and is a
+// few instructions per draw.
 
 #pragma once
 
-#include <algorithm>
-#include <bit>
 #include <cassert>
-#include <cmath>
 #include <cstdint>
-#include <numeric>
+#include <cstring>
 #include <vector>
 
 namespace oo {
@@ -36,90 +45,66 @@ public:
     Rng() { seed(0); }
     explicit Rng(int64_t s) { seed(s); }
 
-    // random.Random.seed(int) -> _randommodule.c:random_seed.
-    // CPython takes abs(n), splits it into 32-bit little-endian words, and feeds
-    // those to init_by_array. int64 covers every seed this codebase produces
-    // (the largest is `seed * 1_000_003 + f`, well under 2^63).
+    // SplitMix64 expands the 64-bit seed into 256 bits of state. Seeding a
+    // xoshiro generator directly from a small integer is the classic way to get
+    // correlated streams out of nearby seeds; SplitMix64 is the author's
+    // prescribed fix. It matters here because seeds ARE nearby - `oo_run` uses
+    // seed+0, seed+1, seed+2..., and agents are seeded seed*1000003 + faction.
     void seed(int64_t s) {
-        // abs() written to stay defined at INT64_MIN.
-        uint64_t n = (s < 0) ? (~static_cast<uint64_t>(s) + 1u) : static_cast<uint64_t>(s);
-        uint32_t key[2];
-        int key_length;
-        if (n == 0) {
-            key[0] = 0;
-            key_length = 1;  // bits == 0 -> keyused = 1
-        } else {
-            key[0] = static_cast<uint32_t>(n & 0xffffffffu);
-            key[1] = static_cast<uint32_t>(n >> 32);
-            key_length = (key[1] != 0) ? 2 : 1;  // == (bit_length(n) - 1) / 32 + 1
+        uint64_t z = static_cast<uint64_t>(s);
+        for (int i = 0; i < 4; ++i) {
+            z += 0x9e3779b97f4a7c15ull;
+            uint64_t x = z;
+            x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ull;
+            x = (x ^ (x >> 27)) * 0x94d049bb133111ebull;
+            s_[i] = x ^ (x >> 31);
         }
-        init_by_array(key, key_length);
     }
 
-    // _randommodule.c:genrand_uint32 - the standard MT19937 next-word step.
-    uint32_t genrand_uint32() {
-        if (index_ >= kN) {
-            static constexpr uint32_t mag01[2] = {0x0u, kMatrixA};
-            uint32_t y;
-            int kk = 0;
-            for (; kk < kN - kM; ++kk) {
-                y = (mt_[kk] & kUpperMask) | (mt_[kk + 1] & kLowerMask);
-                mt_[kk] = mt_[kk + kM] ^ (y >> 1) ^ mag01[y & 0x1u];
-            }
-            for (; kk < kN - 1; ++kk) {
-                y = (mt_[kk] & kUpperMask) | (mt_[kk + 1] & kLowerMask);
-                mt_[kk] = mt_[kk + (kM - kN)] ^ (y >> 1) ^ mag01[y & 0x1u];
-            }
-            y = (mt_[kN - 1] & kUpperMask) | (mt_[0] & kLowerMask);
-            mt_[kN - 1] = mt_[kM - 1] ^ (y >> 1) ^ mag01[y & 0x1u];
-            index_ = 0;
-        }
-        uint32_t y = mt_[index_++];
-        y ^= (y >> 11);
-        y ^= (y << 7) & 0x9d2c5680u;
-        y ^= (y << 15) & 0xefc60000u;
-        y ^= (y >> 18);
-        return y;
-    }
-
-    // _randommodule.c:random_random - genrand_res53, two draws per double.
-    // Written in CPython's exact form; the reciprocal is a power of two so the
-    // multiply is exact, but keep it verbatim rather than dividing.
-    double random() {
-        uint32_t a = genrand_uint32() >> 5;
-        uint32_t b = genrand_uint32() >> 6;
-        return (a * 67108864.0 + b) * (1.0 / 9007199254740992.0);
-    }
-
-    // _random_Random_getrandbits_impl. Words are filled least-significant first,
-    // so the FIRST draw becomes the LOW word and only the last word is truncated.
-    // Capped at 64 bits, which is all this codebase ever asks for.
-    uint64_t getrandbits(int k) {
-        assert(k >= 0 && k <= 64);
-        if (k == 0) return 0;
-        if (k <= 32) return genrand_uint32() >> (32 - k);
-        const int words = (k - 1) / 32 + 1;
-        uint64_t result = 0;
-        int remaining = k;
-        for (int i = 0; i < words; ++i, remaining -= 32) {
-            uint32_t r = genrand_uint32();
-            if (remaining < 32) r >>= (32 - remaining);  // drop least significant bits
-            result |= static_cast<uint64_t>(r) << (32 * i);
-        }
+    // xoshiro256++ next().
+    uint64_t next() {
+        const uint64_t result = rotl(s_[0] + s_[3], 23) + s_[0];
+        const uint64_t t = s_[1] << 17;
+        s_[2] ^= s_[0];
+        s_[3] ^= s_[1];
+        s_[1] ^= s_[2];
+        s_[0] ^= s_[3];
+        s_[2] ^= t;
+        s_[3] = rotl(s_[3], 45);
         return result;
     }
 
-    // random.py:_randbelow_with_getrandbits. Note `bit_length(n)`, not
-    // `bit_length(n - 1)` - CPython uses the former so that n == 1 works.
-    uint64_t randbelow(uint64_t n) {
-        if (n == 0) return 0;
-        const int k = std::bit_width(n);
-        uint64_t r = getrandbits(k);
-        while (r >= n) r = getrandbits(k);
-        return r;
+    // Uniform in [0, 1). 53 significant bits, which is every double the interval
+    // can represent at full precision; the multiply is exact.
+    double random() { return static_cast<double>(next() >> 11) * (1.0 / 9007199254740992.0); }
+
+    // Low k bits. Kept because it is a natural primitive, though nothing in the
+    // engine needs it any more now that randbelow does not go through it.
+    uint64_t getrandbits(int k) {
+        assert(k >= 0 && k <= 64);
+        if (k == 0) return 0;
+        if (k == 64) return next();
+        return next() >> (64 - k);
     }
 
-    // random.py:randrange(stop) and randrange(start, stop).
+    // Uniform in [0, n), unbiased, and portable: no 128-bit multiply, so it
+    // behaves identically on every compiler.
+    //
+    // `2^64 mod n` is the size of the short tail at the bottom of the range that
+    // would otherwise be over-represented by a plain modulo. Rejecting draws that
+    // land in it leaves an exact multiple of n, so the modulo is uniform. The
+    // rejection probability is under n/2^64 - unmeasurable for any n here.
+    uint64_t randbelow(uint64_t n) {
+        assert(n > 0);
+        if (n <= 1) return 0;
+        const uint64_t reject_below = (~n + 1u) % n;  // 2^64 mod n
+        uint64_t r;
+        do {
+            r = next();
+        } while (r < reject_below);
+        return r % n;
+    }
+
     int64_t randrange(int64_t stop) {
         assert(stop > 0);
         return static_cast<int64_t>(randbelow(static_cast<uint64_t>(stop)));
@@ -129,81 +114,77 @@ public:
         return start + static_cast<int64_t>(randbelow(static_cast<uint64_t>(stop - start)));
     }
 
-    // random.py:randint(a, b) == randrange(a, b + 1). Inclusive both ends.
+    // Inclusive of both ends, like Python's randint.
     int64_t randint(int64_t a, int64_t b) { return randrange(a, b + 1); }
 
-    // random.py:choice - seq[_randbelow(len(seq))].
     template <class T>
     const T& choice(const std::vector<T>& seq) {
         assert(!seq.empty());
         return seq[static_cast<size_t>(randbelow(seq.size()))];
     }
-    // Index-only form, for callers holding something other than a vector.
-    size_t choice_index(size_t n) {
+
+    int choice_index(int n) {
         assert(n > 0);
-        return static_cast<size_t>(randbelow(n));
+        return static_cast<int>(randbelow(static_cast<uint64_t>(n)));
     }
 
-    // random.py:shuffle - Fisher-Yates walking downward, `j = randbelow(i + 1)`.
+    // Fisher-Yates, descending. Written out rather than std::shuffle because
+    // std::shuffle's draw pattern is implementation-defined.
     template <class T>
-    void shuffle(T* first, size_t n) {
+    void shuffle(T* x, size_t n) {
         for (int64_t i = static_cast<int64_t>(n) - 1; i >= 1; --i) {
             const int64_t j = static_cast<int64_t>(randbelow(static_cast<uint64_t>(i + 1)));
-            std::swap(first[i], first[j]);
+            T tmp = x[i];
+            x[i] = x[j];
+            x[j] = tmp;
         }
     }
+
     template <class T>
     void shuffle(std::vector<T>& x) {
         shuffle(x.data(), x.size());
     }
 
-    // random.py:sample, for a population of `n` items, returning the chosen
-    // INDICES (equivalently, the result of sample(range(n), k)).
+    // k distinct indices from [0, n), in selection order.
     //
-    // Both of CPython's branches are implemented because both are genuinely
-    // reachable here: placement.py's sample(range(num_factions), num_factions)
-    // takes the pool branch, while random_agent's sample(legal, k<=3) over a
-    // few hundred legal actions takes the selected-set branch. They consume
-    // different numbers of draws, so picking the wrong one silently desyncs
-    // everything downstream.
+    // Two strategies, chosen by density rather than by CPython's old `setsize`
+    // heuristic: a partial Fisher-Yates over a scratch pool is O(n) in time and
+    // memory, which is the wrong trade when k is tiny and n is large (the random
+    // agent samples 3 of several hundred legal actions). Above that, retry-until-
+    // unseen would spin.
     std::vector<int> sample_indices(int n, int k) {
         assert(k >= 0 && k <= n);
         std::vector<int> result(static_cast<size_t>(k));
 
-        int setsize = 21;  // size of a small set minus size of an empty list
-        if (k > 5) {
-            setsize += static_cast<int>(
-                std::pow(4.0, std::ceil(std::log(static_cast<double>(k) * 3.0) / std::log(4.0))));
-        }
-
-        if (n <= setsize) {
+        if (static_cast<int64_t>(k) * 3 >= n) {
             std::vector<int> pool(static_cast<size_t>(n));
-            std::iota(pool.begin(), pool.end(), 0);
+            for (int i = 0; i < n; ++i) pool[static_cast<size_t>(i)] = i;
             for (int i = 0; i < k; ++i) {
                 const int j = static_cast<int>(randbelow(static_cast<uint64_t>(n - i)));
                 result[static_cast<size_t>(i)] = pool[static_cast<size_t>(j)];
                 pool[static_cast<size_t>(j)] = pool[static_cast<size_t>(n - i - 1)];
             }
         } else {
-            // CPython uses a set purely for membership - iteration order is never
-            // observed, so a flat bitmap reproduces it exactly.
-            std::vector<char> selected(static_cast<size_t>(n), 0);
+            // Sparse: draw and retry. With k*3 < n the expected retries per pick
+            // are below 0.5, so this terminates quickly.
+            std::vector<char> taken(static_cast<size_t>(n), 0);
             for (int i = 0; i < k; ++i) {
                 int j = static_cast<int>(randbelow(static_cast<uint64_t>(n)));
-                while (selected[static_cast<size_t>(j)]) {
+                while (taken[static_cast<size_t>(j)]) {
                     j = static_cast<int>(randbelow(static_cast<uint64_t>(n)));
                 }
-                selected[static_cast<size_t>(j)] = 1;
+                taken[static_cast<size_t>(j)] = 1;
                 result[static_cast<size_t>(i)] = j;
             }
         }
         return result;
     }
 
-    // random.py:choices(population, weights=..., k=1), returning the chosen index.
-    // One random() draw, then bisect_right over the accumulated weights - note
-    // CPython passes `hi = n - 1`, not `n`, which genuinely changes the result
-    // for a draw landing in the last bucket.
+    // One index, chosen with probability proportional to its weight.
+    //
+    // Straight binary search now, without CPython's `hi = n - 1` quirk. Rounding
+    // in the accumulation can leave `x` fractionally above the final cumulative
+    // total, so the result is clamped rather than allowed off the end.
     int choices_index(const std::vector<double>& weights) {
         assert(!weights.empty());
         std::vector<double> cum(weights.size());
@@ -217,80 +198,26 @@ public:
         const double x = random() * total;
 
         int lo = 0;
-        int hi = static_cast<int>(cum.size()) - 1;  // CPython's bisect hi
+        int hi = static_cast<int>(cum.size());
         while (lo < hi) {
-            const int mid = (lo + hi) / 2;  // Python's (lo + hi) // 2
+            const int mid = lo + (hi - lo) / 2;
             if (x < cum[static_cast<size_t>(mid)]) {
                 hi = mid;
             } else {
                 lo = mid + 1;
             }
         }
-        return lo;
-    }
-
-    // Raw MT state, in CPython's random.getstate()/setstate() layout: 624 words
-    // followed by the index. Used by the transitional Python bindings to borrow a
-    // live random.Random's state, run a phase natively, and hand the advanced
-    // state back - which keeps the stream exactly shared with Python instead of
-    // paying a Python call per die roll.
-    void get_state(uint32_t out[625]) const {
-        for (int i = 0; i < kN; ++i) out[i] = mt_[i];
-        out[kN] = static_cast<uint32_t>(index_);
-    }
-    void set_state(const uint32_t in[625]) {
-        for (int i = 0; i < kN; ++i) mt_[i] = in[i];
-        index_ = static_cast<int>(in[kN]);
+        const int last = static_cast<int>(cum.size()) - 1;
+        return lo > last ? last : lo;
     }
 
 private:
-    static constexpr int kN = 624;
-    static constexpr int kM = 397;
-    static constexpr uint32_t kMatrixA = 0x9908b0dfu;
-    static constexpr uint32_t kUpperMask = 0x80000000u;
-    static constexpr uint32_t kLowerMask = 0x7fffffffu;
+    static uint64_t rotl(uint64_t x, int k) { return (x << k) | (x >> (64 - k)); }
 
-    // _randommodule.c:init_genrand
-    void init_genrand(uint32_t s) {
-        mt_[0] = s;
-        for (int i = 1; i < kN; ++i) {
-            mt_[i] = (1812433253u * (mt_[i - 1] ^ (mt_[i - 1] >> 30)) + static_cast<uint32_t>(i));
-        }
-        index_ = kN;
-    }
-
-    // _randommodule.c:init_by_array
-    void init_by_array(const uint32_t* init_key, int key_length) {
-        init_genrand(19650218u);
-        int i = 1;
-        int j = 0;
-        int k = std::max(kN, key_length);
-        for (; k; --k) {
-            mt_[i] = (mt_[i] ^ ((mt_[i - 1] ^ (mt_[i - 1] >> 30)) * 1664525u)) +
-                     init_key[j] + static_cast<uint32_t>(j);
-            ++i;
-            ++j;
-            if (i >= kN) {
-                mt_[0] = mt_[kN - 1];
-                i = 1;
-            }
-            if (j >= key_length) j = 0;
-        }
-        for (k = kN - 1; k; --k) {
-            mt_[i] = (mt_[i] ^ ((mt_[i - 1] ^ (mt_[i - 1] >> 30)) * 1566083941u)) -
-                     static_cast<uint32_t>(i);
-            ++i;
-            if (i >= kN) {
-                mt_[0] = mt_[kN - 1];
-                i = 1;
-            }
-        }
-        mt_[0] = 0x80000000u;  // MSB is 1; assuring non-zero initial array
-        index_ = kN;
-    }
-
-    uint32_t mt_[kN] = {};
-    int index_ = kN;
+    uint64_t s_[4] = {};
 };
+
+static_assert(sizeof(Rng) == 32, "Rng is copied per rollout candidate and lives per game; "
+                                 "keep it small (PLAN.md §3.4)");
 
 }  // namespace oo

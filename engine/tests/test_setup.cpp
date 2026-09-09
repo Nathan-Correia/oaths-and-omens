@@ -324,7 +324,11 @@ int run_setup(std::istream& in, std::ostream* rw) {
         // what Python produced. This is what makes each case a full-pipeline test
         // rather than just a placement replay: create_initial_state (terrain
         // generation plus starting gold/kill-XP) has to compose correctly first.
-        {
+        // Skipped when rewriting: the recorded before-state is by definition the
+        // OLD board, so comparing the freshly generated one against it after a
+        // deliberate terrain-affecting change reports a failure per case for a
+        // difference that is the entire point of the rebless.
+        if (!rw) {
             auto generated = std::make_unique<oo::GameState>();
             oo::create_initial_state(*generated, radius, num_factions, game_seed);
             std::string diff;

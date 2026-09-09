@@ -28,13 +28,13 @@
 
 namespace oo_test {
 
-// Pulls `--rewrite <path>` out of argv. Returns true if present, and shrinks
-// argc so the caller's positional-argument handling is unaffected.
-inline bool take_rewrite_flag(int& argc, char** argv, std::string& out_path) {
+// Pulls `<flag> <path>` out of argv. Returns true if present, and shrinks argc
+// so the caller's positional-argument handling is unaffected.
+inline bool take_flag(int& argc, char** argv, const char* flag, std::string& out_path) {
     for (int i = 1; i < argc; ++i) {
-        if (std::strcmp(argv[i], "--rewrite") != 0) continue;
+        if (std::strcmp(argv[i], flag) != 0) continue;
         if (i + 1 >= argc) {
-            std::cerr << "--rewrite needs an output path\n";
+            std::cerr << flag << " needs an output path\n";
             std::exit(2);
         }
         out_path = argv[i + 1];
@@ -43,6 +43,10 @@ inline bool take_rewrite_flag(int& argc, char** argv, std::string& out_path) {
         return true;
     }
     return false;
+}
+
+inline bool take_rewrite_flag(int& argc, char** argv, std::string& out_path) {
+    return take_flag(argc, argv, "--rewrite", out_path);
 }
 
 // An output file that is only opened when rewriting, so every test can write

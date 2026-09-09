@@ -10,7 +10,15 @@
 #
 # -Apply   overwrites the golden files in place.
 #
-# The four rewriting tests keep their recorded inputs and recompute only the
+# turn_traces uses --record, not --rewrite, and that difference matters. Rewriting
+# keeps the recorded decision traces, which only works while the engine still ASKS
+# for the same decisions; a change to the dice or the movement rules alters battle
+# round counts and traces get DROPPED. The RNG swap alone eroded the corpus from
+# 176 cases to 80. --record regenerates the whole thing from seeds instead, so the
+# deepest test in the suite survives deliberate change rather than decaying with
+# every one.
+#
+# The other rewriting tests keep their recorded inputs and recompute only the
 # expected outputs. test_setup is different: its terrain half rewrites, but its
 # setup half RE-RECORDS from the seed with native agents, because a changed RNG
 # produces a different board and the recorded placements point at hexes that no
@@ -49,7 +57,7 @@ $targets = @(
     @{ exe = "test_agents";   file = "agent_games.txt" },
     @{ exe = "test_replay";   file = "replay_hashes.txt" },
     @{ exe = "test_movement"; file = "movement_scenarios.txt" },
-    @{ exe = "test_turn";     file = "turn_traces.txt" },
+    @{ exe = "test_turn";     file = "turn_traces.txt"; flag = "--record" },
     @{ exe = "test_setup";    file = "setup_cases.txt" },
     @{ exe = "test_buy";      file = "legal_cases.txt"; extra = "tests\data\buy_scenarios.txt" }
 )
@@ -63,29 +71,37 @@ foreach ($t in $targets) {
 
     # test_buy takes two positional files; the second is a specification, not a
     # recording, so it is passed through but never reblessed.
+    $flag = if ($t.ContainsKey("flag")) { $t.flag } else { "--rewrite" }
     if ($t.ContainsKey("extra")) {
-        & $exe $golden (Join-Path $repo ("engine\\" + $t.extra)) --rewrite $tmp | Out-Null
+        & $exe $golden (Join-Path $repo ("engine\\" + $t.extra)) $flag $tmp | Out-Null
     } else {
-        & $exe $golden --rewrite $tmp | Out-Null
+        & $exe $golden $flag $tmp | Out-Null
     }
     if ($LASTEXITCODE -ne 0) { Write-Error "$($t.exe) --rewrite failed"; exit 1 }
 
-    Copy-Item $tmp $golden -Force
-    # git, not fc: the goldens are stored LF and checked out CRLF under
-    # core.autocrlf, so a raw byte compare would flag every line. git applies the
-    # same normalisation it would on commit, which is the comparison that matters.
-    git -C $repo diff --quiet -- $golden
-    $differs = ($LASTEXITCODE -ne 0)
+    # Compare the CONTENT of the two files directly, normalising line endings.
+    #
+    # An earlier version compared with `git diff` and restored with
+    # `git checkout`. Both were wrong the moment the working tree was dirty: git
+    # diffs against HEAD, not against the file as it was before this run, so a
+    # -Check during an uncommitted rebless reported everything as changed and
+    # then REVERTED the rebless. This depends on nothing but the two files.
+    $before = [System.IO.File]::ReadAllText($golden) -replace "`r`n", "`n"
+    $after  = [System.IO.File]::ReadAllText($tmp)    -replace "`r`n", "`n"
+    $differs = ($before -ne $after)
 
     if ($differs) {
-        $stat = (git -C $repo diff --numstat -- $golden) -split "\s+"
-        Write-Host ("  {0,-26} CHANGED  (+{1} -{2})" -f $t.file, $stat[0], $stat[1]) -ForegroundColor Yellow
+        $oldLines = ($before -split "`n").Count
+        $newLines = ($after  -split "`n").Count
+        Write-Host ("  {0,-26} CHANGED  ({1} -> {2} lines)" -f $t.file, $oldLines, $newLines) -ForegroundColor Yellow
         $changed++
     } else {
         Write-Host ("  {0,-26} unchanged" -f $t.file) -ForegroundColor DarkGray
     }
 
-    if ($Check) { git -C $repo checkout -- $golden }
+    if ($Apply -and $differs) {
+        Copy-Item $tmp $golden -Force
+    }
 }
 
 Write-Host ""

@@ -457,11 +457,19 @@ The RNG-draw counter matters as much as the state: two engines can agree on stat
 while having consumed a different number of rolls, and that divergence surfaces
 several turns later somewhere unrelated.
 
-### 3.4 Retiring the parity corpus (decided, do at M8b — §11)
+### 3.4 Retiring the parity corpus — DONE (M8b)
 
 Once Python is gone the CPython-compatible RNG (§3.1) stops earning its keep,
-and it is replaced with a native generator — recommended: **xoshiro256++ seeded
-through SplitMix64**.
+and it is replaced with a native generator: **xoshiro256++ seeded through
+SplitMix64**. Done — `include/oo/rng.hpp`.
+
+**Measured afterwards:** single-threaded, greedy 900 -> 948 games/s (+5.4 %) and
+tactician 52.0 -> 55.1 (+6.0 %), matching the ~4.5 % predicted. `sizeof(Rng)` is
+32 bytes, held by a `static_assert`. SplitMix64 seeding is not optional
+decoration: `oo_run` runs game *g* with `seed + g` and agents are seeded
+`seed * 1000003 + faction`, so adjacent seeds are the normal case, and seeding a
+xoshiro state directly from a small integer would correlate those streams.
+`tests/test_rng.cpp` asserts exactly that property.
 
 **What this buys.** Speed is the smallest part: `Rng::seed` + `genrand_uint32` +
 `randbelow` measure 0.85 s of 18.5 s (engine profile) and 0.84 s of 20.0 s
