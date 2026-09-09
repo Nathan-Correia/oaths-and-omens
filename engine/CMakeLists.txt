@@ -72,9 +72,44 @@ target_include_directories(oo_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 find_package(Threads REQUIRED)
 target_link_libraries(oo_core PUBLIC Threads::Threads)
 
+# --- neural policy (optional; PLAN.md 10) -----------------------------------
+# OFF by default and strictly additive: the engine, every existing test and both
+# apps build and pass with no LibTorch present. That is 1.2's rule applied to a
+# new dependency - the core never requires anything external, and a heavyweight
+# GPU library is exactly the kind of thing that quietly becomes mandatory.
+#
+#   cmake -S engine -B engine/build -DOO_LIBTORCH_DIR=C:/libtorch
+set(OO_LIBTORCH_DIR "" CACHE PATH "Path to an extracted LibTorch (enables the neural policy)")
+
+if(OO_LIBTORCH_DIR)
+  find_package(Torch REQUIRED PATHS "${OO_LIBTORCH_DIR}" NO_DEFAULT_PATH)
+  message(STATUS "Neural policy ON, LibTorch at ${OO_LIBTORCH_DIR}")
+
+  # A separate library so oo_core stays free of torch headers entirely.
+  # No CXX_STANDARD override anywhere here: LibTorch 2.14's headers REQUIRE
+  # C++20 (designated initializers, std::strong_ordering), so forcing the usual
+  # 17 breaks the build inside c10 rather than in our code.
+  add_library(oo_neural STATIC src/neural.cpp)
+  target_link_libraries(oo_neural PUBLIC oo_core "${TORCH_LIBRARIES}")
+  # /GL on a translation unit this template-heavy costs minutes and buys
+  # nothing measurable, since the time is inside LibTorch's own prebuilt code.
+  target_compile_options(oo_neural PRIVATE $<$<CONFIG:Release>:/GL->)
+
+  # LibTorch ships its DLLs beside the .libs and does not install them; without
+  # this every neural target fails at startup with a missing-DLL box rather than
+  # a linker error, which is a confusing way to find out.
+  file(GLOB OO_TORCH_DLLS "${OO_LIBTORCH_DIR}/lib/*.dll")
+  add_custom_target(oo_copy_torch_dlls ALL
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${OO_TORCH_DLLS} ${CMAKE_BINARY_DIR}
+    COMMAND_EXPAND_LISTS)
+else()
+  add_library(oo_neural STATIC src/neural_stub.cpp)
+  target_link_libraries(oo_neural PUBLIC oo_core)
+endif()
+
 # --- apps (the eventual replacements for run.py / tournament.py) ------------
 add_executable(oo_run apps/oo_run.cpp)
-target_link_libraries(oo_run PRIVATE oo_core)
+target_link_libraries(oo_run PRIVATE oo_core oo_neural)
 
 add_executable(oo_tournament apps/oo_tournament.cpp)
 target_link_libraries(oo_tournament PRIVATE oo_core)
@@ -135,6 +170,12 @@ add_test(NAME movement_clamp COMMAND test_clamp)
 # The batched runner must be indistinguishable from run_games (M9a).
 # The state encoder (M9b). Property-based: the layout is not frozen until M9
 # ships (PLAN.md 10.11), so a golden file would only get in the way.
+# Only meaningful with LibTorch, but built either way: the stub build makes it
+# print "skipping" and pass, so the suite has the same shape in both.
+add_executable(test_neural tests/test_neural.cpp)
+target_link_libraries(test_neural PRIVATE oo_core oo_neural)
+add_test(NAME neural_smoke COMMAND test_neural)
+
 add_executable(test_encode tests/test_encode.cpp)
 target_link_libraries(test_encode PRIVATE oo_core)
 add_test(NAME encode_properties COMMAND test_encode)

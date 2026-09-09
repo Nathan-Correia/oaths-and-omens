@@ -86,8 +86,12 @@ struct DecisionAnswer {
 
 // Answers a whole batch at once. Implementations must fill out[i] for every i.
 //
-// May be called from any thread, and is called with requests from DIFFERENT
-// games, so an implementation must hold no per-game state of its own.
+// CALLED CONCURRENTLY. The gate deliberately evaluates outside its lock so
+// games can keep arriving while a batch runs, so several threads may be inside
+// evaluate() at once, each with requests from different games. An
+// implementation must therefore be reentrant: no shared mutable scratch, no
+// per-game state of its own. A shared staging buffer here is a data race that
+// surfaces as a stack-buffer-overrun crash, not as a wrong answer.
 class BatchedPolicy {
 public:
     virtual ~BatchedPolicy() = default;

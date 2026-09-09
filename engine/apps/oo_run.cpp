@@ -19,6 +19,8 @@
 #include "oo/json.hpp"
 #include "oo/log.hpp"
 #include "oo/placement.hpp"
+#include "oo/batch.hpp"
+#include "oo/neural.hpp"
 #include "oo/run.hpp"
 #include "oo/setup.hpp"
 #include "oo/turn.hpp"
@@ -50,6 +52,13 @@ void usage() {
                  "  --max-turns N     safety cap, not a rule (default 100)\n"
                  "  --rotate          rotate the assignment by game, to cancel seat bias\n"
                  "  --threads N       worker threads (default: all cores; 1 = no pool)\n"
+                 "  --neural          play with a neural policy (random weights)\n"
+                 "  --in-flight N     neural: games in flight (default 256)\n"
+                 "  --batch N         neural: target batch size (default 256)\n"
+                 "  --net-d N         neural: model width (default 128)\n"
+                 "  --net-blocks N    neural: transformer blocks (default 4)\n"
+                 "  --net-cpu         neural: CPU instead of CUDA\n"
+                 "  --net-fp32        neural: fp32 instead of fp16\n"
                  "  --replay K        with --games>1, also write game K's replay files\n"
                  "  --out-dir DIR     where to write the replay files (default .)\n"
                  "  --list-agents     print the available agent kinds and exit\n");
@@ -129,6 +138,15 @@ int main(int argc, char** argv) {
     long long base_seed = -1;
     int replay_game = -1;
     int num_threads = 0;  // 0 = one per hardware thread
+    // Neural policy (PLAN.md 10). --neural swaps every seat's decisions for one
+    // network, so the per-seat --agents assignment stops mattering.
+    bool neural = false;
+    int in_flight = 256;
+    int neural_batch = 256;
+    int neural_d = 128;
+    int neural_blocks = 4;
+    bool neural_cpu = false;
+    bool neural_fp32 = false;
 
     bool rotate = false;
     std::string out_dir = ".";
@@ -144,6 +162,13 @@ int main(int argc, char** argv) {
         else if (a == "--seed") base_seed = std::atoll(next().c_str());
         else if (a == "--replay") replay_game = std::atoi(next().c_str());
         else if (a == "--threads") num_threads = std::atoi(next().c_str());
+        else if (a == "--neural") neural = true;
+        else if (a == "--in-flight") in_flight = std::atoi(next().c_str());
+        else if (a == "--batch") neural_batch = std::atoi(next().c_str());
+        else if (a == "--net-d") neural_d = std::atoi(next().c_str());
+        else if (a == "--net-blocks") neural_blocks = std::atoi(next().c_str());
+        else if (a == "--net-cpu") neural_cpu = true;
+        else if (a == "--net-fp32") neural_fp32 = true;
         else if (a == "--rotate") rotate = true;
         else if (a == "--out-dir") out_dir = next();
         else if (a == "--agent") agent_names = {next()};
@@ -244,8 +269,35 @@ int main(int argc, char** argv) {
     cfg.max_turns = max_turns;
 
     std::vector<oo::GameResult> results(static_cast<size_t>(num_games));
+    oo::BatchRunStats batch_stats;
+    std::unique_ptr<oo::BatchedPolicy> policy;
+    if (neural) {
+        oo::NeuralConfig ncfg;
+        ncfg.radius = radius;
+        ncfg.num_factions = num_factions;
+        ncfg.d_model = neural_d;
+        ncfg.n_blocks = neural_blocks;
+        ncfg.cuda = !neural_cpu;
+        ncfg.fp16 = !neural_fp32 && !neural_cpu;
+        ncfg.seed = base_seed;
+        std::string err;
+        policy = oo::make_neural_policy(ncfg, err);
+        if (!policy) {
+            std::fprintf(stderr, "cannot build the neural policy: %s\n", err.c_str());
+            return 2;
+        }
+        std::printf("neural: %s\n", oo::neural_describe(*policy).c_str());
+        std::printf("        %d games in flight, target batch %d\n\n",
+                    in_flight, neural_batch);
+    }
+
     const auto t0 = std::chrono::steady_clock::now();
-    oo::run_games(cfg, specs.data(), results.data(), num_games, num_threads);
+    if (neural) {
+        oo::run_games_batched(cfg, specs.data(), results.data(), num_games, in_flight,
+                              neural_batch, *policy, &batch_stats);
+    } else {
+        oo::run_games(cfg, specs.data(), results.data(), num_games, num_threads);
+    }
     const double elapsed =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 
@@ -292,6 +344,12 @@ int main(int argc, char** argv) {
         }
     }
 
+    if (neural && batch_stats.batches) {
+        std::printf("\n%lld evaluations in %lld batches (mean %.1f, max %d), %.0f evals/s\n",
+                    batch_stats.requests, batch_stats.batches, batch_stats.mean_batch,
+                    batch_stats.max_batch,
+                    double(batch_stats.requests) / (elapsed > 0 ? elapsed : 1e-9));
+    }
     std::printf("\n%d game%s in %.2fs (%.1f games/s), avg %.1f turns", num_games,
                 num_games == 1 ? "" : "s", elapsed, num_games / (elapsed > 0 ? elapsed : 1e-9),
                 double(total_turns) / num_games);
