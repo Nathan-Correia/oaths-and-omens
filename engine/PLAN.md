@@ -1263,14 +1263,6 @@ only 19%**. A 128-channel hex-conv residual block is 77.6 MFLOP. So:
 n is small enough that the quadratic term never dominates — 19% of the layer at
 r7, 23% at r8, 31% at r10.
 
-**The baseline that must be beaten first.** A ResNet with squeeze-excite blocks
-gets global context by channel-wise pooling at a fraction of attention's cost,
-and Leela Chess Zero was very strong that way for years. Much of what is
-globally relevant here (VP race, front location, army totals) is low-dimensional
-aggregate information that pooling captures. Build `ResNet+SE, 64ch x 8` first
-as a control. If the transformer cannot beat it, the transformer is not earning
-its complexity.
-
 ### 10.3 Multi-size is a requirement
 
 Decided: **one network across radii 1–8 and 1–10 factions**, not a net per
@@ -1592,8 +1584,6 @@ soft/multi-hot targets on ties.
 - **Which decisions get a network at all.** Full coverage is ~1 420 evals/game;
   movement + cavalry + buy only is ~1 020. Recommend starting narrow and
   widening once each head is shown to beat its heuristic.
-- **Does the ResNet+SE control beat the transformer?** If it does, take it — it
-  is simpler and TensorRT-friendlier. Build the control first.
 - **Board-size curriculum.** Train on pooled r5–r8, or start at r7 and widen?
   Pooled is more honest but slower to converge; r3 in particular is nearly a
   different game and may deserve exclusion rather than inclusion.
