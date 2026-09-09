@@ -87,17 +87,22 @@ rule explicitly, because it is easy to erode by accident:
 > Nothing under `include/oo/`, `src/`, `agents/` or `apps/` may include
 > `Python.h`, `pybind11`, or link against a Python library. Ever.
 
-`bindings/` is the *only* place Python appears, it is a leaf that depends on the core
-and nothing depends on it, and it sits behind a CMake option:
+`bindings/` was the *only* place Python appeared — a leaf that depended on the core
+with nothing depending on it, behind a CMake option that was flipped `OFF` at M8.
 
-```cmake
-option(OO_BUILD_PYTHON "Build the pybind11 module" ON)   # flip OFF at M8
-```
+**Done (M8).** The option, the `bindings/` directory, the `engine/*.py` shims,
+`engine_old/`, `agents/`, `tournament.py` and `tools/*.py` are all deleted. The
+repo contains **zero `.py` files**; `CMakeLists.txt` mentions neither Python nor
+pybind11 and does no Python probing at configure time. The build produces the
+static library plus `oo_run` and `oo_tournament`, and Python is not involved at
+any stage — not at build time, not at run time.
 
-With it `OFF`, the build produces a standalone static library plus the `oo_run` and
-`oo_tournament` executables, and Python is not involved at any stage — not at build
-time, not at run time. That target is testable from day one; CI should build both
-configurations so the dependency can never creep back in.
+What this cost, recorded deliberately: `agents/` and `engine_old/` were the
+parity oracles and the fastest place to prototype a heuristic. Both are
+recoverable from git history (`git show <commit>:agents/tactician_agent.py`),
+which was judged sufficient — no tag was cut (§9). The golden files under
+`tests/data/` are now the only checked-in record of the Python engine's
+behaviour, and §3.4 covers what happens to them.
 
 **Three decisions follow from this**, and they differ from what an
 engine-that-lives-inside-Python would do:
@@ -452,7 +457,7 @@ The RNG-draw counter matters as much as the state: two engines can agree on stat
 while having consumed a different number of rolls, and that divergence surfaces
 several turns later somewhere unrelated.
 
-### 3.4 Retiring the parity corpus (decided, do at M8)
+### 3.4 Retiring the parity corpus (decided, do at M8b — §11)
 
 Once Python is gone the CPython-compatible RNG (§3.1) stops earning its keep,
 and it is replaced with a native generator — recommended: **xoshiro256++ seeded
@@ -477,16 +482,37 @@ the final act of M8, after everything else is green.
 
 The corpus splits cleanly:
 
-| survives untouched — no RNG, stays a Python-verified oracle | regenerate from C++ — downgrades to a regression test |
+| survives untouched — no RNG, stays a Python-verified oracle | regenerate — downgrades to a regression test |
 |---|---|
-| `grid_golden`, `legal_cases`, `buy_scenarios`, `movement_scenarios`, `phase_cases` | `turn_traces`, `agent_games`, `replay_hashes`, `setup_cases` |
+| `grid_golden`, `legal_cases`, `buy_scenarios`, `phase_cases` | `turn_traces`, `agent_games`, `replay_hashes`, `setup_cases`, `movement_scenarios` |
 
 The left column is pure geometry, explicit states, or hand-built action lists —
 no seed is involved, so those files stay valid forever and keep some
-Python-derived ground truth in the repo. The right column is generated from
-seeds; regenerate each file once from the C++ engine in the same commit as the
-swap. Those tests still catch "I broke something today"; they stop proving
-"matches Python". That is the correct trade at M8 and not before.
+Python-derived ground truth in the repo. The right column is seed-derived and
+gets rewritten in the same commit as the swap. Those tests still catch "I broke
+something today"; they stop proving "matches Python".
+
+**`movement_scenarios` belongs on the right, which is not obvious.** Its inputs
+are explicit states and action lists, so it looks RNG-free — but
+`apply_movement_step` draws exactly once, for the Line Battle coin flip that
+decides which of two swapping armies' hexes the battle lands on
+(`movement.cpp`, `rng.random() < 0.5`). Any scenario containing a swap has an
+RNG-dependent expected output. `phase_cases` really is RNG-free; `test_phases`
+constructs no `Rng` at all.
+
+**How the rewrite works, and why it needs no Python.** Do not rebuild the
+scenario *generators* in C++ — the inputs are already stored verbatim in the
+golden files. Add a `--rewrite` mode to the five affected test binaries that
+parses the file with the same reader the test already uses, keeps every input
+field untouched, recomputes the expected outputs with the current engine, and
+writes the file back. That is a few dozen lines per test rather than a port of
+~2 000 lines of Python dumpers.
+
+It also validates itself, which is the point: **run `--rewrite` BEFORE swapping
+the RNG and the files must come back byte-identical.** That proves the rewrite
+path is faithful while the old behaviour is still in place. Only then swap the
+RNG and rewrite for real. This is why the swap is not blocked on M8 — the
+mechanism reads golden files and the C++ engine, never Python.
 
 `rng_golden` and `rng_stress` become meaningless outright — their entire purpose
 is CPython bit-compatibility. Replace them with basic property tests on the new
@@ -663,10 +689,14 @@ Each step ends with its own parity test green before starting the next.
 
 ---
 
-## 5. Step 4 — Python bindings (`oo_engine`) — *transitional, deleted at M8*
+## 5. Step 4 — Python bindings (`oo_engine`) — *transitional; **deleted at M8***
 
-Scoped as an integration harness, not a product (§1.2). It exists so twelve working
-agents can exercise the new engine before any of them are ported, which is a far
+**This section is history — the module no longer exists.** Kept because it
+records why the bindings were built and what they bought, which is the
+justification for a chunk of M5–M6's method.
+
+Scoped as an integration harness, not a product (§1.2). It existed so twelve working
+agents could exercise the new engine before any of them were ported, which is a far
 stronger test than anything hand-written. Build it behind `-DOO_BUILD_PYTHON=ON`;
 nothing in the core may include it.
 
@@ -1209,7 +1239,7 @@ invariant every army mutation must preserve.
 | ~~M6c~~ | ~~`oo_run` / `oo_tournament` + native JSON~~ | **done — 120/120 files byte-identical; `run.py` deleted (§6.8)** |
 | ~~M6d~~ | ~~Sparse battle storage~~ | **done — 68.6 KB -> 17.7 KB; all gates green (§6.9)** |
 | M7 | `run_games` thread pool | **DONE** — 6.4x on 12 threads (6 cores + SMT), deterministic per seed |
-| M8 | **Python removed** | `-DOO_BUILD_PYTHON=OFF` builds and passes everything; `bindings/`, shims, `engine_old/`, `agents/` deleted. Finish by swapping the CPython RNG for a native one and regenerating the seed-derived corpus (§3.4) — tag first, it is a one-way door |
+| ~~M8~~ | ~~**Python removed**~~ | **done — zero `.py` files in the repo; no Python in `CMakeLists.txt` and none probed at configure time; 11/11 tests green and `oo_run` output unchanged (§1.2)** |
 | M8b | Rules + cleanup window (§11) | auto-clamp merges, RNG swap, `alive[]` dropped; corpus regenerated once. **Must close before M9 generates training data** |
 | M9 | Neural policy (§10) | resumable `play_game`, batched encoder, TensorRT inference; a learned policy that beats `tactician` head to head |
 
