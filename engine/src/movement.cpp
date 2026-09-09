@@ -52,7 +52,20 @@ void legal_mask_impl(const GameState& state, int faction, bool require_cavalry, 
         const int16_t* nb = grid.neighbours_of(h);
         for (int d = 0; d < NUM_DIRECTIONS; ++d) {
             const int j = nb[d];
-            out.cell[h][d] = j >= 0 && !kImpassableByTerrain[state.terrain[j]];
+            if (j < 0 || kImpassableByTerrain[state.terrain[j]]) continue;
+            // §11.1: moving into our own FULL stack is illegal, not merely
+            // clamped to nothing. A faction gets one move per step, so offering
+            // a move that would carry zero units would waste the whole step.
+            //
+            // No simultaneity hazard: for a peaceful merge both stacks are ours,
+            // and since only one of our armies moves per step the sitting one
+            // cannot also be moving. So this is a pure function of our own
+            // pre-step board - exactly what units_to_move will clamp against.
+            if (!state.locked(j) && state.army_faction[j] == faction &&
+                state.units_at(j) >= MAX_STACK_SIZE) {
+                continue;
+            }
+            out.cell[h][d] = true;
         }
     }
 }
@@ -101,16 +114,52 @@ void start_or_extend_battle(GameState& state, int hex_index, const Contribution*
     state.clear_army(hex_index);
 }
 
-// The movement phase moves the WHOLE army. The cavalry phase moves a different,
-// fixed subset - only the cavalry count, always leaving infantry and archers
-// behind - not a further narrowing of the same idea.
-Units units_to_move(const GameState& state, int from_index, bool cavalry_only) {
+// What a move actually carries (PLAN.md §11.1).
+//
+// The movement phase moves the whole army; the cavalry phase moves a fixed
+// subset - only the cavalry, always leaving infantry and archers behind. Both
+// are then subject to the destination clamp below.
+//
+// A move into the mover's OWN stack carries only as many units as the
+// destination can hold; the remainder never leaves. The clamp is deliberately
+// here, at collect time, rather than at destination-resolution time: it means
+// nothing is ever sent back to an origin, which is what let `revert_departure`
+// and its two edge cases be deleted outright rather than fixed.
+//
+// It also reads the board as the PLAYER saw it when deciding, so how many units
+// will move is knowable at decision time. Clamping later would depend on what
+// opponents did simultaneously, which the player cannot see. The accepted cost:
+// if an opponent contests the destination the merge becomes a battle instead,
+// and battles are not stack-capped, so the trimmed units would ideally have
+// joined. The rule is evaluated once, from the pre-step board, deterministically.
+//
+// Only a peaceful merge into our own army clamps. An empty destination cannot
+// overflow (a stack is never above MAX_STACK_SIZE to begin with), and a hostile
+// or locked destination starts a battle, which is uncapped by design and
+// reconciled afterwards by rectify_overflow.
+Units units_to_move(const GameState& state, int from_index, int to_index, bool cavalry_only) {
+    Units u{{0, 0, 0}};
     if (cavalry_only) {
-        Units u{{0, 0, 0}};
         u.u[kCavalry] = state.army_units[from_index][kCavalry];
-        return u;
+    } else {
+        u = units_at(state, from_index);
     }
-    return units_at(state, from_index);
+
+    if (to_index < 0 || state.locked(to_index)) return u;
+    if (state.army_faction[to_index] != state.army_faction[from_index]) return u;
+
+    int capacity = MAX_STACK_SIZE - state.units_at(to_index);
+    if (capacity < 0) capacity = 0;
+    int total = u.total();
+    // Infantry are left behind first, then cavalry, then archers - the same
+    // order rectify_overflow trims in (battle.hpp), so the cheapest unit is the
+    // one that stays wherever the rules have to shed units.
+    for (int t = 0; t < NUM_UNIT_TYPES && total > capacity; ++t) {
+        const int drop = u.u[t] < (total - capacity) ? u.u[t] : (total - capacity);
+        u.u[t] = static_cast<int16_t>(u.u[t] - drop);
+        total -= drop;
+    }
+    return u;
 }
 
 }  // namespace
@@ -140,12 +189,18 @@ void apply_movement_step(GameState& state, const MoveActions& actions, Rng& rng,
         if (from < 0 || from >= state.num_hexes) continue;
         if (state.army_faction[from] != faction) continue;
         if (state.locked(from) || state.frozen[from]) continue;
-        const Units units = units_to_move(state, from, cavalry_only);
-        if (units.total() <= 0) continue;
+        // `to` is resolved before the units are taken, because units_to_move now
+        // clamps against the destination. Every check here drops the move either
+        // way, so the reordering changes nothing about which moves survive.
         if (dir < 0 || dir >= NUM_DIRECTIONS) continue;
         const int to = grid.neighbour(from, dir);
         if (to < 0) continue;
         if (kImpassableByTerrain[state.terrain[to]]) continue;
+        const Units units = units_to_move(state, from, to, cavalry_only);
+        // Zero means the destination is our own full stack. legal_mask_impl masks
+        // that out, so a well-behaved agent never submits it; anything else is
+        // dropped here like any other invalid action.
+        if (units.total() <= 0) continue;
 
         moves.push_back(CollectedMove{faction, from, to, units});
     }
@@ -219,32 +274,6 @@ void apply_movement_step(GameState& state, const MoveActions& actions, Rng& rng,
         subtract_departure(state, moves[mi].from, moves[mi].units);
     }
 
-    // Sends a reverted move's units back to its origin. PORTED AS-IS, including
-    // the two edge cases: if the origin has since been claimed by a different
-    // faction's peaceful merge this starts a battle there rather than merging or
-    // vanishing; and if the origin was locked by an unrelated battle this same
-    // step, it recreates a peaceful army on a locked hex.
-    //
-    // The moved flags in the battle-starting branch: the faction that peacefully
-    // claimed `origin` this step really did move there (true), while `a`'s own
-    // move was voided by the revert, so by the end of the step it never left
-    // (false) - same as any other stationary occupant a battle triggers against.
-    auto revert_departure = [&](const CollectedMove& a) {
-        const int origin = a.from;
-        if (state.army_faction[origin] == NO_FACTION) {
-            state.army_faction[origin] = static_cast<int8_t>(a.faction);
-            for (int t = 0; t < NUM_UNIT_TYPES; ++t) state.army_units[origin][t] = a.units.u[t];
-        } else if (state.army_faction[origin] == a.faction) {
-            for (int t = 0; t < NUM_UNIT_TYPES; ++t) state.army_units[origin][t] += a.units.u[t];
-        } else {
-            const Contribution contribs[2] = {
-                {state.army_faction[origin], origin, units_at(state, origin), true},
-                {a.faction, origin, a.units, false},
-            };
-            start_or_extend_battle(state, origin, contribs, 2);
-        }
-    };
-
     for (int d = 0; d < dests.size(); ++d) {
         const int dest = dests[d];
         const SmallVec<int, MAX_FACTIONS>& group = arrivals[d];
@@ -295,11 +324,16 @@ void apply_movement_step(GameState& state, const MoveActions& actions, Rng& rng,
         int arriving_total = 0;
         for (int i = 0; i < group.size(); ++i) arriving_total += moves[group[i]].units.total();
 
+        // UNREACHABLE since §11.1: units_to_move already clamped this move to what
+        // the destination could hold. Kept as a live check rather than deleted,
+        // because the reasoning that makes it unreachable rests on an invariant
+        // elsewhere - that a faction submits at most one move per step
+        // (MoveActions), so a peaceful group is a single arrival onto a stack that
+        // cannot itself have moved. If that ever stops holding, a silent
+        // over-cap merge would corrupt the state invisibly; this makes it loud.
         if (existing_total + arriving_total > MAX_STACK_SIZE) {
-            // Outside battle the 6-unit limit is strict: a peaceful merge that
-            // would exceed it simply does not happen.
-            for (int i = 0; i < group.size(); ++i) revert_departure(moves[group[i]]);
-            continue;
+            assert(false && "peaceful merge exceeded the stack cap despite the collect-time clamp");
+            std::abort();
         }
 
         // Only reachable when there is exactly one arriving faction, so "the

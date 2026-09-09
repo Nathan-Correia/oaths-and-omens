@@ -16,8 +16,14 @@
 # produces a different board and the recorded placements point at hexes that no
 # longer exist. See tests/test_setup.cpp.
 #
-# Files NOT touched here, because no RNG reaches them: grid_golden, phase_cases,
-# legal_cases, buy_scenarios. Those stay Python-verified forever.
+# legal_cases is here too, and that is not about the RNG: it records the
+# movement/cavalry MASKS, so any rules change to legality invalidates it. §11.1
+# did exactly that.
+#
+# Files NOT touched, because nothing reaches them: grid_golden (pure geometry),
+# phase_cases (no Rng is even constructed), and buy_scenarios (hand-built inputs
+# AND hand-reasoned expectations - a specification, not a recording; reblessing
+# it would just make it agree with whatever the engine now does).
 #
 # rng_golden and rng_stress are deliberately absent: they exist only to pin
 # CPython bit-compatibility, so the RNG swap retires them rather than reblessing
@@ -44,7 +50,8 @@ $targets = @(
     @{ exe = "test_replay";   file = "replay_hashes.txt" },
     @{ exe = "test_movement"; file = "movement_scenarios.txt" },
     @{ exe = "test_turn";     file = "turn_traces.txt" },
-    @{ exe = "test_setup";    file = "setup_cases.txt" }
+    @{ exe = "test_setup";    file = "setup_cases.txt" },
+    @{ exe = "test_buy";      file = "legal_cases.txt"; extra = "tests\data\buy_scenarios.txt" }
 )
 
 $changed = 0
@@ -54,7 +61,13 @@ foreach ($t in $targets) {
     $golden = Join-Path $data $t.file
     $tmp    = Join-Path ([System.IO.Path]::GetTempPath()) ("oo_" + $t.file)
 
-    & $exe $golden --rewrite $tmp | Out-Null
+    # test_buy takes two positional files; the second is a specification, not a
+    # recording, so it is passed through but never reblessed.
+    if ($t.ContainsKey("extra")) {
+        & $exe $golden (Join-Path $repo ("engine\\" + $t.extra)) --rewrite $tmp | Out-Null
+    } else {
+        & $exe $golden --rewrite $tmp | Out-Null
+    }
     if ($LASTEXITCODE -ne 0) { Write-Error "$($t.exe) --rewrite failed"; exit 1 }
 
     Copy-Item $tmp $golden -Force

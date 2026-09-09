@@ -11,6 +11,8 @@
 //
 // Usage: test_buy <legal_cases.txt> <buy_scenarios.txt>
 
+#include "rewrite.hpp"
+
 #include "oo/buy.hpp"
 #include "oo/movement.hpp"
 #include "oo/state_io.hpp"
@@ -58,7 +60,7 @@ oo::BuyAction read_action(std::istream& in) {
     return a;
 }
 
-int run_legal_cases(const char* path) {
+int run_legal_cases(const char* path, std::ostream* rw) {
     std::ifstream in(path);
     if (!in) {
         std::cerr << "cannot open " << path << "\n";
@@ -71,6 +73,7 @@ int run_legal_cases(const char* path) {
         std::cerr << "malformed legal case file\n";
         return -1;
     }
+    if (rw) *rw << "LEGAL_CASES " << total << "\n";
 
     auto state = std::make_unique<oo::GameState>();
     oo::LegalBuyActions legal;
@@ -85,6 +88,10 @@ int run_legal_cases(const char* path) {
             std::cerr << "legal case " << name << ": " << error << "\n";
             return -1;
         }
+        if (rw) {
+            *rw << "LEGAL_CASE " << name << "\n";
+            oo::write_state(*rw, *state);
+        }
         for (int f = 0; f < state->num_factions; ++f) {
             int faction = 0;
             in >> tag >> faction;
@@ -92,6 +99,41 @@ int run_legal_cases(const char* path) {
             int n = 0;
             in >> tag >> n;  // BUY
             oo::get_legal_buy_actions(*state, faction, legal);
+            if (rw) {
+                *rw << "FACTION " << faction << "\n";
+                *rw << "BUY " << legal.size();
+                for (int a = 0; a < legal.size(); ++a) {
+                    *rw << ' ' << int(legal[a].type) << ' ' << legal[a].hex << ' '
+                        << int(legal[a].unit_type) << ' ' << int(legal[a].upgrade);
+                }
+                *rw << "\n";
+                // Still consume the recorded actions so the stream stays aligned.
+                for (int a = 0; a < n; ++a) (void)read_action(in);
+                for (int which = 0; which < 2; ++which) {
+                    int count = 0;
+                    in >> tag >> count;
+                    for (int c = 0; c < count; ++c) {
+                        int h, d;
+                        in >> h >> d;
+                    }
+                    if (which == 0) {
+                        oo::legal_movement_mask(*state, faction, mask);
+                    } else {
+                        oo::legal_cavalry_mask(*state, faction, mask);
+                    }
+                    std::vector<std::pair<int, int>> got;
+                    for (int h = 0; h < state->num_hexes; ++h) {
+                        for (int d = 0; d < oo::NUM_DIRECTIONS; ++d) {
+                            if (mask.cell[h][d]) got.emplace_back(h, d);
+                        }
+                    }
+                    *rw << (which == 0 ? "MOVEMASK " : "CAVMASK ") << got.size();
+                    for (const auto& p : got) *rw << ' ' << p.first << ' ' << p.second;
+                    *rw << "\n";
+                }
+                checked += 3;
+                continue;
+            }
             if (legal.size() != n) {
                 std::ostringstream os;
                 os << name << " f" << faction << ": legal buy count " << legal.size() << ", want "
@@ -195,11 +237,26 @@ int run_buy_scenarios(const char* path) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    // Only legal_cases can be reblessed here. buy_scenarios is hand-built inputs
+    // AND hand-reasoned expectations, so recomputing its outputs would just make
+    // it agree with whatever the engine currently does - it is a specification,
+    // not a recording, and it stays fixed.
+    std::string rewrite_path;
+    const bool rewriting = oo_test::take_rewrite_flag(argc, argv, rewrite_path);
+
     if (argc < 3) {
-        std::cerr << "usage: test_buy <legal_cases.txt> <buy_scenarios.txt>\n";
+        std::cerr << "usage: test_buy <legal_cases.txt> <buy_scenarios.txt> [--rewrite <out>]\n";
         return 2;
     }
-    const int legal = run_legal_cases(argv[1]);
+
+    oo_test::Rewriter rw;
+    if (rewriting && !rw.open(rewrite_path)) return 2;
+    const int legal = run_legal_cases(argv[1], rewriting ? &rw.out : nullptr);
+    if (rewriting) {
+        std::printf("test_buy: rewrote %d legal-action states to %s\n", legal,
+                    rewrite_path.c_str());
+        return legal < 0 ? 2 : 0;
+    }
     const int scenarios = run_buy_scenarios(argv[2]);
     if (legal < 0 || scenarios < 0) return 2;
 

@@ -135,6 +135,12 @@ add_test(NAME movement_scenarios
 
 # No golden data: this one asserts an invariant (thread count cannot change
 # results), so it stays valid as the rules evolve.
+# Pins the movement stack clamp itself. The golden files were reblessed from
+# this engine so they agree with it by construction; this asserts the rule.
+add_executable(test_clamp tests/test_clamp.cpp)
+target_link_libraries(test_clamp PRIVATE oo_core)
+add_test(NAME movement_clamp COMMAND test_clamp)
+
 add_executable(test_run tests/test_run.cpp)
 target_link_libraries(test_run PRIVATE oo_core)
 add_test(NAME run_determinism COMMAND test_run)
