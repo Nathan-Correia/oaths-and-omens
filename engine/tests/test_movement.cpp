@@ -1,7 +1,12 @@
 // Targeted movement scenarios - the edge cases full-turn traces barely reach.
 //
-// See tools/dump_movement_scenarios.py for what each case is and why it matters.
-// Usage: test_movement <path-to-movement_scenarios.txt>
+// The cases were built by tools/dump_movement_scenarios.py, deleted with the rest
+// of the Python at M8; the file itself is now the only record of them. Case names
+// still say what each one is for.
+//
+// Usage: test_movement <path-to-movement_scenarios.txt> [--rewrite <out>]
+
+#include "rewrite.hpp"
 
 #include "oo/movement.hpp"
 #include "oo/state_io.hpp"
@@ -9,10 +14,15 @@
 #include <cstdio>
 #include <fstream>
 #include <iostream>
+#include <array>
 #include <memory>
 #include <string>
+#include <vector>
 
 int main(int argc, char** argv) {
+    std::string rewrite_path;
+    const bool rewriting = oo_test::take_rewrite_flag(argc, argv, rewrite_path);
+
     if (argc < 2) {
         std::cerr << "usage: test_movement <movement_scenarios.txt>\n";
         return 2;
@@ -33,6 +43,15 @@ int main(int argc, char** argv) {
 
     auto before = std::make_unique<oo::GameState>();
     auto expected = std::make_unique<oo::GameState>();
+    // apply_movement_step mutates `before` in place, so a rewrite needs the
+    // original back to re-emit it as the case's input.
+    auto original = std::make_unique<oo::GameState>();
+
+    oo_test::Rewriter rw;
+    if (rewriting) {
+        if (!rw.open(rewrite_path)) return 2;
+        rw.out << "SCENARIOS " << total << "\n";
+    }
 
     int passed = 0, failures = 0;
     for (int i = 0; i < total; ++i) {
@@ -53,10 +72,12 @@ int main(int argc, char** argv) {
         // order (see MoveActions).
         oo::MoveActions actions;
         actions.clear();
+        std::vector<std::array<int, 3>> raw_actions;
         for (int a = 0; a < n_actions; ++a) {
             int faction, hex_index, direction;
             in >> faction >> hex_index >> direction;
             actions.set(faction, hex_index, direction);
+            raw_actions.push_back({faction, hex_index, direction});
         }
 
         std::string error;
@@ -69,8 +90,23 @@ int main(int argc, char** argv) {
             return 2;
         }
 
+        *original = *before;
         oo::Rng rng(seed);
         oo::apply_movement_step(*before, actions, rng, cavalry_only != 0);
+
+        if (rw) {
+            rw.out << "SCENARIO " << case_name << "\n"
+                   << "SEED " << seed << "\n"
+                   << "CAVALRY_ONLY " << cavalry_only << "\n"
+                   << "ACTIONS " << n_actions << "\n";
+            for (const auto& a : raw_actions) {
+                rw.out << a[0] << ' ' << a[1] << ' ' << a[2] << "\n";
+            }
+            oo::write_state(rw.out, *original);
+            oo::write_state(rw.out, *before);
+            ++passed;
+            continue;
+        }
 
         std::string diff;
         if (!oo::compare_states(*before, *expected, diff)) {
@@ -84,6 +120,10 @@ int main(int argc, char** argv) {
         ++passed;
     }
 
+    if (rw) {
+        std::printf("test_movement: rewrote %d scenarios to %s\n", passed, rewrite_path.c_str());
+        return 0;
+    }
     std::printf("test_movement: %d/%d scenarios passed, %d failures\n", passed, total, failures);
     return failures == 0 ? 0 : 1;
 }

@@ -6,7 +6,9 @@
 // the check is still byte-exact, which matters because web_visualizer.html is the
 // one viewer that survives Python removal.
 //
-// Usage: test_replay <path-to-replay_hashes.txt>
+// Usage: test_replay <path-to-replay_hashes.txt> [--rewrite <out>]
+
+#include "rewrite.hpp"
 
 #include "oo/agent.hpp"
 #include "oo/json.hpp"
@@ -117,6 +119,9 @@ std::string sha256(const std::string& s) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    std::string rewrite_path;
+    const bool rewriting = oo_test::take_rewrite_flag(argc, argv, rewrite_path);
+
     if (argc < 2) {
         std::cerr << "usage: test_replay <replay_hashes.txt>\n";
         return 2;
@@ -139,6 +144,12 @@ int main(int argc, char** argv) {
     // three of its files.
     std::string last_key;
     std::string board_json, terrain_json, placement_json;
+
+    oo_test::Rewriter rw;
+    if (rewriting) {
+        if (!rw.open(rewrite_path)) return 2;
+        rw.out << "REPLAY_HASHES " << total << "\n";
+    }
 
     int passed = 0, failures = 0;
     for (int i = 0; i < total; ++i) {
@@ -185,6 +196,14 @@ int main(int argc, char** argv) {
                                  : file == "terrain_gen_log.json" ? terrain_json
                                                                   : placement_json;
         const std::string got_hash = sha256(got);
+
+        if (rw) {
+            rw.out << agent << ' ' << radius << ' ' << factions << ' ' << seed << ' ' << max_turns
+                   << ' ' << file << ' ' << got.size() << ' ' << got_hash << "\n";
+            ++passed;
+            continue;
+        }
+
         if (got.size() == want_size && got_hash == want_hash) {
             ++passed;
         } else if (++failures <= 10) {
@@ -194,6 +213,10 @@ int main(int argc, char** argv) {
         }
     }
 
+    if (rw) {
+        std::printf("test_replay: rewrote %d hashes to %s\n", passed, rewrite_path.c_str());
+        return 0;
+    }
     std::printf("test_replay: %d/%d replay files byte-identical to Python, %d failures\n", passed,
                 total, failures);
     return failures == 0 ? 0 : 1;

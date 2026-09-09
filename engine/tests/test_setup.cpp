@@ -6,8 +6,25 @@
 // the same order. That is only possible if the RNG, the bag weighting order, the
 // blob shape rules, the island check and the round structure all agree exactly.
 //
-// Usage: test_setup <path-to-setup_cases.txt>
+// Usage: test_setup <path-to-setup_cases.txt> [--rewrite <out>]
+//
+// The two halves rebless DIFFERENTLY (PLAN.md §3.4), and this is the one file
+// where the distinction matters:
+//
+//   TERRAIN_CASES rewrites. Its inputs are a radius and a seed, which stay
+//   meaningful whatever the RNG does, so only the expected map is recomputed.
+//
+//   SETUP_CASES has to be RE-RECORDED, not rewritten, because a new RNG changes
+//   the generated terrain - and the recorded placement decisions are hex indices
+//   chosen on the OLD board. Preserving them would replay a trace against a map
+//   that no longer exists. So the before-state is regenerated from the seed and
+//   the decisions are taken fresh from the native agent named in the case
+//   (all of them are `random`). That downgrades this half from "matches Python"
+//   to "matches the last blessed C++ build", which is the honest trade.
 
+#include "rewrite.hpp"
+
+#include "oo/agent.hpp"
 #include "oo/placement.hpp"
 #include "oo/setup.hpp"
 #include "oo/state_io.hpp"
@@ -111,6 +128,53 @@ int replay_draft(const oo::GameState&, int faction, const int16_t* pool, int poo
     return d->b;
 }
 
+// --- setup decision recording (rewrite mode only) ---------------------------
+//
+// Mirrors the Replay callbacks above, but drives real agents and writes down what
+// they were asked and what they answered - including the legal set, which is the
+// part mutation testing showed was load-bearing (a mask that is merely larger
+// still validates a recorded choice).
+struct Recorder {
+    const oo::AgentSet* agents = nullptr;
+    std::vector<Decision> decisions;
+};
+
+int record_placement(const oo::GameState& state, int faction, const bool* legal, void* ctx) {
+    Recorder& r = *static_cast<Recorder*>(ctx);
+    Decision d;
+    d.kind = 'L';
+    d.a = faction;
+    for (int i = 0; i < state.num_hexes; ++i) {
+        if (legal[i]) d.legal.push_back(i);
+    }
+    d.b = r.agents->get(faction)->decide_placement(state, faction, legal);
+    r.decisions.push_back(std::move(d));
+    return r.decisions.back().b;
+}
+
+int record_draft(const oo::GameState& state, int faction, const int16_t* pool, int pool_size,
+                 void* ctx) {
+    Recorder& r = *static_cast<Recorder*>(ctx);
+    Decision d;
+    d.kind = 'D';
+    d.a = faction;
+    d.legal.assign(pool, pool + pool_size);
+    d.b = r.agents->get(faction)->decide_draft(state, faction, pool, pool_size);
+    r.decisions.push_back(std::move(d));
+    return r.decisions.back().b;
+}
+
+bool record_swap(const oo::GameState& state, int faction, int leftover, int placer, int placer_hex,
+                 void* ctx) {
+    Recorder& r = *static_cast<Recorder*>(ctx);
+    Decision d;
+    d.kind = 'W';
+    d.a = faction;
+    d.b = r.agents->get(faction)->decide_swap(state, faction, leftover, placer, placer_hex) ? 1 : 0;
+    r.decisions.push_back(std::move(d));
+    return r.decisions.back().b != 0;
+}
+
 bool replay_swap(const oo::GameState&, int faction, int, int, int, void* ctx) {
     Replay& r = *static_cast<Replay*>(ctx);
     const size_t index = r.cursor;
@@ -135,7 +199,7 @@ const char* kind_name(int k) {
     }
 }
 
-int run_terrain(std::istream& in) {
+int run_terrain(std::istream& in, std::ostream* rw) {
     std::string tag;
     int total = 0;
     in >> tag >> total;
@@ -143,6 +207,7 @@ int run_terrain(std::istream& in) {
         std::cerr << "expected TERRAIN_CASES, got " << tag << "\n";
         return -1;
     }
+    if (rw) *rw << "TERRAIN_CASES " << total << "\n";
 
     std::vector<int8_t> terrain(oo::MAX_HEXES);
     std::vector<oo::TerrainLogEntry> log;
@@ -173,6 +238,20 @@ int run_terrain(std::istream& in) {
         oo::Rng rng(seed);
         log.clear();
         oo::generate_terrain(grid, rng, terrain.data(), &log);
+
+        if (rw) {
+            *rw << "TERRAIN_CASE " << radius << ' ' << seed << "\n";
+            *rw << "TERRAIN " << n;
+            for (int h = 0; h < n; ++h) *rw << ' ' << int(terrain[static_cast<size_t>(h)]);
+            *rw << "\n";
+            *rw << "LOG " << log.size() << "\n";
+            for (const auto& e : log) {
+                *rw << int(e.q) << ' ' << int(e.r) << ' ' << int(e.s) << ' ' << int(e.terrain)
+                    << ' ' << e.round << "\n";
+            }
+            hexes_checked += n;
+            continue;
+        }
 
         bool ok = true;
         for (int h = 0; h < n && ok; ++h) {
@@ -213,7 +292,7 @@ int run_terrain(std::istream& in) {
     return total;
 }
 
-int run_setup(std::istream& in) {
+int run_setup(std::istream& in, std::ostream* rw) {
     std::string tag;
     int total = 0;
     in >> tag >> total;
@@ -221,6 +300,7 @@ int run_setup(std::istream& in) {
         std::cerr << "expected SETUP_CASES, got " << tag << "\n";
         return -1;
     }
+    if (rw) *rw << "SETUP_CASES " << total << "\n";
 
     auto before = std::make_unique<oo::GameState>();
     auto expected = std::make_unique<oo::GameState>();
@@ -295,6 +375,59 @@ int run_setup(std::istream& in) {
         sd.swap = &replay_swap;
         sd.ctx = &replay;
 
+        if (rw) {
+            // RE-RECORD, not rewrite: regenerate the board from the seed and take
+            // fresh decisions from the agent named in the case, because the
+            // recorded ones point at hexes on a board the new RNG will not
+            // produce. See the file header.
+            const size_t dash = name.find('-');
+            oo::AgentKind kind;
+            if (dash == std::string::npos ||
+                !oo::agent_kind_from_name(name.substr(0, dash).c_str(), kind)) {
+                std::cerr << "cannot recover agent kind from case name '" << name << "'\n";
+                return -1;
+            }
+            auto fresh = std::make_unique<oo::GameState>();
+            oo::create_initial_state(*fresh, radius, num_factions, game_seed);
+
+            oo::AgentSet agents;
+            oo::build_agents(agents, kind, num_factions, game_seed);
+            Recorder rec;
+            rec.agents = &agents;
+            oo::SetupDecisions rsd;
+            rsd.placement = &record_placement;
+            rsd.draft = &record_draft;
+            rsd.swap = &record_swap;
+            rsd.ctx = &rec;
+
+            oo::Rng rrng(seed);
+            log.clear();
+            oo::run_city_setup(*fresh, rsd, rrng, &log);
+
+            *rw << "SETUP_CASE " << name << "\n"
+                << "PARAMS " << radius << ' ' << num_factions << ' ' << game_seed << "\n"
+                << "SEED " << seed << "\n";
+            {
+                auto start = std::make_unique<oo::GameState>();
+                oo::create_initial_state(*start, radius, num_factions, game_seed);
+                oo::write_state(*rw, *start);
+            }
+            *rw << "DECISIONS " << rec.decisions.size() << "\n";
+            for (const Decision& d : rec.decisions) {
+                *rw << d.kind << ' ' << d.a << ' ' << d.b << ' ' << d.legal.size();
+                for (int v : d.legal) *rw << ' ' << v;
+                *rw << "\n";
+            }
+            oo::write_state(*rw, *fresh);
+            *rw << "LOG " << log.size() << "\n";
+            for (const auto& e : log) {
+                *rw << int(e.kind) << ' ' << int(e.faction) << ' ' << int(e.q) << ' ' << int(e.r)
+                    << ' ' << int(e.s) << ' ' << int(e.placer_faction) << ' ' << int(e.placer_q)
+                    << ' ' << int(e.placer_r) << ' ' << int(e.placer_s) << "\n";
+            }
+            continue;
+        }
+
         oo::Rng rng(seed);
         log.clear();
         oo::run_city_setup(*before, sd, rng, &log);
@@ -355,6 +488,9 @@ int run_setup(std::istream& in) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    std::string rewrite_path;
+    const bool rewriting = oo_test::take_rewrite_flag(argc, argv, rewrite_path);
+
     if (argc < 2) {
         std::cerr << "usage: test_setup <setup_cases.txt>\n";
         return 2;
@@ -365,11 +501,20 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    const int terrain = run_terrain(in);
+    oo_test::Rewriter rw;
+    if (rewriting && !rw.open(rewrite_path)) return 2;
+    std::ostream* rws = rewriting ? &rw.out : nullptr;
+
+    const int terrain = run_terrain(in, rws);
     if (terrain < 0) return 2;
-    const int setup = run_setup(in);
+    const int setup = run_setup(in, rws);
     if (setup < 0) return 2;
 
+    if (rewriting) {
+        std::printf("test_setup: rewrote %d terrain maps + re-recorded %d setup cases to %s\n",
+                    terrain, setup, rewrite_path.c_str());
+        return 0;
+    }
     std::printf("test_setup: %d terrain maps + %d setup cases, %d failures\n", terrain, setup,
                 g_failures);
     return g_failures == 0 ? 0 : 1;

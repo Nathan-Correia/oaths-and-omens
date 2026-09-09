@@ -7,7 +7,9 @@
 // faction, is reported at the point it happens rather than as a mystery state diff
 // several phases later.
 //
-// Usage: test_turn <path-to-turn_traces.txt>
+// Usage: test_turn <path-to-turn_traces.txt> [--rewrite <out>]
+
+#include "rewrite.hpp"
 
 #include "oo/state_io.hpp"
 #include "oo/turn.hpp"
@@ -207,6 +209,9 @@ bool parse_decision(const std::string& line, Decision& out) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    std::string rewrite_path;
+    const bool rewriting = oo_test::take_rewrite_flag(argc, argv, rewrite_path);
+
     if (argc < 2) {
         std::cerr << "usage: test_turn <turn_traces.txt>\n";
         return 2;
@@ -227,6 +232,14 @@ int main(int argc, char** argv) {
 
     auto before = std::make_unique<oo::GameState>();
     auto expected = std::make_unique<oo::GameState>();
+    // run_turn mutates `before`, so a rewrite needs the original to re-emit.
+    auto original = std::make_unique<oo::GameState>();
+
+    // Buffered, because a case whose decision sequence no longer replays cannot
+    // be rewritten at all and has to be DROPPED - which changes the case count in
+    // the header. Buffering lets the real count be written once at the end.
+    std::ostringstream rw_body;
+    int rw_cases = 0, rw_dropped = 0;
 
     int passed = 0, failures = 0;
     long long total_decisions = 0;
@@ -252,16 +265,22 @@ int main(int argc, char** argv) {
         }
         std::getline(in, tag);  // consume rest of line
         std::vector<Decision> decisions;
+        // Kept verbatim rather than re-serialized from the parsed struct, so a
+        // rewrite reproduces the recorded input exactly instead of round-tripping
+        // it through a formatter that might normalise something.
+        std::vector<std::string> raw_decisions;
         decisions.reserve(static_cast<size_t>(n_decisions));
         for (int d = 0; d < n_decisions; ++d) {
             std::string line;
             std::getline(in, line);
+            if (!line.empty() && line.back() == '\r') line.pop_back();
             Decision dec;
             if (!parse_decision(line, dec)) {
                 std::cerr << "case " << case_name << ": bad decision line: " << line << "\n";
                 return 2;
             }
             decisions.push_back(std::move(dec));
+            raw_decisions.push_back(std::move(line));
         }
         total_decisions += n_decisions;
 
@@ -288,8 +307,30 @@ int main(int argc, char** argv) {
         td.resource_choice = &replay_resource;
         td.ctx = &replay;
 
+        *original = *before;
         oo::Rng rng(seed);
         oo::run_turn(*before, td, rng);
+
+        if (rewriting) {
+            // A case whose recorded decision sequence no longer matches what the
+            // engine asks for cannot be reblessed - the trace is the input, and
+            // it is now wrong. Drop it loudly rather than writing a broken case.
+            if (!replay.error.empty() || replay.cursor != decisions.size()) {
+                ++rw_dropped;
+                std::cerr << "DROPPED " << case_name << ": "
+                          << (replay.error.empty() ? "decision count changed" : replay.error)
+                          << "\n";
+                continue;
+            }
+            rw_body << "TURN_CASE " << case_name << "\n" << "SEED " << seed << "\n";
+            oo::write_state(rw_body, *original);
+            rw_body << "DECISIONS " << n_decisions << "\n";
+            for (const std::string& line : raw_decisions) rw_body << line << "\n";
+            oo::write_state(rw_body, *before);
+            ++rw_cases;
+            ++passed;
+            continue;
+        }
 
         if (!replay.error.empty()) {
             if (++failures <= 15) std::cerr << "FAIL " << case_name << ": " << replay.error << "\n";
@@ -316,6 +357,14 @@ int main(int argc, char** argv) {
         ++passed;
     }
 
+    if (rewriting) {
+        oo_test::Rewriter rw;
+        if (!rw.open(rewrite_path)) return 2;
+        rw.out << "TURN_CASES " << rw_cases << "\n" << rw_body.str();
+        std::printf("test_turn: rewrote %d cases to %s (%d dropped)\n", rw_cases,
+                    rewrite_path.c_str(), rw_dropped);
+        return 0;
+    }
     std::printf("test_turn: %d/%d turns passed (%lld decisions replayed), %d failures\n", passed,
                 total, total_decisions, failures);
     return failures == 0 ? 0 : 1;
