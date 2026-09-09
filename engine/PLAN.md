@@ -1249,7 +1249,10 @@ invariant every army mutation must preserve.
 | ~~M7~~ | ~~`run_games` thread pool~~ | **done — 6.4x on 12 threads (6 cores + SMT), deterministic per seed (§7.1)** |
 | ~~M8~~ | ~~**Python removed**~~ | **done — zero `.py` files in the repo; no Python in `CMakeLists.txt` and none probed at configure time; 11/11 tests green and `oo_run` output unchanged (§1.2)** |
 | ~~M8b~~ | ~~Rules + cleanup window (§11)~~ | **done — auto-clamp (§11.1), xoshiro256++ (§3.4), `alive[]` dropped (§11.2); corpus reblessed via `tools/rewrite_goldens.ps1`, 11/11 green** |
-| M9 | Neural policy (§10) | resumable `play_game`, batched encoder, TensorRT inference; a learned policy that beats `tactician` head to head |
+| M9 | Neural policy runtime (§10) | resumable `play_game`, batched encoder, GPU inference. **Exit: `oo_run --agent neural` runs on random weights and reports games/s** — no training |
+| M10a | Evaluation harness (§12.1) | head-to-head with confidence intervals, paired seeds, seat rotation, a fixed ladder. Before any training |
+| M10b | Imitate tactician (§12.2) | behaviour cloning on engine-generated data. **Exit: beats `marshal`, close to `tactician`** |
+| M10c | Self-play (§12.3) | league of past checkpoints; where search would later take over |
 
 M1–M4 are where nearly all the risk lives. M5 is mechanical. M6 is the largest
 *volume* of work (~1 200 lines, §6.1) but low risk, since each agent is parity-tested
@@ -1312,13 +1315,13 @@ against its Python original independently and the dependency graph is a clean tr
 
 ---
 
-## 10. Step 7 — a neural policy (design)
+## 10. Step 7 — a neural policy: architecture and runtime (M9)
 
 Target hardware: RTX 3080 Ti (GA102, 12 GB, ~68 TFLOP/s fp16 tensor with fp32
 accumulate, ~20 TFLOP/s realistically achievable on our shapes) plus the 5600X
 already driving the engine. CUDA 12.6 is installed.
 
-### 10.1 Scope: policy-only, no search
+### 10.1 Scope: policy-only, no search, and no training
 
 The first network replaces an agent's decision functions with a learned policy.
 No MCTS. That is a deliberate ordering, not timidity:
@@ -1335,6 +1338,19 @@ No MCTS. That is a deliberate ordering, not timidity:
   improve by training rather than by hand-editing heuristics.
 
 Search comes after this works.
+
+**M9 ends with a runnable agent on RANDOM WEIGHTS.** Training is M10 (§12), and
+splitting them that way is deliberate: it means the whole runtime - resumable
+driver, encoder, batching, inference - is finished and *speed-benchmarked*
+before any question of strength is on the table. A net that is too slow is a
+design problem, and it is much cheaper to discover it against untrained weights
+than halfway through a training run. The M9 exit criterion is a number:
+`oo_run --agent neural` reporting games/s.
+
+**All nine decisions get a network.** Decided - no heuristic fallbacks for the
+low-stakes ones. That is ~1 420 evaluations per game (§10.10) rather than the
+~1 020 a movement/cavalry/buy-only net would need, and the extra ~40 % is
+accepted so that no part of play is left outside the policy.
 
 ### 10.2 Why a transformer, and why the usual argument is the weak one
 
@@ -1363,11 +1379,25 @@ only 19%**. A 128-channel hex-conv residual block is 77.6 MFLOP. So:
 n is small enough that the quadratic term never dominates — 19% of the layer at
 r7, 23% at r8, 31% at r10.
 
-### 10.3 Multi-size is a requirement
+### 10.3 Multi-size, over radii 5-8
 
-Decided: **one network across radii 1–8 and 1–10 factions**, not a net per
+Decided: **one network across radii 5-8 and 1-10 factions**, not a net per
 configuration. `oo_run` exposes radius and faction count as first-class knobs
 and an agent that only works at r7/f8 would quietly retire them.
+
+**Radii 1-4 are out of scope**, and that is a narrowing of an earlier decision.
+Small boards are not merely smaller, they are a different game: measured on the
+current engine at f8, r5 runs 23.3 turns/game against r8's 14.1, and r3 ran 83.8
+with more than a third of games hitting the turn cap. Including r3 would spend
+capacity teaching the net a game nobody plays. The surviving 5-8 range is a 1.65x
+spread rather than a 6x one.
+
+| radius | hexes | tokens | max hex distance | turns/game (greedy, f8) |
+|---|---:|---:|---:|---:|
+| 5 | 91 | 102 | 10 | 23.3 |
+| 6 | 127 | 138 | 12 | 16.7 |
+| 7 | 169 | 180 | 14 | 14.9 |
+| 8 | 217 | 228 | 16 | 14.1 |
 
 This costs roughly 15% throughput (padding waste, masking) and buys a single net
 trainable on pooled data from every configuration — worth it given how cheaply
@@ -1383,14 +1413,12 @@ so, each of which has a fixed-size alternative that would have been simpler:
    than being a fixed 1015 logits.
 3. **Faction tokens with masking** (§10.4), sized `MAX_FACTIONS`, not 8.
 
-**The game is not scale-invariant, though, and that is a separate problem.**
-Measured turn counts: r3 = 83.8 turns/game with 19/40 hitting the 100-turn cap,
-r5 = 23.3, r7 = 16.0, r8 = 14.9. A radius-3 game is a different game — dense,
-all contact, VP accrual barely outrunning the cap. A size-agnostic architecture
-will happily run on both and play one of them badly. So `radius`, `num_hexes`
-and `num_factions` are fed explicitly into the CLS token, and training must mix
-the sizes we care about. Conditioning is cheap; assuming invariance is the
-mistake.
+**The game is still not scale-invariant inside 5-8**, so conditioning stays.
+23.3 turns at r5 against 14.1 at r8 means a materially different pace: VP accrue
+over more turns, contact comes later, and an outpost is worth a different
+fraction of the board. `radius`, `num_hexes` and `num_factions` are fed
+explicitly into the CLS token, and training mixes all four sizes. Conditioning
+is cheap; assuming invariance is the mistake, even over a narrow range.
 
 ### 10.4 Token encoding
 
@@ -1474,9 +1502,10 @@ lookup we have already paid for.
 **Bucket logarithmically** — `{0, 1, 2, 3, 4, 5, 6-7, 8-11, 12+}`, 9 buckets.
 Two reasons, and the second is the one that matters:
 
-- Max hex distance is `2 x radius`: 14 at r7, 16 at r8, 20 at r10. Train at r7
-  and play at r8 and the un-bucketed bins 15–16 are untrained noise. Bucketing
-  makes far-apart hexes share a bin, so distances never seen still work.
+- Max hex distance is `2 x radius`: 10 at r5 through 16 at r8. Training on a
+  mix of sizes covers all of those, but bucketing still earns its place - the
+  far bins would otherwise be trained almost entirely by r8 games, since only
+  the largest boards ever produce distances above 10.
 - It is 9 parameters per head instead of 21, which is a rounding error either
   way, but the prior is better: the model should care a lot about the difference
   between distance 1 and 2, and almost nothing about 15 vs 16.
@@ -1580,8 +1609,12 @@ batch at one size:
 | board | tokens | MFLOP/layer @ d=128 | padded to r8 |
 |---|---:|---:|---:|
 | r5 | 102 | 45.4 | 116.3 (2.6x waste) |
+| r6 | 138 | 62.0 | 116.3 (1.9x) |
 | r7 | 180 | 87.4 | 116.3 (1.3x) |
 | r8 | 228 | 116.3 | — |
+
+r8 is the largest supported board (§10.3), so it is also the padding target for
+an unbucketed batch - and r5 costs 2.6x more that way than it needs to.
 
 **Send bytes, not planes.** A ~55-plane fp16 encoding is 11.8 KB/position; at
 batch 1024 that is 12 MB per batch, 0.48 ms over PCIe 4.0 — which caps
@@ -1628,8 +1661,8 @@ The network is the easy part. This is the milestone's real cost:
 
 ### 10.10 Sizes and expected throughput
 
-Evaluations per game, at r7/f8 with the net making *every* decision (15.9
-turns/game measured):
+Evaluations per game, at r7/f8 with the net making *every* decision - which is
+the decision (§10.1). Measured 14.9 turns/game on the current engine:
 
 | decision | evals/game |
 |---|---:|
@@ -1642,10 +1675,9 @@ turns/game measured):
 | **total** | **~1 420** |
 
 That is 2.2x the 636 decisions tactician searches, because tactician only
-searches movement and cavalry. **Worth considering: leave the low-stakes
-decisions to heuristics.** Dropping resource choice (a binary iron/fish pick) to
-the existing greedy rule saves ~18% of all evaluations for almost no strategic
-loss.
+searches movement and cavalry. Leaving the low-stakes decisions (resource choice
+is a binary iron/fish pick) to heuristics would save ~18 % of all evaluations,
+and was considered and rejected: nothing should sit outside the policy.
 
 At ~20 TFLOP/s effective, r7/f8, ~1 420 evals/game:
 
@@ -1668,62 +1700,20 @@ place Python is hard to avoid; recommendation is a single offline trainer script
 kept physically outside `engine/`, since the constraint that matters is the
 *engine* not depending on Python, not the research tooling.
 
-### 10.11 Training
+### 10.11 Open questions
 
-**Stage 1 — behaviour cloning.** Log `(state, legal mask, chosen action)` from
-tactician self-play; train cross-entropy on the chosen action, plus the value
-head on final VP. This validates the entire pipeline against a known-good
-teacher and yields an agent that should approach tactician's strength at a
-fraction of its per-decision search.
-
-**Stage 2 — policy improvement.** Self-play with the trained policy, keeping
-what wins. Without search this is closer to iterated behaviour cloning / league
-play than to AlphaZero, and it is where search would take over.
-
-**D6 augmentation: don't bother.** The hex board has 12-fold symmetry (6
-rotations x reflection), so any training example `(S, A)` yields 11 more as
-`(g.S, g.A)` — two permutation tables, hex index and direction index, both
-cheap for `HexGrid` to precompute. AlphaGo used the square board's 8-fold
-symmetry exactly this way.
-
-It is not worth it here, for a reason specific to this project: **augmentation
-stretches scarce data, and our data is not scarce.** The engine generates 5 732
-greedy and 344 tactician games/s. Twelve rotations of one game carry strictly
-less information than twelve fresh games, which bring new terrain, new openings
-and new positions. Generate more games instead.
-
-There is also a second-order wrinkle worth recording, because it will show up
-in metrics whether or not augmentation is used. The teacher's tie-breaks are
-enumeration-order artifacts: tactician keeps the first maximum
-(`score > best_score`, strict), and candidate order comes from hex and
-direction index order — the same reason the port needed `std::stable_sort` and
-`std::min_element` throughout (§4). Rotate the board and the index order
-changes, so a *different* one of several equally-scored moves comes first.
-`g.A` is therefore still a tied-optimal move, just not the one the teacher
-would have picked. Consequences:
-
-- "Top-1 agreement with tactician" reads lower than the policy deserves on
-  tied positions. Do not read that as weakness.
-- Hard cross-entropy cannot reach zero on ties; the net learns to spread mass
-  across tied moves, which is arguably better play than cloning an index-order
-  artifact.
-
-The symmetry remains useful in two other forms: as an architectural prior (an
-equivariant trunk gets it for free rather than learning it), and as test-time
-augmentation — average the policy over all 12 rotations for a smoother output,
-at 12x inference cost.
-
-### 10.12 Open questions
-
-- **Which decisions get a network at all.** Full coverage is ~1 420 evals/game;
-  movement + cavalry + buy only is ~1 020. Recommend starting narrow and
-  widening once each head is shown to beat its heuristic.
-- **Board-size curriculum.** Train on pooled r5–r8, or start at r7 and widen?
-  Pooled is more honest but slower to converge; r3 in particular is nearly a
-  different game and may deserve exclusion rather than inclusion.
-- **`decide_play_cards` / `decide_trade`** (§9) — if action cards ever land, the
-  buy head's autoregressive set-decode is the natural template, which is a
-  further argument for building it that way rather than as a fixed-width head.
+- ~~**Which decisions get a network at all?**~~ **Resolved: all nine.** ~1 420
+  evaluations per game rather than ~1 020 for a movement/cavalry/buy-only net;
+  the extra ~40 % is accepted so no part of play sits outside the policy.
+- ~~**Board-size curriculum.**~~ **Resolved: r5-r8, pooled, exclusively** (§10.3).
+  r1-r4 are out of scope entirely - r3 runs 83.8 turns/game against r8's 14.1
+  and is effectively a different game.
+- ~~**`decide_play_cards` / `decide_trade`.**~~ **Resolved: cards are out of
+  scope** (§9). The no-op hook stays because it costs nothing.
+- **Still open — the encoder is not frozen until M9 ships.** Every field in
+  §10.4 is a guess until a net trains on it. Expect at least one revision, and
+  note that changing it invalidates checkpoints (§12.4), which is survivable
+  during M9 and expensive during M10.
 
 ---
 
@@ -1849,3 +1839,115 @@ It is not as free as it looks. `state_io` serialized an `ALIVE` row into the
 canonical state format, so every state-bearing golden file carried one — which
 is why this waited for a window where the corpus was being regenerated anyway.
 
+---
+
+## 12. Step 8 — training the policy (M10)
+
+M9 (§10) ends with a runnable net on random weights and a games/s number. This
+section is everything that makes it *good*. Split from M9 deliberately: the
+runtime is a systems problem with a measurable exit criterion, training is an
+open-ended research problem, and mixing them means never knowing which one is
+failing.
+
+Three phases, in order. Each has an exit criterion, because "the loss went down"
+is not evidence of anything.
+
+### 12.1 M10a — the evaluation harness (first, before any training)
+
+Nothing currently answers *is this agent stronger?* `oo_tournament` plays
+scripted agents but reports no uncertainty, and a win rate over 40 games is
+mostly noise.
+
+Needs:
+
+- **Head-to-head with a confidence interval.** N games, one agent against
+  another, reporting win rate with a Wilson interval. Distinguishing a 52 %
+  agent from a 50 % one needs on the order of 10 000 games - trivial at
+  6 086 games/s for scripted agents, and the reason the harness must batch and
+  thread the same way self-play does.
+- **Seat rotation on by default.** Seat win rates ranged 9-19 % among identical
+  agents in a 3-tactician / 5-greedy run (§6.8a), so an unrotated comparison
+  measures placement luck. `--rotate` already exists in `oo_run`.
+- **Paired seeds.** Run both agents through the *same* seed set rather than
+  independent ones; the variance reduction is large and free.
+- **A fixed benchmark ladder** - `random`, `greedy`, `marshal`, `tactician` -
+  so successive checkpoints are comparable to each other, not just to whatever
+  they last played.
+
+Exit criterion: reproduces the known ordering of the scripted agents with
+non-overlapping intervals.
+
+**Build this before the first training run, not after.** Without it a training
+loop produces checkpoints nobody can rank, and the temptation is to trust the
+loss curve, which measures agreement with the teacher rather than strength.
+
+### 12.2 M10b — imitate tactician (behaviour cloning)
+
+Supervised, on data the engine generates for free.
+
+- **Data.** Log `(state, legal mask, chosen action)` for all nine decision types
+  from tactician self-play across r5-r8 and a spread of faction counts. At
+  ~1 420 decisions/game and 323 tactician games/s (12 threads), an overnight run
+  is order 10^8 decisions - far more than a ~1M-parameter net needs.
+- **Loss.** Cross-entropy on the chosen action, masked to legal, plus the value
+  head on final VP as an auxiliary. The value head earns its place here even
+  though nothing reads it yet (§10.6).
+- **Watch for:** top-1 agreement will *understate* quality wherever tactician's
+  choice was an arbitrary tie-break between equally-scored moves (§12.4). Judge
+  by the harness, not by agreement.
+
+Exit criterion: beats `marshal` head-to-head, and comes within a stated margin
+of `tactician` - at a fraction of its per-decision cost, since one forward pass
+replaces a rollout over every candidate.
+
+This phase is really a test of the M9 pipeline. If cloning cannot reach a
+teacher it has unlimited data for, something is wrong in the encoder, the
+masking, or the heads - not in the training.
+
+### 12.3 M10c — self-play
+
+Only after cloning works.
+
+Without search this is closer to iterated behaviour cloning or league play than
+to AlphaZero: generate games with the current policy, keep what wins, retrain,
+repeat. The obvious failure is a policy that beats its immediate predecessor
+while losing to an older one, so keep a **league** of past checkpoints in the
+ladder rather than only the latest.
+
+This is where search (a later §13) would take over, and where the value head
+starts doing real work.
+
+### 12.4 Notes that apply throughout
+
+**D6 augmentation: don't.** The hex board has 12-fold symmetry, so every
+example yields 11 more, and `HexGrid` could precompute the permutations
+cheaply. It is not worth it here for a reason specific to this project:
+augmentation stretches scarce data, and our data is not scarce. Twelve rotations
+of one game carry less information than twelve fresh games, which bring new
+terrain and new openings.
+
+There is a second-order wrinkle worth recording, because it shows up in metrics
+either way. Tactician keeps the first maximum (`score > best_score`, strict) and
+candidate order comes from hex and direction index order - the same reason the
+port needed `std::stable_sort` and `std::min_element` throughout. Rotate the
+board and a different one of several equally-scored moves comes first. So a
+rotated label is still a tied-optimal move, just not the one the teacher picked:
+top-1 agreement reads low on tied positions, and hard cross-entropy cannot reach
+zero there. The net learns to spread mass across tied moves, which is arguably
+better play than cloning an index-order artifact.
+
+The symmetry stays useful in two other forms: as an architectural prior (an
+equivariant trunk gets it free), and as test-time augmentation - average the
+policy over all 12 rotations for a smoother output at 12x inference cost.
+
+**Checkpoint versioning.** Stamp the encoder version, action-space shape, and
+supported radius range into every checkpoint, and have inference refuse to load
+on mismatch. Ten lines, and it prevents the confusing failure where an old
+checkpoint loads against a changed encoder and plays like noise. The M8b window
+closed precisely so these could stop moving - but the encoder itself will move
+during M9.
+
+**Where Python lives.** Training is the one place it is hard to avoid, and the
+recommendation is a single offline trainer kept physically outside `engine/`.
+§1.2's constraint is that the *engine* has no Python at build or run time, which
+a separate trainer does not violate. Inference stays C++ (TensorRT or LibTorch).
