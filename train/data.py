@@ -86,16 +86,25 @@ class SampleFile(Dataset):
         self.info = read_info(path)
         self._open()
 
-        # The header is the first 16 bytes of every record, so kind and outcome
-        # can be read for the whole file in one vectorised pass - filtering by
-        # kind never touches the position payload. These are COPIES, not views,
-        # so they survive being sent to a worker process.
-        heads = self.mm[:, :SAMPLE_HEADER_BYTES]
-        self.kind = np.asarray(heads[:, 0]).copy()
-        self.faction = np.asarray(heads[:, 3]).astype(np.int8).copy()
-        self.final_vp = np.asarray(heads[:, 4:6]).copy().view(np.int16).reshape(-1)
-        self.max_vp = np.asarray(heads[:, 6:8]).copy().view(np.int16).reshape(-1)
-        self.won = np.asarray(heads[:, 2]).copy()
+        # The header is the first 16 bytes of every record. MATERIALISE IT ONCE:
+        # every column here is a strided read across the entire file, so pulling
+        # the five fields out of the memmap separately meant five full passes -
+        # 160 GB of reads on a 32 GB file, which looked like a hang rather than
+        # slowness. One contiguous copy is 16 bytes x records (168 MB at 10.5M)
+        # and everything else comes out of RAM.
+        #
+        # These are also COPIES rather than views so they survive being pickled
+        # into a spawned worker.
+        heads = np.empty((self.info.num_records, SAMPLE_HEADER_BYTES), dtype=np.uint8)
+        chunk = 1 << 20
+        for start in range(0, self.info.num_records, chunk):
+            end = min(start + chunk, self.info.num_records)
+            heads[start:end] = self.mm[start:end, :SAMPLE_HEADER_BYTES]
+        self.kind = heads[:, 0].copy()
+        self.faction = heads[:, 3].astype(np.int8)
+        self.final_vp = heads[:, 4:6].copy().view(np.int16).reshape(-1)
+        self.max_vp = heads[:, 6:8].copy().view(np.int16).reshape(-1)
+        self.won = heads[:, 2].copy()
 
         if kinds is None:
             self.index = np.arange(self.info.num_records, dtype=np.int64)

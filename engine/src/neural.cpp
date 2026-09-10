@@ -32,9 +32,13 @@ namespace F = torch::nn::functional;
 // between them does not raise, it just feeds the net misaligned inputs.
 constexpr int kPosBytes = static_cast<int>(sizeof(EncodedPosition));
 
-// How many extra copies of each repeatable buy action to propose. 32 covers
-// `gold / kInfantryCost` with starting gold 50, and the engine drops the rest.
-constexpr int kBuyRepeatPasses = 32;
+// How many extra copies of each repeatable buy action to propose. Capitals are
+// exempt from the per-turn recruit cap (buy.cpp), so the real limit is gold, and
+// gold accumulates over a game - 32 was enough for the starting 50 but would
+// quietly cap a rich late-game turn. The engine drops every surplus action, so
+// over-proposing costs a little list-building and nothing else; under-proposing
+// silently leaves money unspent.
+constexpr int kBuyRepeatPasses = 128;
 
 // Per-token feature widths after expansion (§10.4).
 constexpr int kHexFeatures = 54;

@@ -37,8 +37,9 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from data import (KIND_HEAD, KIND_NAMES, MULTI_LABEL_KINDS, SampleFile, action_bits,
-                  unpack_bits)
+from data import (KIND_BUY, KIND_HEAD, KIND_NAMES, MULTI_LABEL_KINDS, SampleFile,
+                  action_bits, unpack_bits)
+from model import BUY_VARIANTS
 from model import Policy
 
 
@@ -111,6 +112,66 @@ def collate(batch):
     }
 
 
+def buy_variant_weights(ds, idx, sample=60000):
+    """Per-variant positive weights for the buy BCE.
+
+    The buy label is dominated by two variants - buy_infantry and
+    convert_to_archers are ~78 % of everything the teacher picks - while the
+    three upgrades are under 2 % between them. Unweighted BCE learns to predict
+    "no" for the rare ones and takes the accuracy: measured recall after the
+    first run was 11 % for barracks and 0 % for workshop and temple.
+
+    That matters more than the frequency suggests. A barracks lifts the
+    per-turn recruit cap on an outpost, and a temple generates victory points
+    every round - and victory points are the entire win condition. Weighting by
+    inverse square-root frequency lifts the rare classes without letting ten
+    temple examples dominate the gradient.
+    """
+    import numpy as np
+    from data import KIND_BUY
+
+    # Vectorised: a Python loop over ten million indices with two numpy scalar
+    # lookups each is minutes of pure interpreter overhead.
+    sel = np.asarray(idx, dtype=np.int64)
+    rows_all = ds.index[sel]
+    buy_rows = rows_all[ds.kind[rows_all] == KIND_BUY]
+    if buy_rows.size == 0:
+        return None
+    rng = np.random.default_rng(0)
+    if buy_rows.size > sample:
+        buy_rows = rng.choice(buy_rows, size=sample, replace=False)
+
+    pos = np.zeros(BUY_VARIANTS, dtype=np.int64)
+    legal = np.zeros(BUY_VARIANTS, dtype=np.int64)
+    bits = action_bits(KIND_BUY, ds.info.num_hexes, ds.info.num_factions)
+    # Slice the mask columns out of the memmap in BULK. Reading 60k samples one
+    # at a time through __getitem__ meant 60k scattered reads over a 32 GB file
+    # and took longer than an epoch; sorting the row ids first also keeps the
+    # access roughly sequential.
+    rows = np.sort(buy_rows)
+    lo, mid = ds._pos_end, ds._legal_end
+    for start in range(0, len(rows), 8192):
+        r = rows[start:start + 8192]
+        block = np.asarray(ds.mm[r, lo:])
+        lg = np.unpackbits(block[:, :ds.info.mask_bytes], axis=1, bitorder="little")[:, :bits]
+        ch = np.unpackbits(block[:, ds.info.mask_bytes:], axis=1, bitorder="little")[:, :bits]
+        for v in range(BUY_VARIANTS):
+            pos[v] += int(ch[:, v::BUY_VARIANTS].sum())
+            legal[v] += int(lg[:, v::BUY_VARIANTS].sum())
+
+    rate = np.where(legal > 0, pos / np.maximum(legal, 1), 0.0)
+    # Reference is the most common variant, so weights are >= 1 and the common
+    # classes keep their current effective learning rate.
+    ref = rate.max() if rate.max() > 0 else 1.0
+    w = np.where(rate > 0, np.sqrt(ref / np.maximum(rate, 1e-9)), 1.0)
+    w = np.clip(w, 1.0, 20.0)
+    print("  buy variant weights (rate -> weight):")
+    for v in range(BUY_VARIANTS):
+        if legal[v]:
+            print(f"    variant {v}: chosen {rate[v]*100:5.1f}% of legal -> x{w[v]:.1f}")
+    return torch.tensor(w, dtype=torch.float32)
+
+
 def query_hex_of(pos: torch.Tensor, num_hexes: int, hex_off: int) -> torch.Tensor:
     """Recovers the query hex from the encoded record's kHexQuery flag (bit 4).
 
@@ -140,6 +201,9 @@ def main():
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--cpu", action="store_true")
     ap.add_argument("--limit", type=int, default=0, help="cap samples, for a quick run")
+    ap.add_argument("--balance-buy", action="store_true", default=True,
+                    help="weight rare buy variants (upgrades) in the loss")
+    ap.add_argument("--no-balance-buy", dest="balance_buy", action="store_false")
     args = ap.parse_args()
 
     device = torch.device("cpu" if args.cpu or not torch.cuda.is_available() else "cuda")
@@ -176,6 +240,10 @@ def main():
     params = sum(p.numel() for p in net.parameters())
     print(f"model: d={args.d_model} x{args.blocks} blocks, {params/1000:.0f}k params, "
           f"{net.tokens} tokens")
+
+    buy_w = buy_variant_weights(ds, train_idx) if args.balance_buy else None
+    if buy_w is not None:
+        buy_w = buy_w.to(device)
 
     opt = torch.optim.AdamW(net.parameters(), lr=args.lr, weight_decay=0.01)
     steps = args.epochs * max(1, len(train_dl))
@@ -226,8 +294,15 @@ def main():
                     masked = head.masked_fill(legal < 0.5, float("-inf"))
                     if kind in MULTI_LABEL_KINDS:
                         # Set-valued: independent Bernoulli per legal action.
+                        w = legal
+                        if kind == KIND_BUY and buy_w is not None:
+                            # Upweight a POSITIVE example of a rare variant. Only
+                            # the positives: upweighting its negatives too would
+                            # just make the class louder, not more likely.
+                            tile = buy_w.repeat(head.shape[1] // BUY_VARIANTS)
+                            w = legal * (1.0 + (tile - 1.0) * chosen)
                         loss = F.binary_cross_entropy_with_logits(
-                            head, chosen, weight=legal, reduction="sum") / legal.sum().clamp(min=1)
+                            head, chosen, weight=w, reduction="sum") / w.sum().clamp(min=1)
                         correct = ((head > 0).float() * legal == chosen * legal).all(1).sum()
                     else:
                         tgt = chosen.argmax(1)
