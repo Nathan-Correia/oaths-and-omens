@@ -32,6 +32,10 @@ namespace F = torch::nn::functional;
 // between them does not raise, it just feeds the net misaligned inputs.
 constexpr int kPosBytes = static_cast<int>(sizeof(EncodedPosition));
 
+// How many extra copies of each repeatable buy action to propose. 32 covers
+// `gold / kInfantryCost` with starting gold 50, and the engine drops the rest.
+constexpr int kBuyRepeatPasses = 32;
+
 // Per-token feature widths after expansion (§10.4).
 constexpr int kHexFeatures = 54;
 constexpr int kFactionFeatures = 15;  // active, is_me, outposts, 3 units, settle, gold, 4 resources, vp, kill_xp, vp_behind
@@ -349,10 +353,43 @@ void TorchPolicy::evaluate_impl(const DecisionRequest* requests, DecisionAnswer*
                 }
                 std::stable_sort(scored.begin(), scored.end(),
                                  [](const Scored& p, const Scored& q) { return p.score > q.score; });
+                int n_selected = 0;
                 for (const Scored& sc : scored) {
                     if (sc.score <= 0.0f) break;
                     if (a.buy->size() >= kMaxChosenBuy) break;
                     a.buy->push_back((*r.legal_buy)[sc.index]);
+                    ++n_selected;
+                }
+
+                // REPEAT the repeatable picks until the budget stops them.
+                //
+                // The teacher buys `gold / kInfantryCost` infantry - 25 of them
+                // on turn one - by pushing the same action over and over. The
+                // training label is a bitmask with one bit per (hex, variant),
+                // so all 25 collapse into one bit and the net is taught "buy
+                // infantry here" ONCE. Emitting each cell once then made it
+                // structurally impossible to buy more than one unit per city per
+                // turn, which starved it of units. Measured: with buy handed to
+                // the teacher instead, win rate against greedy went 18% -> 69%.
+                //
+                // Repeating is safe because apply_one validates every action and
+                // silently skips what cannot be afforded (buy.cpp), so the
+                // engine - not this decoder - decides where the money runs out.
+                // Only infantry and conversions repeat; the per-turn cap allows
+                // just one outpost or upgrade action anyway.
+                for (int pass = 0; pass < kBuyRepeatPasses && n_selected > 0; ++pass) {
+                    bool appended = false;
+                    for (int k = 0; k < n_selected; ++k) {
+                        const BuyAction& act = (*a.buy)[k];
+                        if (act.type != BuyType::kBuyInfantry &&
+                            act.type != BuyType::kConvertToSpecial) {
+                            continue;
+                        }
+                        if (a.buy->size() >= kMaxChosenBuy) break;
+                        a.buy->push_back(act);
+                        appended = true;
+                    }
+                    if (!appended) break;
                 }
                 break;
             }

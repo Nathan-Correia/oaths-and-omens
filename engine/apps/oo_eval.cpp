@@ -52,7 +52,24 @@ void usage() {
                  "  --seed N          base seed (default 1)\n"
                  "  --max-turns N     safety cap (default 100)\n"
                  "  --in-flight N     games in flight when a side is neural (default 256)\n"
-                 "  --threads N       threads when both sides are scripted\n");
+                 "  --threads N       threads when both sides are scripted\n"
+                 "  --a-fallback K,K  ABLATION: side A uses a scripted agent for these\n"
+                 "                    decision kinds (buy, movement, cavalry, target,\n"
+                 "                    rectification, resource, placement, draft, swap)\n"
+                 "  --a-fallback-agent NAME   which agent that is (default tactician)\n");
+}
+
+std::vector<std::string> split_commas(const std::string& in) {
+    std::vector<std::string> out;
+    size_t start = 0;
+    while (start <= in.size()) {
+        const size_t c = in.find(',', start);
+        const size_t end = c == std::string::npos ? in.size() : c;
+        if (end > start) out.push_back(in.substr(start, end - start));
+        if (c == std::string::npos) break;
+        start = c + 1;
+    }
+    return out;
 }
 
 // Wilson score interval. Correct near 0 and 1, where the textbook
@@ -123,11 +140,62 @@ private:
     bool a_seats_[MAX_FACTIONS] = {};
 };
 
+// Routes by decision KIND rather than by seat: side A plays the network for
+// every kind EXCEPT the listed ones, which fall back to a scripted agent.
+//
+// This is an ablation, not a way to play. It answers "if this head were
+// perfect, how much strength would we gain?", which is the only way to know
+// which head is actually costing games - agreement percentages cannot say,
+// because a head can disagree constantly and cost nothing (the teacher's buy
+// targeting is a coin flip) or agree mostly and cost a lot.
+class KindFallbackPolicy : public BatchedPolicy {
+public:
+    KindFallbackPolicy(BatchedPolicy* net, BatchedPolicy* scripted, const bool* fallback)
+        : net_(net), scripted_(scripted) {
+        for (int k = 0; k < kNumDecisionKinds; ++k) fallback_[k] = fallback[k];
+    }
+
+    void on_game_start(const GameState* s, int i) override {
+        net_->on_game_start(s, i);
+        scripted_->on_game_start(s, i);
+    }
+    void on_game_end(const GameState* s) override {
+        net_->on_game_end(s);
+        scripted_->on_game_end(s);
+    }
+
+    void evaluate(const DecisionRequest* reqs, DecisionAnswer* ans, int n) override {
+        std::vector<DecisionRequest> rn, rs;
+        std::vector<DecisionAnswer> an, as;
+        std::vector<int> in, is;
+        for (int i = 0; i < n; ++i) {
+            if (fallback_[static_cast<int>(reqs[i].kind)]) {
+                rs.push_back(reqs[i]); as.push_back(ans[i]); is.push_back(i);
+            } else {
+                rn.push_back(reqs[i]); an.push_back(ans[i]); in.push_back(i);
+            }
+        }
+        if (!rn.empty()) net_->evaluate(rn.data(), an.data(), int(rn.size()));
+        if (!rs.empty()) scripted_->evaluate(rs.data(), as.data(), int(rs.size()));
+        for (size_t k = 0; k < in.size(); ++k) ans[in[k]] = an[k];
+        for (size_t k = 0; k < is.size(); ++k) ans[is[k]] = as[k];
+    }
+
+private:
+    BatchedPolicy* net_;
+    BatchedPolicy* scripted_;
+    bool fallback_[kNumDecisionKinds] = {};
+};
+
 struct Side {
     std::string name;
     std::string weights;
     bool neural = false;
     AgentKind kind = AgentKind::kRandom;
+    // Ablation: decision kinds this side hands back to a scripted agent.
+    bool fallback[kNumDecisionKinds] = {};
+    bool any_fallback = false;
+    AgentKind fallback_kind = AgentKind::kTactician;
 };
 
 bool parse_side(const std::string& name, const std::string& weights, Side& out) {
@@ -209,7 +277,28 @@ Result play_matchup(const Side& a, const Side& b, const RunConfig& cfg, long lon
             if (!net_b) { ok = false; return r; }
         }
 
+        // For an ablation, A's fallback kinds are answered by a scripted agent
+        // sitting in A's OWN seats - so it is the same faction, with the same
+        // history, just a different brain for those decisions.
+        std::vector<GameSpec> fb_specs;
+        std::unique_ptr<ScriptedPolicy> fb;
+        std::unique_ptr<KindFallbackPolicy> hybrid;
+        if (a.neural && a.any_fallback) {
+            fb_specs = specs;
+            for (int g = 0; g < pairs; ++g) {
+                for (int f = 0; f < nf; ++f) {
+                    if (a_seats[f]) fb_specs[static_cast<size_t>(g)].seats[f] = a.fallback_kind;
+                }
+            }
+            fb = std::make_unique<ScriptedPolicy>(cfg, fb_specs.data(), pairs);
+            fb->set_seats(a_seats, nf);
+        }
+
         BatchedPolicy* pa = a.neural ? net_a.get() : &scripted;
+        if (fb) {
+            hybrid = std::make_unique<KindFallbackPolicy>(pa, fb.get(), a.fallback);
+            pa = hybrid.get();
+        }
         BatchedPolicy* pb = b.neural ? net_b.get() : &scripted;
         SplitPolicy split(pa, pb, a_seats, nf);
 
@@ -267,6 +356,7 @@ void report(const std::string& a_name, const std::string& b_name, const Result& 
 
 int main(int argc, char** argv) {
     std::string a_name = "tactician", b_name = "marshal", a_weights, b_weights;
+    std::string fallback_kinds, fallback_agent = "tactician";
     int pairs = 500, radius = 7, factions = 8, max_turns = 100, in_flight = 256, threads = 0;
     long long base_seed = 1;
     bool ladder = false;
@@ -278,6 +368,8 @@ int main(int argc, char** argv) {
         else if (s == "--b") b_name = next();
         else if (s == "--a-weights") a_weights = next();
         else if (s == "--b-weights") b_weights = next();
+        else if (s == "--a-fallback") fallback_kinds = next();
+        else if (s == "--a-fallback-agent") fallback_agent = next();
         else if (s == "--games") pairs = std::atoi(next().c_str());
         else if (s == "--ladder") ladder = true;
         else if (s == "--radius") radius = std::atoi(next().c_str());
@@ -300,6 +392,26 @@ int main(int argc, char** argv) {
 
     Side a;
     if (!parse_side(a_name, a_weights, a)) return 2;
+    if (!fallback_kinds.empty()) {
+        for (const std::string& k : split_commas(fallback_kinds)) {
+            int found = -1;
+            for (int i = 0; i < kNumDecisionKinds; ++i) {
+                if (k == decision_kind_name(static_cast<DecisionKind>(i))) found = i;
+            }
+            if (found < 0) {
+                std::fprintf(stderr, "unknown decision kind '%s'\n", k.c_str());
+                return 2;
+            }
+            a.fallback[found] = true;
+            a.any_fallback = true;
+        }
+        if (!agent_kind_from_name(fallback_agent.c_str(), a.fallback_kind)) {
+            std::fprintf(stderr, "unknown fallback agent '%s'\n", fallback_agent.c_str());
+            return 2;
+        }
+        std::printf("ABLATION: side A uses %s for [%s]\n", fallback_agent.c_str(),
+                    fallback_kinds.c_str());
+    }
 
     RunConfig cfg;
     cfg.radius = radius;
