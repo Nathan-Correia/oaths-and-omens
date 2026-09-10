@@ -351,8 +351,35 @@ void TorchPolicy::evaluate_impl(const DecisionRequest* requests, DecisionAnswer*
                     if (variant > 8) variant = 8;
                     scored.push_back({buy_at(i, act.hex, variant), k});
                 }
+                // Sort by TYPE first, score second.
+                //
+                // apply_buy_phase spends gold in list order, and an outpost is
+                // the only source of victory points in the game (collect.cpp:
+                // only non-capital cities score). Emitting in pure score order
+                // let infantry - 25 of them at 2 gold each - drain the treasury
+                // before the 3-gold outpost was ever attempted, so the policy
+                // could hold territory and still score nothing.
+                //
+                // The teacher orders the same way and for the same reason:
+                // greedy_buy_common pushes its one upgrade-or-outpost action
+                // before any infantry or conversions. Upgrades come before new
+                // outposts because only one of the two happens per turn, and
+                // improving ground already held beats founding more.
+                auto rank = [](BuyType t) {
+                    switch (t) {
+                        case BuyType::kUpgradeOutpost: return 0;
+                        case BuyType::kBuildOutpost: return 1;
+                        case BuyType::kBuyInfantry: return 2;
+                        default: return 3;  // conversions last
+                    }
+                };
                 std::stable_sort(scored.begin(), scored.end(),
-                                 [](const Scored& p, const Scored& q) { return p.score > q.score; });
+                                 [&](const Scored& p, const Scored& q) {
+                                     const int rp = rank((*r.legal_buy)[p.index].type);
+                                     const int rq = rank((*r.legal_buy)[q.index].type);
+                                     if (rp != rq) return rp < rq;
+                                     return p.score > q.score;
+                                 });
                 int n_selected = 0;
                 for (const Scored& sc : scored) {
                     if (sc.score <= 0.0f) break;
