@@ -84,18 +84,18 @@ class SampleFile(Dataset):
     def __init__(self, path, kinds=None):
         self.path = str(path)
         self.info = read_info(path)
-        self.mm = np.memmap(self.path, dtype=np.uint8, mode="r", offset=FILE_HEADER_BYTES,
-                            shape=(self.info.num_records, self.info.record_bytes))
+        self._open()
 
         # The header is the first 16 bytes of every record, so kind and outcome
         # can be read for the whole file in one vectorised pass - filtering by
-        # kind never touches the position payload.
+        # kind never touches the position payload. These are COPIES, not views,
+        # so they survive being sent to a worker process.
         heads = self.mm[:, :SAMPLE_HEADER_BYTES]
-        self.kind = np.asarray(heads[:, 0])
-        self.faction = np.asarray(heads[:, 3].astype(np.int8))
+        self.kind = np.asarray(heads[:, 0]).copy()
+        self.faction = np.asarray(heads[:, 3]).astype(np.int8).copy()
         self.final_vp = np.asarray(heads[:, 4:6]).copy().view(np.int16).reshape(-1)
         self.max_vp = np.asarray(heads[:, 6:8]).copy().view(np.int16).reshape(-1)
-        self.won = np.asarray(heads[:, 2])
+        self.won = np.asarray(heads[:, 2]).copy()
 
         if kinds is None:
             self.index = np.arange(self.info.num_records, dtype=np.int64)
@@ -105,6 +105,24 @@ class SampleFile(Dataset):
 
         self._pos_end = SAMPLE_HEADER_BYTES + self.info.position_bytes
         self._legal_end = self._pos_end + self.info.mask_bytes
+
+    def _open(self):
+        self.mm = np.memmap(self.path, dtype=np.uint8, mode="r", offset=FILE_HEADER_BYTES,
+                            shape=(self.info.num_records, self.info.record_bytes))
+
+    # DataLoader workers are SPAWNED on Windows, so the dataset is pickled into
+    # each one - and a memmap does not survive that (it fails with a truncated
+    # pickle, which does not point anywhere near the cause). Drop the handle on
+    # the way out and reopen it in the worker; the file is read-only, so every
+    # process mapping it independently is free.
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["mm"] = None
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._open()
 
     def __len__(self):
         return len(self.index)

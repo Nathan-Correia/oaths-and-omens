@@ -92,19 +92,23 @@ class Bar:
 
 
 def collate(batch):
-    """Groups a batch by decision kind - one head runs per group."""
-    by_kind = defaultdict(list)
-    for s in batch:
-        by_kind[s["kind"]].append(s)
-    out = {}
-    for kind, items in by_kind.items():
-        out[kind] = {
-            "pos": torch.stack([s["pos"] for s in items]),
-            "legal": torch.stack([s["legal"] for s in items]),
-            "chosen": torch.stack([s["chosen"] for s in items]),
-            "won": torch.tensor([s["won"] for s in items]),
-        }
-    return out
+    """One flat batch, plus the kind of each row.
+
+    Deliberately NOT grouped by kind. Grouping meant up to nine separate trunk
+    passes of ~28 rows each per batch of 256, and the trunk is essentially all
+    of the cost - the heads are a rounding error. Running the trunk once over
+    everything and selecting rows per head afterwards is the same computation
+    with one big GEMM instead of nine small ones. Measured 3.4x.
+
+    The masks are all the same width on disk, so they stack without padding.
+    """
+    return {
+        "pos": torch.stack([s["pos"] for s in batch]),
+        "legal": torch.stack([s["legal"] for s in batch]),
+        "chosen": torch.stack([s["chosen"] for s in batch]),
+        "won": torch.tensor([s["won"] for s in batch]),
+        "kind": torch.tensor([s["kind"] for s in batch], dtype=torch.long),
+    }
 
 
 def query_hex_of(pos: torch.Tensor, num_hexes: int, hex_off: int) -> torch.Tensor:
@@ -194,15 +198,28 @@ def main():
             batch_loss = 0.0
             batch_n = 0
             with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
-                for kind, g in groups.items():
-                    pos = g["pos"].to(device, non_blocking=True)
-                    qh = query_hex_of(pos, info.num_hexes, hex_off).to(device)
-                    outs = net(pos, qh)
-                    head = outs[KIND_HEAD[kind]]
+                pos = groups["pos"].to(device, non_blocking=True)
+                kinds = groups["kind"].to(device, non_blocking=True)
+                legal_b = groups["legal"].to(device, non_blocking=True)
+                chosen_b = groups["chosen"].to(device, non_blocking=True)
+                won = groups["won"].to(device, non_blocking=True)
+                qh = query_hex_of(pos, info.num_hexes, hex_off).to(device)
+
+                # ONE trunk pass for the whole batch; the heads then read the
+                # rows that belong to them.
+                outs = net(pos, qh)
+
+                # The value head applies to every row regardless of kind.
+                vloss = F.binary_cross_entropy_with_logits(outs["value"], won)
+
+                for kind in torch.unique(kinds).tolist():
+                    sel = (kinds == kind).nonzero(as_tuple=True)[0]
+                    if sel.numel() == 0:
+                        continue
                     bits = action_bits(kind, info.num_hexes, info.num_factions)
-                    head = head[:, :bits]
-                    legal = unpack_bits(g["legal"].to(device), bits)
-                    chosen = unpack_bits(g["chosen"].to(device), bits)
+                    head = outs[KIND_HEAD[kind]].index_select(0, sel)[:, :bits]
+                    legal = unpack_bits(legal_b.index_select(0, sel), bits)
+                    chosen = unpack_bits(chosen_b.index_select(0, sel), bits)
 
                     # -inf on illegal actions, so they can never win an argmax
                     # and contribute nothing to the softmax.
@@ -210,23 +227,21 @@ def main():
                     if kind in MULTI_LABEL_KINDS:
                         # Set-valued: independent Bernoulli per legal action.
                         loss = F.binary_cross_entropy_with_logits(
-                            head, chosen, weight=legal, reduction="sum") / max(1, legal.sum())
+                            head, chosen, weight=legal, reduction="sum") / legal.sum().clamp(min=1)
                         correct = ((head > 0).float() * legal == chosen * legal).all(1).sum()
                     else:
                         tgt = chosen.argmax(1)
                         loss = F.cross_entropy(masked, tgt)
                         correct = (masked.argmax(1) == tgt).sum()
 
-                    vloss = F.binary_cross_entropy_with_logits(
-                        outs["value"], g["won"].to(device))
-                    total = loss + args.value_weight * vloss
-                    k = pos.shape[0]
-                    batch_loss = batch_loss + total * k
+                    k = sel.numel()
+                    batch_loss = batch_loss + loss * k
                     batch_n += k
                     st = per_kind[kind]
                     st[0] += float(loss.detach()) * k
                     st[1] += int(correct)
                     st[2] += k
+                batch_loss = batch_loss + args.value_weight * vloss * max(1, batch_n)
             if batch_n == 0:
                 bar.update()
                 continue
