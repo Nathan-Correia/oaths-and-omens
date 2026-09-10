@@ -1250,8 +1250,8 @@ invariant every army mutation must preserve.
 | ~~M8~~ | ~~**Python removed**~~ | **done — zero `.py` files in the repo; no Python in `CMakeLists.txt` and none probed at configure time; 11/11 tests green and `oo_run` output unchanged (§1.2)** |
 | ~~M8b~~ | ~~Rules + cleanup window (§11)~~ | **done — auto-clamp (§11.1), xoshiro256++ (§3.4), `alive[]` dropped (§11.2); corpus reblessed via `tools/rewrite_goldens.ps1`, 11/11 green** |
 | ~~M9~~ | ~~Neural policy runtime (§10)~~ | **done — `oo_run --neural` plays full games on random weights: 27 225 evals/s, 9.3 games/s at r7/f8, d=128 x4, after three answer-preserving optimisations (§10.9)** |
-| M10a | Evaluation harness (§12.1) | head-to-head with confidence intervals, paired seeds, seat rotation, a fixed ladder. Before any training |
-| M10b | Imitate tactician (§12.2) | behaviour cloning on engine-generated data. **Exit: beats `marshal`, close to `tactician`** |
+| ~~M10a~~ | ~~Evaluation harness (§12.1)~~ | **done — `oo_eval`. Reproduces the known ordering with non-overlapping intervals, and a self-match lands on exactly 50.0 % (150-150), which is the paired mirror proving itself** |
+| M10b | Imitate tactician (§12.2) | data generation, trainer and TorchScript round-trip all working; **the training run itself is still to do.** Exit: beats `marshal`, close to `tactician` |
 | M10c | Self-play (§12.3) | league of past checkpoints; where search would later take over |
 
 M1–M4 are where nearly all the risk lives. M5 is mechanical. M6 is the largest

@@ -20,29 +20,24 @@
 namespace oo {
 
 struct NeuralConfig {
-    // Architecture (§10.10). d=128 x 4 blocks is the recommended starting point:
-    // ~0.9M parameters, and below d=128 tensor cores stop being efficient, so a
-    // smaller model buys far less speed than its FLOP count suggests.
-    int d_model = 128;
-    int n_blocks = 4;
-    int n_heads = 4;
-    int ffn_mult = 4;
-    int stem_layers = 2;  // hex-conv layers before the transformer (§10.6)
+    // A TorchScript module exported by train/export.py. REQUIRED - the network
+    // is defined in train/model.py and nowhere else, so the engine has no
+    // architecture to fall back on. For an untrained one:
+    //   python train/export.py --init --out checkpoints/init.ts --radius 7 --factions 8
+    std::string weights;
 
-    // The bucket this instance serves.
+    // The bucket this instance serves. Checked against the checkpoint's own
+    // stamped values, which is the difference between a clear refusal and a net
+    // that plays like noise.
     int radius = 7;
     int num_factions = 8;
 
     bool cuda = true;
     bool fp16 = true;
-
-    // Seed for weight initialisation. M9 runs on random weights; M10 loads real
-    // ones instead.
-    int64_t seed = 1;
 };
 
-// Number of parameters a config implies, without building it. Handy for
-// sanity-checking a size against §10.10's table before paying for the model.
+// Always 0 now: the architecture lives in train/model.py, so a parameter count
+// cannot be derived from a config. neural_describe reports the loaded module's.
 long long neural_param_count(const NeuralConfig& cfg);
 
 // Builds a policy with randomly initialised weights. Returns null and fills

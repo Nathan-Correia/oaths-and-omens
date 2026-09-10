@@ -112,6 +112,10 @@ endif()
 add_executable(oo_run apps/oo_run.cpp)
 target_link_libraries(oo_run PRIVATE oo_core oo_neural)
 
+# Head-to-head evaluation (M10a). Links oo_neural so a side can be a network.
+add_executable(oo_eval apps/oo_eval.cpp)
+target_link_libraries(oo_eval PRIVATE oo_core oo_neural)
+
 add_executable(oo_dump_training apps/oo_dump_training.cpp)
 target_link_libraries(oo_dump_training PRIVATE oo_core)
 
@@ -178,7 +182,7 @@ add_test(NAME movement_clamp COMMAND test_clamp)
 # print "skipping" and pass, so the suite has the same shape in both.
 add_executable(test_neural tests/test_neural.cpp)
 target_link_libraries(test_neural PRIVATE oo_core oo_neural)
-add_test(NAME neural_smoke COMMAND test_neural)
+add_test(NAME neural_smoke COMMAND test_neural ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/tiny_policy.ts)
 
 add_executable(test_encode tests/test_encode.cpp)
 target_link_libraries(test_encode PRIVATE oo_core)

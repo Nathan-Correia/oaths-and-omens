@@ -9,6 +9,7 @@
 #include "oo/encode.hpp"
 #include "oo/grid.hpp"
 
+#include <torch/script.h>
 #include <torch/torch.h>
 
 #include <algorithm>
@@ -24,13 +25,11 @@ namespace {
 
 namespace F = torch::nn::functional;
 
-// --- wire layout ------------------------------------------------------------
-// Byte offsets into EncodedPosition. Kept as constants next to the tensor code
-// that slices them, because a mismatch here produces a model that trains on
-// garbage without ever erroring.
-constexpr int kHeaderOff = 0;
-constexpr int kFactionOff = static_cast<int>(sizeof(HeaderRecord));
-constexpr int kHexOff = kFactionOff + static_cast<int>(sizeof(FactionRecord)) * MAX_FACTIONS;
+// The record the module consumes. Its LAYOUT is not described here any more -
+// train/model.py owns that, and the module we load does the expansion itself.
+// That is the point of loading TorchScript rather than rebuilding the network in
+// C++: there was previously a second definition of every feature, and a mismatch
+// between them does not raise, it just feeds the net misaligned inputs.
 constexpr int kPosBytes = static_cast<int>(sizeof(EncodedPosition));
 
 // Per-token feature widths after expansion (§10.4).
@@ -68,225 +67,6 @@ torch::Tensor bit(const torch::Tensor& v, int k) {
     return torch::bitwise_and(torch::bitwise_right_shift(v, k), 1);
 }
 
-// --- model ------------------------------------------------------------------
-
-struct BlockImpl : torch::nn::Module {
-    BlockImpl(int d, int heads, int ffn_mult)
-        : n_heads(heads),
-          head_dim(d / heads),
-          norm1(torch::nn::LayerNormOptions({d})),
-          norm2(torch::nn::LayerNormOptions({d})),
-          qkv(torch::nn::LinearOptions(d, 3 * d)),
-          proj(torch::nn::LinearOptions(d, d)),
-          fc1(torch::nn::LinearOptions(d, d * ffn_mult)),
-          fc2(torch::nn::LinearOptions(d * ffn_mult, d)) {
-        register_module("norm1", norm1);
-        register_module("norm2", norm2);
-        register_module("qkv", qkv);
-        register_module("proj", proj);
-        register_module("fc1", fc1);
-        register_module("fc2", fc2);
-    }
-
-    // `bias` is [heads, T, T], already gathered from the bucket table.
-    torch::Tensor forward(torch::Tensor x, const torch::Tensor& bias) {
-        const auto B = x.size(0);
-        const auto T = x.size(1);
-
-        // Pre-LN: normalise going in, add the residual raw. More stable to train
-        // than post-LN and the standard choice for a net this shallow.
-        auto h = norm1->forward(x);
-        auto q_k_v = qkv->forward(h).view({B, T, 3, n_heads, head_dim}).permute({2, 0, 3, 1, 4});
-        auto q = q_k_v[0], k = q_k_v[1], v = q_k_v[2];
-        // attn_mask as a FLOAT tensor is ADDED to the scores, which is exactly
-        // what a relative position bias is. (A bool mask would instead mean
-        // allowed/blocked, so passing the bias as one would silently threshold
-        // it.) This is the ATen op; there is no nn::functional wrapper.
-        auto attn = torch::scaled_dot_product_attention(q, k, v, bias.unsqueeze(0));
-        attn = attn.transpose(1, 2).reshape({B, T, n_heads * head_dim});
-        x = x + proj->forward(attn);
-
-        h = norm2->forward(x);
-        x = x + fc2->forward(F::gelu(fc1->forward(h)));
-        return x;
-    }
-
-    int n_heads, head_dim;
-    torch::nn::LayerNorm norm1, norm2;
-    torch::nn::Linear qkv, proj, fc1, fc2;
-};
-TORCH_MODULE(Block);
-
-struct NetImpl : torch::nn::Module {
-    NetImpl(const NeuralConfig& cfg, int n_hex)
-        : d(cfg.d_model),
-          nf(cfg.num_factions),
-          hexes(n_hex),
-          hex_in(torch::nn::LinearOptions(kHexFeatures, cfg.d_model)),
-          faction_in(torch::nn::LinearOptions(kFactionFeatures, cfg.d_model)),
-          header_in(torch::nn::LinearOptions(kHeaderFeatures, cfg.d_model)),
-          slot_emb(torch::nn::EmbeddingOptions(MAX_FACTIONS, cfg.d_model)),
-          head_move(torch::nn::LinearOptions(cfg.d_model, NUM_DIRECTIONS)),
-          head_pass(torch::nn::LinearOptions(cfg.d_model, 1)),
-          head_hex(torch::nn::LinearOptions(cfg.d_model, 1)),
-          head_buy(torch::nn::LinearOptions(cfg.d_model, 9)),
-          head_target(torch::nn::LinearOptions(cfg.d_model, 1)),
-          head_resource(torch::nn::LinearOptions(cfg.d_model, 2)),
-          head_swap(torch::nn::LinearOptions(cfg.d_model, 2)),
-          head_rect(torch::nn::LinearOptions(cfg.d_model, MAX_BATTLE_CONTRIB * NUM_UNIT_TYPES)),
-          head_value(torch::nn::LinearOptions(cfg.d_model, 1)) {
-        register_module("hex_in", hex_in);
-        register_module("faction_in", faction_in);
-        register_module("header_in", header_in);
-        register_module("slot_emb", slot_emb);
-        for (int i = 0; i < cfg.stem_layers; ++i) {
-            // The hex-conv stem: a 7-tap gather over the hex's own value and its
-            // six neighbours (§10.6). Cheap, and it means attention does not have
-            // to rediscover adjacency - which is what the movement action space
-            // is defined over.
-            auto layer = torch::nn::Linear(torch::nn::LinearOptions(cfg.d_model * 7, cfg.d_model));
-            register_module("stem" + std::to_string(i), layer);
-            stem.push_back(layer);
-        }
-        for (int i = 0; i < cfg.n_blocks; ++i) {
-            auto b = Block(cfg.d_model, cfg.n_heads, cfg.ffn_mult);
-            register_module("block" + std::to_string(i), b);
-            blocks.push_back(b);
-        }
-        bias_table = register_parameter("bias_table",
-                                        torch::zeros({cfg.n_heads, kNumBuckets}));
-        register_module("head_move", head_move);
-        register_module("head_pass", head_pass);
-        register_module("head_hex", head_hex);
-        register_module("head_buy", head_buy);
-        register_module("head_target", head_target);
-        register_module("head_resource", head_resource);
-        register_module("head_swap", head_swap);
-        register_module("head_rect", head_rect);
-        register_module("head_value", head_value);
-    }
-
-    // raw: [B, kPosBytes] uint8. Returns the token stream [B, T, d].
-    torch::Tensor embed(const torch::Tensor& raw) {
-        const auto B = raw.size(0);
-        auto i32 = raw.to(torch::kInt32);
-
-        // --- hex tokens ------------------------------------------------------
-        auto hx = i32.slice(1, kHexOff, kHexOff + 12 * MAX_HEXES)
-                      .view({B, MAX_HEXES, 12})
-                      .slice(1, 0, hexes);
-        auto terrain = hx.select(2, 0);
-        auto city = hx.select(2, 1);
-        auto city_flags = hx.select(2, 2);
-        auto army = hx.select(2, 3);
-        auto units = hx.slice(2, 4, 7).to(torch::kFloat32);
-        auto flags = hx.select(2, 7);
-        auto battle_round = hx.select(2, 8).to(torch::kFloat32);
-        auto battle_factions = hx.select(2, 10) + hx.select(2, 11) * 256;
-
-        std::vector<torch::Tensor> hf;
-        hf.push_back(F::one_hot(terrain.to(torch::kLong), NUM_TERRAIN_TYPES).to(torch::kFloat32));
-        for (int k = 0; k < 7; ++k) hf.push_back(bit(flags, k).to(torch::kFloat32).unsqueeze(-1));
-        hf.push_back(F::one_hot(city.to(torch::kLong), MAX_FACTIONS + 1).to(torch::kFloat32));
-        hf.push_back(bit(city_flags, 0).to(torch::kFloat32).unsqueeze(-1));
-        hf.push_back(F::one_hot(torch::bitwise_and(torch::bitwise_right_shift(city_flags, 1), 3).to(torch::kLong), 4)
-                         .to(torch::kFloat32));
-        hf.push_back(F::one_hot(army.to(torch::kLong), MAX_FACTIONS + 1).to(torch::kFloat32));
-        hf.push_back(units / double(MAX_STACK_SIZE));
-        hf.push_back((units.sum(-1) / double(MAX_STACK_SIZE)).unsqueeze(-1));
-        hf.push_back((battle_round / 5.0).unsqueeze(-1));
-        for (int k = 0; k < MAX_FACTIONS; ++k) {
-            hf.push_back(bit(battle_factions, k).to(torch::kFloat32).unsqueeze(-1));
-        }
-        auto hex_feat = torch::cat(hf, -1);
-        TORCH_CHECK(hex_feat.size(-1) == kHexFeatures, "hex feature width drifted: got ",
-                    hex_feat.size(-1), " expected ", kHexFeatures);
-        auto hex_tok = hex_in->forward(hex_feat.to(dtype()));
-
-        // --- hex-conv stem ---------------------------------------------------
-        for (auto& layer : stem) {
-            // neighbours_idx is [hexes, 7]: self, then the six directions, with
-            // off-board directions pointing at a zero row appended at the end.
-            auto padded = torch::cat({hex_tok, torch::zeros({B, 1, d}, hex_tok.options())}, 1);
-            auto gathered = padded.index_select(1, neighbours_idx.view({-1}))
-                                .view({B, hexes, 7 * d});
-            hex_tok = hex_tok + F::gelu(layer->forward(gathered));
-        }
-
-        // --- faction tokens ---------------------------------------------------
-        auto fc = i32.slice(1, kFactionOff, kFactionOff + 24 * MAX_FACTIONS)
-                      .view({B, MAX_FACTIONS, 24})
-                      .slice(1, 0, nf);
-        std::vector<torch::Tensor> ff;
-        ff.push_back(fc.select(2, 0).to(torch::kFloat32).unsqueeze(-1));  // active
-        ff.push_back(fc.select(2, 1).to(torch::kFloat32).unsqueeze(-1));  // is_me
-        ff.push_back((fc.select(2, 2).to(torch::kFloat32) / double(kOutpostCap)).unsqueeze(-1));
-        ff.push_back(fc.slice(2, 3, 6).to(torch::kFloat32) / 20.0);       // units by type
-        ff.push_back((fc.select(2, 6).to(torch::kFloat32) / 10.0).unsqueeze(-1));  // settle order
-        ff.push_back((read_i16(fc, 8).to(torch::kFloat32) / 50.0).unsqueeze(-1));  // gold
-        std::vector<torch::Tensor> res;
-        for (int r = 0; r < NUM_RESOURCES; ++r) res.push_back(read_i16(fc, 10 + 2 * r).unsqueeze(-1));
-        ff.push_back(torch::cat(res, -1).to(torch::kFloat32) / 20.0);
-        ff.push_back((read_i16(fc, 18).to(torch::kFloat32) / double(kVpToWin)).unsqueeze(-1));
-        ff.push_back((read_i16(fc, 20).to(torch::kFloat32) / 20.0).unsqueeze(-1));
-        ff.push_back((read_i16(fc, 22).to(torch::kFloat32) / double(kVpToWin)).unsqueeze(-1));
-        auto fac_feat = torch::cat(ff, -1);
-        TORCH_CHECK(fac_feat.size(-1) == kFactionFeatures, "faction feature width drifted: got ",
-                    fac_feat.size(-1), " expected ", kFactionFeatures);
-        // Slot identity comes from a learned embedding rather than a one-hot,
-        // since the slot IS the relative faction index and the net should be free
-        // to give "me" its own vector.
-        auto fac_tok = faction_in->forward(fac_feat.to(dtype())) +
-                       slot_emb->forward(torch::arange(nf, torch::TensorOptions()
-                                                               .dtype(torch::kLong)
-                                                               .device(raw.device())))
-                           .unsqueeze(0);
-
-        // --- CLS --------------------------------------------------------------
-        auto hd = i32.slice(1, kHeaderOff, kHeaderOff + 16);
-        std::vector<torch::Tensor> gf;
-        gf.push_back((hd.select(1, 1).to(torch::kFloat32) / 8.0).unsqueeze(-1));   // radius
-        gf.push_back((hd.select(1, 2).to(torch::kFloat32) / 10.0).unsqueeze(-1));  // num_factions
-        gf.push_back(F::one_hot(hd.select(1, 3).to(torch::kLong), kNumDecisionKinds).to(torch::kFloat32));
-        gf.push_back((hd.select(1, 4).to(torch::kFloat32) / 3.0).unsqueeze(-1));   // step
-        gf.push_back((read_i16(hd, 6).to(torch::kFloat32) / 331.0).unsqueeze(-1));  // num_hexes
-        gf.push_back((read_i16(hd, 8).to(torch::kFloat32) / 50.0).unsqueeze(-1));   // turn
-        gf.push_back((read_i16(hd, 12).to(torch::kFloat32) / double(kVpToWin)).unsqueeze(-1));
-        auto head_feat = torch::cat(gf, -1);
-        TORCH_CHECK(head_feat.size(-1) == kHeaderFeatures, "header feature width drifted: got ",
-                    head_feat.size(-1), " expected ", kHeaderFeatures);
-        auto cls_tok = header_in->forward(head_feat.to(dtype())).unsqueeze(1);
-
-        return torch::cat({hex_tok, fac_tok, cls_tok}, 1);
-    }
-
-    // Returns the trunk output [B, T, d].
-    torch::Tensor trunk(const torch::Tensor& raw) {
-        auto x = embed(raw);
-        auto bias = bias_table.index_select(1, bucket_idx.view({-1}))
-                        .view({bias_table.size(0), bucket_idx.size(0), bucket_idx.size(1)});
-        for (auto& b : blocks) x = b->forward(x, bias);
-        return x;
-    }
-
-    // Whatever the weights were converted to. The byte expansion above works in
-    // int32/float32 regardless, so every projection casts on the way in.
-    torch::ScalarType dtype() const { return hex_in->weight.scalar_type(); }
-
-    int d, nf, hexes;
-    torch::nn::Linear hex_in, faction_in, header_in;
-    torch::nn::Embedding slot_emb;
-    std::vector<torch::nn::Linear> stem;
-    std::vector<Block> blocks;
-    torch::Tensor bias_table;
-    torch::Tensor neighbours_idx;  // [hexes, 7] long
-    torch::Tensor bucket_idx;      // [T, T] long
-
-    torch::nn::Linear head_move, head_pass, head_hex, head_buy, head_target, head_resource,
-        head_swap, head_rect, head_value;
-};
-TORCH_MODULE(Net);
-
 }  // namespace
 
 // --- the policy -------------------------------------------------------------
@@ -295,62 +75,26 @@ namespace {
 
 class TorchPolicy : public BatchedPolicy {
 public:
-    TorchPolicy(const NeuralConfig& cfg, const HexGrid& grid)
+    TorchPolicy(const NeuralConfig& cfg, torch::jit::script::Module module, int hexes,
+                long long params)
         : cfg_(cfg),
-          grid_(grid),
-          hexes_(grid.num_hexes()),
-          tokens_(grid.num_hexes() + cfg.num_factions + 1),
-          device_(cfg.cuda ? torch::kCUDA : torch::kCPU) {
-        torch::manual_seed(cfg.seed);
-        net_ = Net(cfg, hexes_);
+          hexes_(hexes),
+          tokens_(hexes + cfg.num_factions + 1),
+          device_(cfg.cuda ? torch::kCUDA : torch::kCPU),
+          module_(std::move(module)),
+          params_(params) {
+        module_.to(device_);
+        // Deliberately NO dtype conversion here. Module::to(kFloat16) converts
+        // every tensor in the module including the integer geometry buffers, and
+        // a half index tensor fails inside gather. Precision is chosen at export
+        // time instead (train/export.py --half), where .half() touches only
+        // floating-point tensors.
+        module_.eval();
 
-        // Neighbour gather table: column 0 is self, 1..6 the directions. An
-        // off-board direction points at row `hexes_`, a zero row appended at
-        // gather time, so the stem needs no masking.
-        std::vector<int64_t> nb(static_cast<size_t>(hexes_) * 7);
-        for (int h = 0; h < hexes_; ++h) {
-            nb[static_cast<size_t>(h) * 7] = h;
-            for (int dir = 0; dir < NUM_DIRECTIONS; ++dir) {
-                const int j = grid.neighbour(h, dir);
-                nb[static_cast<size_t>(h) * 7 + 1 + dir] = j >= 0 ? j : hexes_;
-            }
+        for (const auto& p : module_.parameters()) {
+            half_ = p.scalar_type() == torch::kFloat16;
+            break;
         }
-        net_->neighbours_idx =
-            torch::from_blob(nb.data(), {hexes_, 7}, torch::kLong).clone().to(device_);
-
-        // Distance-bias bucket table over the whole token stream.
-        std::vector<int64_t> bk(static_cast<size_t>(tokens_) * static_cast<size_t>(tokens_));
-        const int fac0 = hexes_;
-        const int cls = tokens_ - 1;
-        for (int i = 0; i < tokens_; ++i) {
-            for (int j = 0; j < tokens_; ++j) {
-                int b;
-                const bool ih = i < fac0, jh = j < fac0;
-                const bool ic = i == cls, jc = j == cls;
-                if (ih && jh) {
-                    b = distance_bucket(grid.distance(i, j));
-                } else if (ic && jc) {
-                    b = kBucketClsCls;
-                } else if (ic || jc) {
-                    b = (ih || jh) ? kBucketHexCls : kBucketFactionCls;
-                } else if (ih || jh) {
-                    b = kBucketHexFaction;
-                } else {
-                    b = kBucketFactionFaction;
-                }
-                bk[static_cast<size_t>(i) * static_cast<size_t>(tokens_) + static_cast<size_t>(j)] =
-                    b;
-            }
-        }
-        net_->bucket_idx =
-            torch::from_blob(bk.data(), {tokens_, tokens_}, torch::kLong).clone().to(device_);
-
-        net_->to(device_);
-        if (cfg.fp16 && cfg.cuda) net_->to(torch::kFloat16);
-        net_->eval();
-
-        params_ = 0;
-        for (const auto& p : net_->parameters()) params_ += p.numel();
     }
 
     void evaluate(const DecisionRequest* requests, DecisionAnswer* answers, int n) override;
@@ -358,19 +102,19 @@ public:
 
     std::string describe() const {
         std::ostringstream os;
-        os << "d=" << cfg_.d_model << " x" << cfg_.n_blocks << " blocks, " << cfg_.n_heads
-           << " heads, " << tokens_ << " tokens, " << (params_ / 1000) << "k params, "
-           << (cfg_.cuda ? "cuda" : "cpu") << (cfg_.fp16 && cfg_.cuda ? "/fp16" : "/fp32");
+        os << tokens_ << " tokens, " << (params_ / 1000) << "k params, "
+           << (cfg_.cuda ? "cuda" : "cpu") << (half_ ? "/fp16" : "/fp32") << ", "
+           << cfg_.weights;
         return os.str();
     }
 
 private:
     NeuralConfig cfg_;
-    const HexGrid& grid_;
     int hexes_, tokens_;
     torch::Device device_;
-    Net net_{nullptr};
+    torch::jit::script::Module module_;
     long long params_ = 0;
+    bool half_ = false;
     mutable std::mutex gpu_mu_;
 };
 
@@ -431,14 +175,6 @@ void TorchPolicy::evaluate_impl(const DecisionRequest* requests, DecisionAnswer*
     // reason to be single-file.
     std::unique_lock<std::mutex> gpu_lock(gpu_mu_);
 
-    auto x = net_->trunk(raw);
-    auto hex_tok = x.slice(1, 0, hexes_);
-    auto fac_tok = x.slice(1, hexes_, hexes_ + cfg_.num_factions);
-    auto cls_tok = x.select(1, tokens_ - 1);
-
-    // Every head runs for the whole batch. They are a rounding error next to the
-    // trunk (~0.7 MFLOP against ~370), and computing them all keeps the GPU path
-    // branch-free - the CPU then reads only what each request asked for.
     // Two heads ask about ONE hex - the query hex carried in the request - so
     // gather that row per position before running them. Computing head_rect over
     // every hex made it [B, n_hex, 48], which at batch 296 is 9.6 MB, 72 % of all
@@ -450,30 +186,21 @@ void TorchPolicy::evaluate_impl(const DecisionRequest* requests, DecisionAnswer*
         query[static_cast<size_t>(i)] =
             (h >= 0 && h < requests[i].state->num_hexes) ? h : 0;
     }
-    auto query_idx = torch::from_blob(query.data(), {n, 1}, torch::kLong).to(device_);
-    // [B, 1, d] -> the trunk row for each position's own query hex.
-    auto query_tok =
-        hex_tok.gather(1, query_idx.unsqueeze(-1).expand({n, 1, hex_tok.size(2)})).squeeze(1);
+    auto query_idx = torch::from_blob(query.data(), {n}, torch::kLong).to(device_);
 
-    // ONE download, not eight. Each `.to(kCPU)` is a full device synchronisation,
-    // so eight of them serialised the batch eight times over. Concatenating on
-    // the device and copying once costs a single sync.
+    // ONE forward, ONE download. The module gathers the query hex itself and
+    // returns every head as a dict; concatenating on the device and copying once
+    // costs a single synchronisation, where pulling the heads back separately
+    // serialised the batch once per head.
     //
-    // Widths, in order: move 6, pass 1, hex 1, buy 9, target nf, resource 2,
-    // swap 2, rect 48. Per-hex heads are flattened so everything is [B, W].
+    // `move` already carries its pass logit as a trailing column
+    // (train/model.py), so it is hexes*6 + 1 wide.
     const int nf = cfg_.num_factions;
-    auto flat = torch::cat(
-        {
-            net_->head_move->forward(hex_tok).reshape({n, hexes_ * NUM_DIRECTIONS}),
-            net_->head_pass->forward(cls_tok),
-            net_->head_hex->forward(hex_tok).reshape({n, hexes_}),
-            net_->head_buy->forward(hex_tok).reshape({n, hexes_ * 9}),
-            net_->head_target->forward(fac_tok).reshape({n, nf}),
-            net_->head_resource->forward(query_tok),
-            net_->head_swap->forward(cls_tok),
-            net_->head_rect->forward(query_tok),
-        },
-        1);
+    auto out = module_.forward({raw, query_idx}).toGenericDict();
+    auto head = [&](const char* name) { return out.at(name).toTensor(); };
+    auto flat = torch::cat({head("move"), head("hex"), head("buy"), head("target"),
+                            head("resource"), head("swap"), head("rect")},
+                           1);
     auto device_f32 = flat.to(torch::kFloat32);
     thread_local torch::Tensor host_pinned;
     torch::Tensor host;
@@ -685,34 +412,71 @@ void TorchPolicy::evaluate_impl(const DecisionRequest* requests, DecisionAnswer*
 
 bool neural_available() { return true; }
 
-long long neural_param_count(const NeuralConfig& cfg) {
-    const long long d = cfg.d_model;
-    long long p = 0;
-    p += (kHexFeatures + 1) * d + (kFactionFeatures + 1) * d + (kHeaderFeatures + 1) * d;
-    p += MAX_FACTIONS * d;                       // slot embedding
-    p += cfg.stem_layers * (7 * d * d + d);      // stem
-    p += cfg.n_blocks * (4 * d + 3 * d * d + 3 * d + d * d + d +
-                         2 * cfg.ffn_mult * d * d + cfg.ffn_mult * d + d);
-    p += cfg.n_heads * kNumBuckets;
-    p += (d + 1) * (NUM_DIRECTIONS + 1 + 1 + 9 + 1 + 2 + 2 +
-                    MAX_BATTLE_CONTRIB * NUM_UNIT_TYPES + 1);
-    return p;
+long long neural_param_count(const NeuralConfig&) {
+    // Architecture lives in train/model.py now, so this cannot be derived from a
+    // config any more. It is reported from the loaded module instead - see
+    // neural_describe.
+    return 0;
 }
 
 std::unique_ptr<BatchedPolicy> make_neural_policy(const NeuralConfig& cfg, std::string& error) {
+    if (cfg.weights.empty()) {
+        error =
+            "no weights given. The network is defined in train/model.py and loaded as "
+"TorchScript; export one with:\n"
+            "  python train/export.py --init --out checkpoints/init.ts "
+            "--radius <r> --factions <f>";
+        return nullptr;
+    }
     if (cfg.cuda && !torch::cuda::is_available()) {
         error = "CUDA requested but not available to LibTorch";
         return nullptr;
     }
-    if (cfg.radius < 1 || cfg.radius > 8) {
-        error = "radius must be 1-8";
+
+    torch::jit::script::Module module;
+    try {
+        module = torch::jit::load(cfg.weights);
+    } catch (const std::exception& e) {
+        error = "cannot load " + cfg.weights + ": " + e.what();
         return nullptr;
     }
-    if (cfg.d_model % cfg.n_heads != 0) {
-        error = "d_model must be divisible by n_heads";
+
+    // The exporter stamps these so a checkpoint can be refused rather than
+    // quietly played against the wrong board. A radius mismatch would reshape
+    // every hex token; an encoding mismatch would feed misaligned features. Both
+    // produce a net that plays like noise and nothing that looks like an error.
+    auto attr_int = [&](const char* name, int fallback) {
+        try {
+            return static_cast<int>(module.attr(name).toInt());
+        } catch (const std::exception&) {
+            return fallback;
+        }
+    };
+    const int radius = attr_int("radius", -1);
+    const int factions = attr_int("num_factions", -1);
+    const int enc = attr_int("encoding_version", -1);
+
+    if (enc >= 0 && enc != kEncodingVersion) {
+        error = "checkpoint was trained against encoding version " + std::to_string(enc) +
+                ", engine writes version " + std::to_string(kEncodingVersion);
         return nullptr;
     }
-    return std::make_unique<TorchPolicy>(cfg, HexGrid::shared(cfg.radius));
+    if (radius >= 0 && radius != cfg.radius) {
+        error = "checkpoint is for radius " + std::to_string(radius) + ", playing radius " +
+                std::to_string(cfg.radius);
+        return nullptr;
+    }
+    if (factions >= 0 && factions != cfg.num_factions) {
+        error = "checkpoint is for " + std::to_string(factions) + " factions, playing " +
+                std::to_string(cfg.num_factions);
+        return nullptr;
+    }
+
+    long long params = 0;
+    for (const auto& p : module.parameters()) params += p.numel();
+
+    return std::make_unique<TorchPolicy>(cfg, std::move(module),
+                                         HexGrid::shared(cfg.radius).num_hexes(), params);
 }
 
 std::string neural_describe(const BatchedPolicy& policy) {

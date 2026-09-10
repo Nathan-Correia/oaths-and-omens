@@ -96,6 +96,17 @@ class BatchedPolicy {
 public:
     virtual ~BatchedPolicy() = default;
     virtual void evaluate(const DecisionRequest* requests, DecisionAnswer* answers, int n) = 0;
+
+    // Called once per game, on that game's own thread, before and after it
+    // plays. A stateless policy (a network) ignores both; a policy holding
+    // per-game state (scripted agents, whose RNGs and memories persist across a
+    // whole game) uses them to build and drop that state.
+    //
+    // These are virtuals rather than a dynamic_cast in the runner because a
+    // COMPOSITE policy - part scripted, part neural, which is what head-to-head
+    // evaluation needs - has to forward them to whichever halves care.
+    virtual void on_game_start(const GameState*, int /*game_index*/) {}
+    virtual void on_game_end(const GameState*) {}
 };
 
 }  // namespace oo

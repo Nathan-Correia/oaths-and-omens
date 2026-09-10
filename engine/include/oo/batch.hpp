@@ -49,9 +49,13 @@ public:
     void evaluate(const DecisionRequest* requests, DecisionAnswer* answers, int n) override;
 
     // Games register the state they are about to play so their agents can be
-    // found again from a bare request. Called once per game, before it starts.
-    void bind(const GameState* state, int game_index);
-    void unbind(const GameState* state);
+    // found again from a bare request.
+    void on_game_start(const GameState* state, int game_index) override;
+    void on_game_end(const GameState* state) override;
+
+    // Restricts this policy to a subset of seats. Requests for other seats are
+    // left untouched, so a composite can hand the same batch to two policies.
+    void set_seats(const bool* seats, int num_factions);
 
 private:
     struct Impl;

@@ -85,20 +85,25 @@ struct AnswerSlot {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
     if (!oo::neural_available()) {
         std::printf("test_neural: no LibTorch in this build, skipping\n");
         return 0;
     }
 
+    // A tiny checked-in TorchScript module (d=32, 1 block, r5f4 - 250 KB). It is
+    // self-contained, so this covers the ENGINE side of the path - loading,
+    // batching, masking, decoding - independently of what train/model.py
+    // currently looks like. Regenerate with:
+    //   python train/export.py --init --out engine/tests/data/tiny_policy.ts \
+    //       --radius 5 --factions 4 --d-model 32 --blocks 1 --heads 2
+    const std::string weights = argc > 1 ? argv[1] : "tests/data/tiny_policy.ts";
     const int radius = 5, factions = 4;
 
     oo::NeuralConfig ncfg;
+    ncfg.weights = weights;
     ncfg.radius = radius;
     ncfg.num_factions = factions;
-    ncfg.d_model = 64;
-    ncfg.n_blocks = 2;
-    ncfg.n_heads = 4;
     ncfg.cuda = false;
     ncfg.fp16 = false;
 
@@ -276,6 +281,34 @@ int main() {
         uniq.erase(std::unique(uniq.begin(), uniq.end()), uniq.end());
         check(uniq.size() >= 8, "answers actually vary across requests (" +
                                     std::to_string(uniq.size()) + " distinct)");
+    }
+
+    // --- a mismatched checkpoint must be REFUSED -------------------------------
+    // Not played. A silent mismatch reshapes every hex token and the net plays
+    // like noise while nothing reports an error, which is exactly the failure
+    // the exporter's stamped attributes exist to prevent (§12.4).
+    {
+        oo::NeuralConfig bad = ncfg;
+        bad.radius = 7;
+        std::string e;
+        auto p = oo::make_neural_policy(bad, e);
+        check(p == nullptr && e.find("radius") != std::string::npos,
+              "a radius mismatch is refused with a clear message, got: " + e);
+    }
+    {
+        oo::NeuralConfig bad = ncfg;
+        bad.num_factions = 8;
+        std::string e;
+        auto p = oo::make_neural_policy(bad, e);
+        check(p == nullptr, "a faction-count mismatch is refused");
+    }
+    {
+        oo::NeuralConfig bad = ncfg;
+        bad.weights.clear();
+        std::string e;
+        auto p = oo::make_neural_policy(bad, e);
+        check(p == nullptr && e.find("export.py") != std::string::npos,
+              "missing weights says how to make some, got: " + e);
     }
 
     // --- and full games still play through ------------------------------------

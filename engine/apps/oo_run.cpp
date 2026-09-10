@@ -55,8 +55,7 @@ void usage() {
                  "  --neural          play with a neural policy (random weights)\n"
                  "  --in-flight N     neural: games in flight (default 256)\n"
                  "  --batch N         neural: target batch size (default 256)\n"
-                 "  --net-d N         neural: model width (default 128)\n"
-                 "  --net-blocks N    neural: transformer blocks (default 4)\n"
+                                  "  --net-weights P   neural: TorchScript from train/export.py (required)\n"
                  "  --net-cpu         neural: CPU instead of CUDA\n"
                  "  --net-fp32        neural: fp32 instead of fp16\n"
                  "  --replay K        with --games>1, also write game K's replay files\n"
@@ -143,8 +142,7 @@ int main(int argc, char** argv) {
     bool neural = false;
     int in_flight = 256;
     int neural_batch = 256;
-    int neural_d = 128;
-    int neural_blocks = 4;
+    std::string neural_weights;
     bool neural_cpu = false;
     bool neural_fp32 = false;
 
@@ -165,8 +163,7 @@ int main(int argc, char** argv) {
         else if (a == "--neural") neural = true;
         else if (a == "--in-flight") in_flight = std::atoi(next().c_str());
         else if (a == "--batch") neural_batch = std::atoi(next().c_str());
-        else if (a == "--net-d") neural_d = std::atoi(next().c_str());
-        else if (a == "--net-blocks") neural_blocks = std::atoi(next().c_str());
+        else if (a == "--net-weights") neural_weights = next();
         else if (a == "--net-cpu") neural_cpu = true;
         else if (a == "--net-fp32") neural_fp32 = true;
         else if (a == "--rotate") rotate = true;
@@ -275,11 +272,9 @@ int main(int argc, char** argv) {
         oo::NeuralConfig ncfg;
         ncfg.radius = radius;
         ncfg.num_factions = num_factions;
-        ncfg.d_model = neural_d;
-        ncfg.n_blocks = neural_blocks;
+        ncfg.weights = neural_weights;
         ncfg.cuda = !neural_cpu;
         ncfg.fp16 = !neural_fp32 && !neural_cpu;
-        ncfg.seed = base_seed;
         std::string err;
         policy = oo::make_neural_policy(ncfg, err);
         if (!policy) {

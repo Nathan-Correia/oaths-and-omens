@@ -38,7 +38,14 @@ struct ScriptedPolicy::Impl {
 
     std::mutex mu;
     std::map<const GameState*, std::unique_ptr<AgentSet>> by_state;
+    bool seat_filter = false;
+    bool seats[MAX_FACTIONS] = {};
 };
+
+void ScriptedPolicy::set_seats(const bool* s, int num_factions) {
+    impl_->seat_filter = true;
+    for (int f = 0; f < MAX_FACTIONS; ++f) impl_->seats[f] = f < num_factions && s[f];
+}
 
 ScriptedPolicy::ScriptedPolicy(const RunConfig& cfg, const GameSpec* specs, int num_games)
     : impl_(std::make_unique<Impl>()) {
@@ -49,7 +56,7 @@ ScriptedPolicy::ScriptedPolicy(const RunConfig& cfg, const GameSpec* specs, int 
 
 ScriptedPolicy::~ScriptedPolicy() = default;
 
-void ScriptedPolicy::bind(const GameState* state, int game_index) {
+void ScriptedPolicy::on_game_start(const GameState* state, int game_index) {
     auto set = std::make_unique<AgentSet>();
     build_mixed_agents(*set, impl_->specs[game_index].seats, impl_->cfg.num_factions,
                        impl_->specs[game_index].seed);
@@ -57,7 +64,7 @@ void ScriptedPolicy::bind(const GameState* state, int game_index) {
     impl_->by_state[state] = std::move(set);
 }
 
-void ScriptedPolicy::unbind(const GameState* state) {
+void ScriptedPolicy::on_game_end(const GameState* state) {
     std::lock_guard<std::mutex> lock(impl_->mu);
     impl_->by_state.erase(state);
 }
@@ -66,6 +73,9 @@ void ScriptedPolicy::evaluate(const DecisionRequest* requests, DecisionAnswer* a
     for (int i = 0; i < n; ++i) {
         const DecisionRequest& r = requests[i];
         DecisionAnswer& a = answers[i];
+
+        const int seat = r.kind == DecisionKind::kRectification ? r.winner : r.faction;
+        if (impl_->seat_filter && (seat < 0 || !impl_->seats[seat])) continue;
 
         Agent* agent = nullptr;
         {
@@ -311,10 +321,10 @@ bool gate_swap(const GameState&, int faction, int leftover, int placer, int plac
 // One game, start to finish, on this thread. Mirrors play_game exactly - the
 // only difference is where the decisions come from.
 void play_one_batched(const RunConfig& cfg, const GameSpec& spec, GameResult& out, BatchGate& gate,
-                      BatchedPolicy& policy, ScriptedPolicy* scripted, int game_index) {
+                      BatchedPolicy& policy, int game_index) {
     auto state = std::make_unique<GameState>();
     create_initial_state(*state, cfg.radius, cfg.num_factions, spec.seed);
-    if (scripted) scripted->bind(state.get(), game_index);
+    policy.on_game_start(state.get(), game_index);
 
     GameCtx gctx{&gate, state.get()};
 
@@ -344,8 +354,7 @@ void play_one_batched(const RunConfig& cfg, const GameSpec& spec, GameResult& ou
     out.winner = get_game_winner(*state);
     for (int f = 0; f < cfg.num_factions; ++f) out.victory_points[f] = state->victory_points[f];
 
-    if (scripted) scripted->unbind(state.get());
-    (void)policy;
+    policy.on_game_end(state.get());
 }
 
 }  // namespace
@@ -364,7 +373,6 @@ void run_games_batched(const RunConfig& cfg, const GameSpec* specs, GameResult* 
     // The gate is told how many games are in flight, not how many remain, so it
     // knows when everyone left is parked.
     BatchGate gate(policy, batch_size, num_threads);
-    auto* scripted = dynamic_cast<ScriptedPolicy*>(&policy);
 
     std::atomic<int> next{0};
     std::vector<std::thread> workers;
@@ -374,7 +382,7 @@ void run_games_batched(const RunConfig& cfg, const GameSpec* specs, GameResult* 
             for (;;) {
                 const int i = next.fetch_add(1, std::memory_order_relaxed);
                 if (i >= num_games) break;
-                play_one_batched(cfg, specs[i], out[i], gate, policy, scripted, i);
+                play_one_batched(cfg, specs[i], out[i], gate, policy, i);
             }
             // This thread will never submit again. Tell the gate so the games
             // still running are not left waiting on it.

@@ -14,7 +14,7 @@ TorchScript, and have C++ load it, so there is one definition rather than two.
 That is a small refactor of neural.cpp and is not done yet.
 """
 
-import math
+from typing import Dict
 
 import torch
 import torch.nn as nn
@@ -71,14 +71,11 @@ def hexes_for_radius(radius: int) -> int:
     return 3 * radius * (radius + 1) + 1
 
 
-def _read_i16(b: torch.Tensor, lo: int) -> torch.Tensor:
+def read_i16(b: torch.Tensor, lo: int) -> torch.Tensor:
     """Little-endian int16 out of two uint8 lanes, sign-extended."""
     v = b[..., lo].to(torch.int32) + b[..., lo + 1].to(torch.int32) * 256
     return torch.where(v > 32767, v - 65536, v)
 
-
-def _bit(v: torch.Tensor, k: int) -> torch.Tensor:
-    return (v >> k) & 1
 
 
 class Block(nn.Module):
@@ -120,6 +117,24 @@ class Policy(nn.Module):
         self.d = d_model
         self.n_heads = n_heads
 
+        # TorchScript cannot close over module-level globals, so every constant
+        # the scripted methods touch has to live on the instance. Keeping them
+        # here rather than inlining also means the layout is stated once.
+        self.hex_off = HEX_OFF
+        self.hex_bytes = HEX_BYTES
+        self.faction_off = FACTION_OFF
+        self.faction_bytes = FACTION_BYTES
+        self.header_off = HEADER_OFF
+        self.header_bytes = HEADER_BYTES
+        self.max_factions = MAX_FACTIONS
+        self.n_terrain = NUM_TERRAIN_TYPES
+        self.stack_cap = float(MAX_STACK_SIZE)
+        self.vp_to_win = float(VP_TO_WIN)
+        self.outpost_cap = float(OUTPOST_CAP)
+        self.n_resources = NUM_RESOURCES
+        self.n_kinds = NUM_DECISION_KINDS
+        self.n_unit_types = NUM_UNIT_TYPES
+
         self.hex_in = nn.Linear(HEX_FEATURES, d_model)
         self.faction_in = nn.Linear(FACTION_FEATURES, d_model)
         self.header_in = nn.Linear(HEADER_FEATURES, d_model)
@@ -148,11 +163,16 @@ class Policy(nn.Module):
         self.register_buffer("buckets", buckets, persistent=True)
 
     # --- byte record -> features ------------------------------------------
+    # Kept TorchScript-compatible: no module-level constants, no f-strings, and
+    # lists built by explicit append rather than comprehension. The feature
+    # widths are checked in tests/check_parity.py instead of by an assert here,
+    # since a scripted assert cannot carry a useful message.
     def embed(self, raw: torch.Tensor) -> torch.Tensor:
         b = raw.shape[0]
         i32 = raw.to(torch.int32)
 
-        hx = i32[:, HEX_OFF:HEX_OFF + HEX_BYTES * self.hexes].view(b, self.hexes, HEX_BYTES)
+        hx = i32[:, self.hex_off:self.hex_off + self.hex_bytes * self.hexes]
+        hx = hx.view(b, self.hexes, self.hex_bytes)
         terrain = hx[:, :, 0]
         city = hx[:, :, 1]
         city_flags = hx[:, :, 2]
@@ -162,61 +182,58 @@ class Policy(nn.Module):
         battle_round = hx[:, :, 8].float()
         battle_factions = hx[:, :, 10] + hx[:, :, 11] * 256
 
-        hf = [F.one_hot(terrain.long(), NUM_TERRAIN_TYPES).float()]
-        hf += [_bit(flags, k).float().unsqueeze(-1) for k in range(7)]
-        hf.append(F.one_hot(city.long(), MAX_FACTIONS + 1).float())
-        hf.append(_bit(city_flags, 0).float().unsqueeze(-1))
+        hf = [F.one_hot(terrain.long(), self.n_terrain).float()]
+        for k in range(7):
+            hf.append(((flags >> k) & 1).float().unsqueeze(-1))
+        hf.append(F.one_hot(city.long(), self.max_factions + 1).float())
+        hf.append((city_flags & 1).float().unsqueeze(-1))
         hf.append(F.one_hot(((city_flags >> 1) & 3).long(), 4).float())
-        hf.append(F.one_hot(army.long(), MAX_FACTIONS + 1).float())
-        hf.append(units / MAX_STACK_SIZE)
-        hf.append((units.sum(-1) / MAX_STACK_SIZE).unsqueeze(-1))
+        hf.append(F.one_hot(army.long(), self.max_factions + 1).float())
+        hf.append(units / self.stack_cap)
+        hf.append((units.sum(-1) / self.stack_cap).unsqueeze(-1))
         hf.append((battle_round / 5.0).unsqueeze(-1))
-        hf += [_bit(battle_factions, k).float().unsqueeze(-1) for k in range(MAX_FACTIONS)]
-        hex_feat = torch.cat(hf, -1)
-        assert hex_feat.shape[-1] == HEX_FEATURES, \
-            f"hex features {hex_feat.shape[-1]} != {HEX_FEATURES}"
-        hex_tok = self.hex_in(hex_feat)
+        for k in range(self.max_factions):
+            hf.append(((battle_factions >> k) & 1).float().unsqueeze(-1))
+        # The expansion above always produces float32 (one_hot, the /
+        # divisions), but the weights may have been converted to half for
+        # inference. Cast at each projection rather than trying to build the
+        # features in the weight dtype - integer ops have no half equivalent.
+        wdt = self.hex_in.weight.dtype
+        hex_tok = self.hex_in(torch.cat(hf, -1).to(wdt))
 
         for layer in self.stem:
-            padded = torch.cat([hex_tok, torch.zeros(b, 1, self.d, device=raw.device,
-                                                     dtype=hex_tok.dtype)], 1)
-            gathered = padded.index_select(1, self.neighbours.view(-1)).view(b, self.hexes, 7 * self.d)
-            hex_tok = hex_tok + F.gelu(layer(gathered))
+            zeros = torch.zeros(b, 1, self.d, device=hex_tok.device, dtype=hex_tok.dtype)
+            padded = torch.cat([hex_tok, zeros], 1)
+            gathered = padded.index_select(1, self.neighbours.view(-1))
+            hex_tok = hex_tok + F.gelu(layer(gathered.view(b, self.hexes, 7 * self.d)))
 
-        fc = i32[:, FACTION_OFF:FACTION_OFF + FACTION_BYTES * MAX_FACTIONS]
-        fc = fc.view(b, MAX_FACTIONS, FACTION_BYTES)[:, :self.num_factions]
-        ff = [
-            fc[:, :, 0].float().unsqueeze(-1),
-            fc[:, :, 1].float().unsqueeze(-1),
-            (fc[:, :, 2].float() / OUTPOST_CAP).unsqueeze(-1),
-            fc[:, :, 3:6].float() / 20.0,
-            (fc[:, :, 6].float() / 10.0).unsqueeze(-1),
-            (_read_i16(fc, 8).float() / 50.0).unsqueeze(-1),
-            torch.stack([_read_i16(fc, 10 + 2 * r) for r in range(NUM_RESOURCES)], -1).float() / 20.0,
-            (_read_i16(fc, 18).float() / VP_TO_WIN).unsqueeze(-1),
-            (_read_i16(fc, 20).float() / 20.0).unsqueeze(-1),
-            (_read_i16(fc, 22).float() / VP_TO_WIN).unsqueeze(-1),
-        ]
-        fac_feat = torch.cat(ff, -1)
-        assert fac_feat.shape[-1] == FACTION_FEATURES, \
-            f"faction features {fac_feat.shape[-1]} != {FACTION_FEATURES}"
+        fc = i32[:, self.faction_off:self.faction_off + self.faction_bytes * self.max_factions]
+        fc = fc.view(b, self.max_factions, self.faction_bytes)[:, :self.num_factions]
+        ff = [fc[:, :, 0].float().unsqueeze(-1)]
+        ff.append(fc[:, :, 1].float().unsqueeze(-1))
+        ff.append((fc[:, :, 2].float() / self.outpost_cap).unsqueeze(-1))
+        ff.append(fc[:, :, 3:6].float() / 20.0)
+        ff.append((fc[:, :, 6].float() / 10.0).unsqueeze(-1))
+        ff.append((read_i16(fc, 8).float() / 50.0).unsqueeze(-1))
+        res = []
+        for r in range(self.n_resources):
+            res.append(read_i16(fc, 10 + 2 * r).float().unsqueeze(-1))
+        ff.append(torch.cat(res, -1) / 20.0)
+        ff.append((read_i16(fc, 18).float() / self.vp_to_win).unsqueeze(-1))
+        ff.append((read_i16(fc, 20).float() / 20.0).unsqueeze(-1))
+        ff.append((read_i16(fc, 22).float() / self.vp_to_win).unsqueeze(-1))
         slots = torch.arange(self.num_factions, device=raw.device)
-        fac_tok = self.faction_in(fac_feat) + self.slot_emb(slots).unsqueeze(0)
+        fac_tok = self.faction_in(torch.cat(ff, -1).to(wdt)) + self.slot_emb(slots).unsqueeze(0)
 
-        hd = i32[:, HEADER_OFF:HEADER_OFF + HEADER_BYTES]
-        gf = [
-            (hd[:, 1].float() / 8.0).unsqueeze(-1),
-            (hd[:, 2].float() / 10.0).unsqueeze(-1),
-            F.one_hot(hd[:, 3].long(), NUM_DECISION_KINDS).float(),
-            (hd[:, 4].float() / 3.0).unsqueeze(-1),
-            (_read_i16(hd, 6).float() / 331.0).unsqueeze(-1),
-            (_read_i16(hd, 8).float() / 50.0).unsqueeze(-1),
-            (_read_i16(hd, 12).float() / VP_TO_WIN).unsqueeze(-1),
-        ]
-        head_feat = torch.cat(gf, -1)
-        assert head_feat.shape[-1] == HEADER_FEATURES, \
-            f"header features {head_feat.shape[-1]} != {HEADER_FEATURES}"
-        cls_tok = self.header_in(head_feat).unsqueeze(1)
+        hd = i32[:, self.header_off:self.header_off + self.header_bytes]
+        gf = [(hd[:, 1].float() / 8.0).unsqueeze(-1)]
+        gf.append((hd[:, 2].float() / 10.0).unsqueeze(-1))
+        gf.append(F.one_hot(hd[:, 3].long(), self.n_kinds).float())
+        gf.append((hd[:, 4].float() / 3.0).unsqueeze(-1))
+        gf.append((read_i16(hd, 6).float() / 331.0).unsqueeze(-1))
+        gf.append((read_i16(hd, 8).float() / 50.0).unsqueeze(-1))
+        gf.append((read_i16(hd, 12).float() / self.vp_to_win).unsqueeze(-1))
+        cls_tok = self.header_in(torch.cat(gf, -1).to(wdt)).unsqueeze(1)
 
         return torch.cat([hex_tok, fac_tok, cls_tok], 1)
 
@@ -228,7 +245,7 @@ class Policy(nn.Module):
             x = blk(x, bias)
         return x
 
-    def forward(self, raw: torch.Tensor, query_hex: torch.Tensor):
+    def forward(self, raw: torch.Tensor, query_hex: torch.Tensor) -> Dict[str, torch.Tensor]:
         """Returns (logits per action space, value).
 
         `logits` is laid out to match the engine's action bitmask exactly, so a
