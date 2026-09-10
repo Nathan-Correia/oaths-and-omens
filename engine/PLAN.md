@@ -2024,7 +2024,42 @@ Head to head sp1 beats bc10k 53.6 %, but the interval is [49.2, 57.9] - it
 **straddles 50**, so that is not a separated result and must not be read as an
 improvement. The ladder is flat within noise on every rung.
 
-Three candidate explanations, untested:
+**Second iteration, advantage-weighted: also nothing.** Same corpus, only the
+objective changed - `exp((R - V(s)) / 0.5)` per sample instead of a hard
+filter. Result 50.8 % [46.4, 55.2] against `bc10k`, and 45.8 % against `sp1`.
+Both straddle 50. Two objectives, one corpus, no movement.
+
+**Why, measured.** Not the reasons guessed below - those were checked and
+mostly wrong:
+
+- *Temperature 1.0 does NOT randomise play.* The policy is confident: top-1
+  probability 80.7 %, effective 2.2 choices out of 16.2 legal, and the sampled
+  games match its own argmax 80.6 % of the time. The corpus is real play with
+  19 % exploration.
+- *The outcome filter selects almost nothing.* Winning seats deviate from the
+  policy's argmax 23.1 % of the time, losing seats 19.1 % - four points apart.
+  "Train on the winners" is therefore 96 % "train on what you already do".
+- *Advantage weighting cannot rescue it either, and the reason is the same one
+  that made the value head look promising.* V(s) predicts the eventual winner
+  at AUC 0.928, so it already explains most of the outcome; what is left,
+  `R - V(s)`, has mean -0.004 and sd 0.251, and 85 % of samples end up with a
+  weight within 0.5 of 1.0. Near-uniform weights are plain self-imitation,
+  which is a fixed point.
+
+The general form of this: a single game's result is a very high-variance
+estimate of one action's value, and eight factions with one winner makes it
+worse. This is a known property of policy-gradient learning without search,
+not a defect in the implementation - and it is precisely the variance that
+MCTS exists to remove, by averaging many rollouts from the SAME position.
+
+**What the experiments actually established.** The value head is the asset
+here: AUC 0.928 overall, 0.810 by turn 2. Converting it into strength does not
+need full MCTS - a one-ply lookahead (apply each legal action, evaluate the
+successor with the value head, take the best) uses it directly at roughly 17x
+the evaluations per movement decision, all of which batch. That is far cheaper
+than tactician's rollouts, which simulate a whole turn per candidate.
+
+Earlier candidate explanations, now largely disproved:
 
 1. **Temperature 1.0 makes the games much worse than the policy's argmax
    play.** The filter then keeps the best 18 % of BAD games, which need not be

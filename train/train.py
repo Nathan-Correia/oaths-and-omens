@@ -205,6 +205,13 @@ def main():
     ap.add_argument("--init-from", default="",
                     help="start from this checkpoint instead of random init - "
                          "self-play fine-tuning must, or the policy forgets")
+    ap.add_argument("--advantage-beta", type=float, default=0.0,
+                    help="SELF-PLAY: advantage-weighted regression. Weights each "
+                         "sample by exp((outcome - V(s)) / beta) instead of hard "
+                         "filtering. 0 disables. Try 0.5")
+    ap.add_argument("--advantage-clip", type=float, default=10.0,
+                    help="cap on the advantage weight, so one lucky game cannot "
+                         "dominate a batch")
     ap.add_argument("--min-vp-ratio", type=float, default=0.0,
                     help="SELF-PLAY: keep only samples whose seat finished with at "
                          "least this fraction of the winning score. 0 keeps everything; "
@@ -276,6 +283,10 @@ def main():
               f"(epoch {blob.get('epoch','?')}, val_loss {blob.get('val_loss', float('nan')):.4f})")
 
     params = sum(p.numel() for p in net.parameters())
+    if args.advantage_beta > 0.0:
+        print(f"advantage weighting: beta {args.advantage_beta}, clip "
+              f"{args.advantage_clip} (no hard filter needed - every sample "
+              f"contributes, weighted)")
     print(f"model: d={args.d_model} x{args.blocks} blocks, {params/1000:.0f}k params, "
           f"{net.tokens} tokens")
 
@@ -318,6 +329,34 @@ def main():
                 # The value head applies to every row regardless of kind.
                 vloss = F.binary_cross_entropy_with_logits(outs["value"], won)
 
+                # ADVANTAGE WEIGHTING (PLAN.md §12.3).
+                #
+                # A hard outcome filter asks "did this seat win", which credits
+                # every decision in the game equally - including the many a
+                # losing seat would have made identically. Measured on the first
+                # self-play corpus, winning and losing seats deviated from the
+                # policy's own argmax 23.1% and 19.1% of the time: a four-point
+                # difference, which is why filtering moved nothing.
+                #
+                # The value head, by contrast, predicts the eventual winner at
+                # AUC 0.928 (0.810 even on turns 0-2). So `outcome - V(s)` is a
+                # far sharper per-decision signal than `outcome` alone: it asks
+                # "did this go BETTER than the position deserved", which is the
+                # part attributable to the actions actually taken.
+                #
+                # V(s) is detached - this weights the policy loss, it must not
+                # push gradients back through the critic.
+                adv_w = None
+                if args.advantage_beta > 0.0:
+                    baseline = torch.sigmoid(outs["value"].detach())
+                    adv = won - baseline
+                    adv_w = torch.exp(adv / args.advantage_beta).clamp(
+                        max=args.advantage_clip)
+                    # Normalised so the weighting changes the SHAPE of the loss,
+                    # not its scale - otherwise it silently rescales the learning
+                    # rate too.
+                    adv_w = adv_w / adv_w.mean().clamp(min=1e-6)
+
                 for kind in torch.unique(kinds).tolist():
                     sel = (kinds == kind).nonzero(as_tuple=True)[0]
                     if sel.numel() == 0:
@@ -339,12 +378,19 @@ def main():
                             # just make the class louder, not more likely.
                             tile = buy_w.repeat(head.shape[1] // BUY_VARIANTS)
                             w = legal * (1.0 + (tile - 1.0) * chosen)
+                        if adv_w is not None:
+                            w = w * adv_w.index_select(0, sel).unsqueeze(1)
                         loss = F.binary_cross_entropy_with_logits(
                             head, chosen, weight=w, reduction="sum") / w.sum().clamp(min=1)
                         correct = ((head > 0).float() * legal == chosen * legal).all(1).sum()
                     else:
                         tgt = chosen.argmax(1)
-                        loss = F.cross_entropy(masked, tgt)
+                        if adv_w is None:
+                            loss = F.cross_entropy(masked, tgt)
+                        else:
+                            per = F.cross_entropy(masked, tgt, reduction="none")
+                            w = adv_w.index_select(0, sel)
+                            loss = (per * w).sum() / w.sum().clamp(min=1e-6)
                         correct = (masked.argmax(1) == tgt).sum()
 
                     k = sel.numel()
