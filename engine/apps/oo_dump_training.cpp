@@ -1,6 +1,7 @@
 // Generates behaviour-cloning data from a scripted teacher (PLAN.md §12.2).
 //
 //   oo_dump_training --out data/r7f8.bin --games 20000 --agent tactician
+//   oo_dump_training --out data/sp.bin --games 20000 --net-weights bc.ts --temperature 1.0
 //
 // Plays whole games with the teacher and records, at every decision point, the
 // encoded position, the legal action set, and what the teacher chose. The value
@@ -12,6 +13,8 @@
 // predicts how long the run has left.
 
 #include "oo/agent.hpp"
+#include "oo/batch.hpp"
+#include "oo/neural.hpp"
 #include "oo/buy.hpp"
 #include "oo/encode.hpp"
 #include "oo/movement.hpp"
@@ -27,6 +30,8 @@
 #include <cstring>
 #include <memory>
 #include <string>
+#include <map>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -43,7 +48,13 @@ void usage() {
                  "  --seed N          base seed; game g uses seed+g (default 1)\n"
                  "  --max-turns N     safety cap (default 100)\n"
                  "  --every N         record every Nth decision (default 1)\n"
-                 "  --threads N       worker threads (default: all cores)\n");
+                 "  --threads N       worker threads (default: all cores)\n"
+                 "  --net-weights P   SELF-PLAY: every seat is this network\n"
+                 "  --temperature T   self-play sampling temperature (default 1.0;\n"
+                 "                    0 is argmax, which makes the corpus useless -\n"
+                 "                    a deterministic policy only ever shows you the\n"
+                 "                    moves it already makes)\n"
+                 "  --in-flight N     self-play: games in flight (default 256)\n");
 }
 
 // Collects one game's samples. Everything is built in the final on-disk layout
@@ -274,11 +285,184 @@ bool rec_swap(const oo::GameState& s, int faction, int leftover, int placer, int
     return yes;
 }
 
+// Wraps a policy and writes down every decision it is asked for, buffered per
+// game so the outcome can be stamped on once the game ends.
+//
+// The buffer is keyed by state pointer rather than by game index because a
+// request carries only the state - and that is also what makes this safe under
+// the batch gate, where several games are mid-flight on different threads at
+// once.
+class SelfPlayRecorder : public oo::BatchedPolicy {
+public:
+    SelfPlayRecorder(oo::BatchedPolicy* inner, oo::TrainWriter* writer, int num_factions,
+                     int num_hexes, int every)
+        : inner_(inner), writer_(writer), num_factions_(num_factions), num_hexes_(num_hexes),
+          every_(every) {}
+
+    void on_game_start(const oo::GameState* s, int game_index) override {
+        inner_->on_game_start(s, game_index);
+        std::lock_guard<std::mutex> lock(mu_);
+        auto& g = games_[s];
+        g.rec.state = s;
+        g.rec.record_bytes = writer_->record_bytes();
+        g.rec.position_bytes = writer_->position_bytes();
+        g.rec.num_hexes = num_hexes_;
+        g.rec.num_factions = num_factions_;
+        g.rec.every = every_;
+        g.index = game_index;
+    }
+
+    void on_game_end(const oo::GameState* s) override {
+        inner_->on_game_end(s);
+        Entry taken;
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            auto it = games_.find(s);
+            if (it == games_.end()) return;
+            taken = std::move(it->second);
+            games_.erase(it);
+        }
+        // The state is final here, so the outcome is readable straight off it.
+        const int winner = oo::get_game_winner(*s);
+        writer_->write_game(taken.rec.buffer, taken.rec.count, s->victory_points, num_factions_,
+                            winner, s->turn_number, taken.index);
+    }
+
+    void evaluate(const oo::DecisionRequest* reqs, oo::DecisionAnswer* ans, int n) override {
+        inner_->evaluate(reqs, ans, n);
+        std::lock_guard<std::mutex> lock(mu_);
+        for (int i = 0; i < n; ++i) {
+            auto it = games_.find(reqs[i].state);
+            if (it == games_.end()) continue;
+            record(it->second.rec, reqs[i], ans[i]);
+        }
+    }
+
+private:
+    struct Entry {
+        Recorder rec;
+        int index = 0;
+    };
+
+    // Turns one (request, answer) into the same masks the scripted dumper
+    // writes, so both corpora share a format and the trainer needs no branch.
+    void record(Recorder& rec, const oo::DecisionRequest& r, const oo::DecisionAnswer& a) {
+        Masks m;
+        switch (r.kind) {
+            case oo::DecisionKind::kMovement:
+            case oo::DecisionKind::kCavalry: {
+                for (int h = 0; h < num_hexes_; ++h) {
+                    for (int d = 0; d < oo::NUM_DIRECTIONS; ++d) {
+                        if (r.legal_mask->cell[h][d]) oo::set_bit(m.legal, h * oo::NUM_DIRECTIONS + d);
+                    }
+                }
+                oo::set_bit(m.legal, num_hexes_ * oo::NUM_DIRECTIONS);
+                if (a.flag) {
+                    oo::set_bit(m.chosen, a.move.hex * oo::NUM_DIRECTIONS + a.move.dir);
+                } else {
+                    oo::set_bit(m.chosen, num_hexes_ * oo::NUM_DIRECTIONS);
+                }
+                break;
+            }
+            case oo::DecisionKind::kBuy: {
+                auto variant = [](const oo::BuyAction& b) {
+                    switch (b.type) {
+                        case oo::BuyType::kBuyInfantry: return 0;
+                        case oo::BuyType::kConvertToSpecial: return 1 + int(b.unit_type);
+                        case oo::BuyType::kBuildOutpost: return 3 + int(b.unit_type);
+                        default: return 6 + int(b.upgrade);
+                    }
+                };
+                for (int i = 0; i < r.legal_buy->size(); ++i) {
+                    oo::set_bit(m.legal, (*r.legal_buy)[i].hex * 9 + variant((*r.legal_buy)[i]));
+                }
+                if (a.buy) {
+                    for (int i = 0; i < a.buy->size(); ++i) {
+                        oo::set_bit(m.chosen, (*a.buy)[i].hex * 9 + variant((*a.buy)[i]));
+                    }
+                }
+                break;
+            }
+            case oo::DecisionKind::kTarget: {
+                const oo::Battle* b = r.state->battle_at(r.hex);
+                if (b) {
+                    for (int i = 0; i < b->nslots; ++i) {
+                        const int f = b->slots[i].faction;
+                        if (f == oo::NO_FACTION || f == r.faction) continue;
+                        oo::set_bit(m.legal, (f - r.faction + num_factions_) % num_factions_);
+                    }
+                }
+                if (a.index >= 0) {
+                    oo::set_bit(m.chosen, (a.index - r.faction + num_factions_) % num_factions_);
+                }
+                break;
+            }
+            case oo::DecisionKind::kRectification: {
+                const oo::Battle* b = r.state->battle_at(r.hex);
+                if (b) {
+                    for (int i = 0; i < b->nslots; ++i) {
+                        if (b->slots[i].faction != r.winner) continue;
+                        for (int t = 0; t < oo::NUM_UNIT_TYPES; ++t) {
+                            if (b->slots[i].units[t] > 0) {
+                                oo::set_bit(m.legal, i * oo::NUM_UNIT_TYPES + t);
+                            }
+                        }
+                    }
+                    if (a.send_back) {
+                        for (int e = 0; e < a.send_back->size(); ++e) {
+                            for (int i = 0; i < b->nslots; ++i) {
+                                if (b->slots[i].faction != r.winner) continue;
+                                if (b->slots[i].origin != (*a.send_back)[e].origin_hex) continue;
+                                for (int t = 0; t < oo::NUM_UNIT_TYPES; ++t) {
+                                    if ((*a.send_back)[e].units[t] > 0) {
+                                        oo::set_bit(m.chosen, i * oo::NUM_UNIT_TYPES + t);
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+                break;
+            }
+            case oo::DecisionKind::kResource:
+                oo::set_bit(m.legal, 0);
+                oo::set_bit(m.legal, 1);
+                oo::set_bit(m.chosen, a.resource == oo::kIron ? 1 : 0);
+                break;
+            case oo::DecisionKind::kSwap:
+                oo::set_bit(m.legal, 0);
+                oo::set_bit(m.legal, 1);
+                oo::set_bit(m.chosen, a.flag ? 1 : 0);
+                break;
+            case oo::DecisionKind::kPlacement:
+                for (int h = 0; h < num_hexes_; ++h) {
+                    if (r.legal_hexes[h]) oo::set_bit(m.legal, h);
+                }
+                if (a.index >= 0) oo::set_bit(m.chosen, a.index);
+                break;
+            case oo::DecisionKind::kDraft:
+                for (int k = 0; k < r.pool_size; ++k) oo::set_bit(m.legal, r.pool[k]);
+                if (a.index >= 0) oo::set_bit(m.chosen, a.index);
+                break;
+        }
+        rec.emit(r, m.legal, m.chosen);
+    }
+
+    oo::BatchedPolicy* inner_;
+    oo::TrainWriter* writer_;
+    int num_factions_, num_hexes_, every_;
+    std::mutex mu_;
+    std::map<const oo::GameState*, Entry> games_;
+};
+
 }  // namespace
 
 int main(int argc, char** argv) {
-    std::string out_path, agent_name = "tactician";
+    std::string out_path, agent_name = "tactician", net_weights;
     int num_games = 1000, radius = 7, num_factions = 8, max_turns = 100, every = 1, threads = 0;
+    int in_flight = 256;
+    float temperature = 1.0f;
     long long base_seed = 1;
 
     for (int i = 1; i < argc; ++i) {
@@ -293,6 +477,9 @@ int main(int argc, char** argv) {
         else if (a == "--max-turns") max_turns = std::atoi(next().c_str());
         else if (a == "--every") every = std::atoi(next().c_str());
         else if (a == "--threads") threads = std::atoi(next().c_str());
+        else if (a == "--net-weights") net_weights = next();
+        else if (a == "--temperature") temperature = float(std::atof(next().c_str()));
+        else if (a == "--in-flight") in_flight = std::atoi(next().c_str());
         else {
             std::fprintf(stderr, "unknown option '%s'\n\n", a.c_str());
             usage();
@@ -329,6 +516,59 @@ int main(int argc, char** argv) {
                 writer.position_bytes(), oo::kMaskBytes, int(sizeof(oo::SampleHeader)));
     if (every > 1) std::printf("recording every %d-th decision\n", every);
     std::fflush(stdout);
+
+    // --- self-play ----------------------------------------------------------
+    // Every seat is the same network, sampling rather than taking the argmax.
+    // The games go through the batch gate exactly as a normal neural run does;
+    // the recorder just sits in front of the policy.
+    if (!net_weights.empty()) {
+        oo::NeuralConfig ncfg;
+        ncfg.weights = net_weights;
+        ncfg.radius = radius;
+        ncfg.num_factions = num_factions;
+        ncfg.temperature = temperature;
+        ncfg.sample_seed = base_seed;
+        std::string nerr;
+        auto policy = oo::make_neural_policy(ncfg, nerr);
+        if (!policy) {
+            std::fprintf(stderr, "%s\n", nerr.c_str());
+            return 1;
+        }
+        std::printf("SELF-PLAY: %s, temperature %.2f, %d games in flight\n",
+                    oo::neural_describe(*policy).c_str(), temperature, in_flight);
+        if (temperature <= 0.0f) {
+            std::printf("  WARNING: temperature 0 is argmax, so every game shows only the\n"
+                        "  moves the policy already makes and the corpus teaches nothing.\n");
+        }
+        std::fflush(stdout);
+
+        std::vector<oo::GameSpec> specs(static_cast<size_t>(num_games));
+        for (int g = 0; g < num_games; ++g) {
+            specs[static_cast<size_t>(g)].seed = base_seed + g;
+            for (int f = 0; f < num_factions; ++f) {
+                specs[static_cast<size_t>(g)].seats[f] = kind;  // unused; the net plays every seat
+            }
+        }
+
+        SelfPlayRecorder rec(policy.get(), &writer, num_factions, grid.num_hexes(), every);
+        oo::RunConfig rcfg;
+        rcfg.radius = radius;
+        rcfg.num_factions = num_factions;
+        rcfg.max_turns = max_turns;
+
+        std::vector<oo::GameResult> results(static_cast<size_t>(num_games));
+        const auto ts = std::chrono::steady_clock::now();
+        oo::run_games_batched(rcfg, specs.data(), results.data(), num_games, in_flight, in_flight,
+                              rec);
+        const double els =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - ts).count();
+        const uint64_t ns = writer.records();
+        writer.close();
+        std::printf("wrote %llu samples to %s (%.2f GB) in %.1fs (%.1f games/s)\n",
+                    static_cast<unsigned long long>(ns), out_path.c_str(),
+                    double(ns) * writer.record_bytes() / 1e9, els, num_games / els);
+        return 0;
+    }
 
     std::atomic<int> next_game{0};
     std::atomic<int> done{0};

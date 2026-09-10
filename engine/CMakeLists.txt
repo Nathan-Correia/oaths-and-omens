@@ -117,7 +117,7 @@ add_executable(oo_eval apps/oo_eval.cpp)
 target_link_libraries(oo_eval PRIVATE oo_core oo_neural)
 
 add_executable(oo_dump_training apps/oo_dump_training.cpp)
-target_link_libraries(oo_dump_training PRIVATE oo_core)
+target_link_libraries(oo_dump_training PRIVATE oo_core oo_neural)
 
 add_executable(oo_tournament apps/oo_tournament.cpp)
 target_link_libraries(oo_tournament PRIVATE oo_core)

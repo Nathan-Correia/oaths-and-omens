@@ -32,6 +32,7 @@ import time
 from collections import defaultdict
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
@@ -201,6 +202,13 @@ def main():
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--cpu", action="store_true")
     ap.add_argument("--limit", type=int, default=0, help="cap samples, for a quick run")
+    ap.add_argument("--init-from", default="",
+                    help="start from this checkpoint instead of random init - "
+                         "self-play fine-tuning must, or the policy forgets")
+    ap.add_argument("--min-vp-ratio", type=float, default=0.0,
+                    help="SELF-PLAY: keep only samples whose seat finished with at "
+                         "least this fraction of the winning score. 0 keeps everything; "
+                         "0.9 is roughly 'keep what wins'")
     ap.add_argument("--balance-buy", action="store_true", default=True,
                     help="weight rare buy variants (upgrades) in the loss")
     ap.add_argument("--no-balance-buy", dest="balance_buy", action="store_false")
@@ -218,13 +226,33 @@ def main():
         print(f"WARNING: file encoding version {info.encoding_version} != 1; features may be "
               f"misaligned and training will look like it simply does not learn")
 
-    n = len(ds)
+    # Self-play filtering. A policy imitating ITSELF learns nothing - the point
+    # is to imitate the trajectories that went well, so the corpus is cut down
+    # to the seats that scored near the winner's total. This is what makes the
+    # iteration a policy IMPROVEMENT step rather than a fixed point (PLAN.md
+    # 12.3).
+    keep = np.arange(len(ds), dtype=np.int64)
+    if args.min_vp_ratio > 0.0:
+        rows = ds.index
+        vp = ds.final_vp[rows].astype(np.float32)
+        mx = ds.max_vp[rows].astype(np.float32)
+        # A game nobody scored in says nothing about who played well; drop it
+        # rather than letting 0/0 count as a perfect ratio.
+        ratio = np.where(mx > 0, vp / np.maximum(mx, 1), 0.0)
+        keep = np.nonzero(ratio >= args.min_vp_ratio)[0].astype(np.int64)
+        print(f"self-play filter: keeping {len(keep):,} of {len(ds):,} samples "
+              f"({len(keep)/max(1,len(ds))*100:.1f}%) with vp >= "
+              f"{args.min_vp_ratio:.2f} x winner")
+        if len(keep) < 1000:
+            raise SystemExit("filter left too few samples; lower --min-vp-ratio")
+
+    n = len(keep)
     if args.limit:
         n = min(n, args.limit)
     n_val = max(1, int(n * args.val_frac))
     n_train = n - n_val
     g = torch.Generator().manual_seed(1234)
-    perm = torch.randperm(len(ds), generator=g)[:n]
+    perm = torch.from_numpy(keep)[torch.randperm(len(keep), generator=g)][:n]
     train_idx, val_idx = perm[:n_train].tolist(), perm[n_train:].tolist()
     print(f"split: {n_train:,} train / {n_val:,} val")
 
@@ -237,6 +265,16 @@ def main():
 
     net = Policy(radius=info.radius, num_factions=info.num_factions, d_model=args.d_model,
                  n_blocks=args.blocks, n_heads=args.heads).to(device)
+    if args.init_from:
+        blob = torch.load(args.init_from, map_location="cpu", weights_only=False)
+        cfg = blob.get("config", {})
+        for k, v in (("radius", info.radius), ("num_factions", info.num_factions)):
+            if k in cfg and cfg[k] != v:
+                raise SystemExit(f"checkpoint {k}={cfg[k]} but data has {v}")
+        net.load_state_dict(blob["model"])
+        print(f"initialised from {args.init_from} "
+              f"(epoch {blob.get('epoch','?')}, val_loss {blob.get('val_loss', float('nan')):.4f})")
+
     params = sum(p.numel() for p in net.parameters())
     print(f"model: d={args.d_model} x{args.blocks} blocks, {params/1000:.0f}k params, "
           f"{net.tokens} tokens")

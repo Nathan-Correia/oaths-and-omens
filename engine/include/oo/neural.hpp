@@ -34,6 +34,22 @@ struct NeuralConfig {
 
     bool cuda = true;
     bool fp16 = true;
+
+    // Softmax temperature for the single-choice heads. 0 means argmax, which is
+    // how the policy PLAYS - deterministic, and what the evaluation harness
+    // measures.
+    //
+    // Self-play needs it above zero. A deterministic policy playing itself only
+    // ever visits the actions it already takes, so the games carry no evidence
+    // about anything else and there is nothing to learn from them (PLAN.md
+    // 12.3). Sampling is what makes a self-play corpus informative.
+    float temperature = 0.0f;
+
+    // Seeds the sampling stream. Sampling is deliberately NOT reproducible per
+    // game - it is per worker thread - because generating self-play data does
+    // not need bit-reproducibility, and making it per game would mean a
+    // generator lookup on every decision.
+    int64_t sample_seed = 1;
 };
 
 // Always 0 now: the architecture lives in train/model.py, so a parameter count

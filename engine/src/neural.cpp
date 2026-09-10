@@ -8,6 +8,7 @@
 #include "oo/buy.hpp"
 #include "oo/encode.hpp"
 #include "oo/grid.hpp"
+#include "oo/rng.hpp"
 
 #include <torch/script.h>
 #include <torch/torch.h>
@@ -15,7 +16,10 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cmath>
 #include <mutex>
+#include <thread>
+#include <utility>
 #include <sstream>
 #include <vector>
 
@@ -230,6 +234,46 @@ void TorchPolicy::evaluate_impl(const DecisionRequest* requests, DecisionAnswer*
     const float* base = host.data_ptr<float>();
     const int64_t row = host.size(1);
 
+    // Per-thread sampling stream, only touched when temperature > 0.
+    thread_local Rng sample_rng(cfg_.sample_seed +
+                                static_cast<int64_t>(std::hash<std::thread::id>()(
+                                    std::this_thread::get_id())));
+
+    // Picks among (index, score) candidates: the best one at temperature 0, a
+    // softmax draw above it.
+    auto choose = [&](const std::vector<std::pair<int, float> >& cand) -> int {
+        if (cand.empty()) return -1;
+        if (cfg_.temperature <= 0.0f) {
+            int best = cand[0].first;
+            float bs = cand[0].second;
+            for (size_t i = 1; i < cand.size(); ++i) {
+                if (cand[i].second > bs) {
+                    bs = cand[i].second;
+                    best = cand[i].first;
+                }
+            }
+            return best;
+        }
+        // Shift by the max before exponentiating. Raw logits reach magnitudes
+        // where exp() overflows to inf and every weight becomes nan.
+        float mx = cand[0].second;
+        for (size_t i = 1; i < cand.size(); ++i) {
+            if (cand[i].second > mx) mx = cand[i].second;
+        }
+        std::vector<double> w(cand.size());
+        double total = 0.0;
+        for (size_t i = 0; i < cand.size(); ++i) {
+            w[i] = std::exp(double(cand[i].second - mx) / double(cfg_.temperature));
+            total += w[i];
+        }
+        double r = sample_rng.random() * total;
+        for (size_t i = 0; i < cand.size(); ++i) {
+            r -= w[i];
+            if (r <= 0.0) return cand[i].first;
+        }
+        return cand.back().first;
+    };
+
     // Column offsets into each row of the fused result.
     const int64_t off_move = 0;
     const int64_t off_pass = off_move + int64_t(hexes_) * NUM_DIRECTIONS;
@@ -259,69 +303,52 @@ void TorchPolicy::evaluate_impl(const DecisionRequest* requests, DecisionAnswer*
             case DecisionKind::kCavalry: {
                 // Legality masking is not optional (§10.7): the argmax runs over
                 // legal cells only, and `pass` competes with them.
-                float best = pass_at(i);
-                int best_h = -1, best_d = -1;
+                // Encoded hex*6+dir, with num_hexes*6 meaning "pass" - the same
+                // layout the training labels use.
+                std::vector<std::pair<int, float> > cand;
+                cand.push_back(std::make_pair(s.num_hexes * NUM_DIRECTIONS, pass_at(i)));
                 for (int h = 0; h < s.num_hexes; ++h) {
                     for (int dir = 0; dir < NUM_DIRECTIONS; ++dir) {
                         if (!r.legal_mask->cell[h][dir]) continue;
-                        const float v = move_at(i, h, dir);
-                        if (v > best) {
-                            best = v;
-                            best_h = h;
-                            best_d = dir;
-                        }
+                        cand.push_back(
+                            std::make_pair(h * NUM_DIRECTIONS + dir, move_at(i, h, dir)));
                     }
                 }
-                a.flag = best_h >= 0;
-                a.move.hex = static_cast<int16_t>(best_h);
-                a.move.dir = static_cast<int8_t>(best_d);
+                const int pick = choose(cand);
+                a.flag = pick >= 0 && pick < s.num_hexes * NUM_DIRECTIONS;
+                a.move.hex = static_cast<int16_t>(a.flag ? pick / NUM_DIRECTIONS : -1);
+                a.move.dir = static_cast<int8_t>(a.flag ? pick % NUM_DIRECTIONS : -1);
                 break;
             }
             case DecisionKind::kPlacement: {
-                int best_h = -1;
-                float best = 0.0f;
+                std::vector<std::pair<int, float> > cand;
                 for (int h = 0; h < s.num_hexes; ++h) {
-                    if (!r.legal_hexes[h]) continue;
-                    const float v = hex_at(i, h);
-                    if (best_h < 0 || v > best) {
-                        best = v;
-                        best_h = h;
-                    }
+                    if (r.legal_hexes[h]) cand.push_back(std::make_pair(h, hex_at(i, h)));
                 }
-                a.index = best_h;
+                a.index = choose(cand);
                 break;
             }
             case DecisionKind::kDraft: {
-                int best_k = 0;
-                float best = 0.0f;
+                std::vector<std::pair<int, float> > cand;
                 for (int k = 0; k < r.pool_size; ++k) {
-                    const float v = hex_at(i, r.pool[k]);
-                    if (k == 0 || v > best) {
-                        best = v;
-                        best_k = k;
-                    }
+                    cand.push_back(std::make_pair(int(r.pool[k]), hex_at(i, r.pool[k])));
                 }
-                a.index = r.pool_size > 0 ? r.pool[best_k] : -1;
+                a.index = choose(cand);
                 break;
             }
             case DecisionKind::kTarget: {
                 // Only factions actually in this battle are valid targets.
                 const Battle* b = s.battle_at(r.hex);
-                int best_f = -1;
-                float best = 0.0f;
+                std::vector<std::pair<int, float> > cand;
                 if (b) {
                     for (int slot = 0; slot < b->nslots; ++slot) {
                         const int f = b->slots[slot].faction;
                         if (f == NO_FACTION || f == r.faction) continue;
                         const int rel = (f - r.faction + s.num_factions) % s.num_factions;
-                        const float v = target_at(i, rel);
-                        if (best_f < 0 || v > best) {
-                            best = v;
-                            best_f = f;
-                        }
+                        cand.push_back(std::make_pair(f, target_at(i, rel)));
                     }
                 }
-                a.index = best_f;
+                a.index = choose(cand);
                 break;
             }
             case DecisionKind::kResource:
