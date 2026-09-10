@@ -1252,7 +1252,7 @@ invariant every army mutation must preserve.
 | ~~M9~~ | ~~Neural policy runtime (§10)~~ | **done — `oo_run --neural` plays full games on random weights: 27 225 evals/s, 9.3 games/s at r7/f8, d=128 x4, after three answer-preserving optimisations (§10.9)** |
 | ~~M10a~~ | ~~Evaluation harness (§12.1)~~ | **done — `oo_eval`. Reproduces the known ordering with non-overlapping intervals, and a self-match lands on exactly 50.0 % (150-150), which is the paired mirror proving itself** |
 | M10b | Imitate tactician (§12.2) | **trained on 10.5M samples: beats `random` 100%, `greedy` 62.2%, near-parity with `marshal` at 44.2%, `tactician` 35.4%.** Exit criterion (beat `marshal`) not quite met - 44.2% [39.9, 48.6] |
-| M10c | Self-play (§12.3) | league of past checkpoints; where search would later take over |
+| M10c | Self-play (§12.3) | machinery built (sampling, self-play dumping, outcome filtering). **First iteration produced NO measurable gain** - 53.6% [49.2, 57.9] against its predecessor, interval straddling 50, and a flat ladder. See §12.3 |
 
 M1–M4 are where nearly all the risk lives. M5 is mechanical. M6 is the largest
 *volume* of work (~1 200 lines, §6.1) but low risk, since each agent is parity-tested
@@ -2005,6 +2005,42 @@ masking, or the heads - not in the training.
 ### 12.3 M10c — self-play
 
 Only after cloning works.
+
+**First iteration: no measurable gain.** Recorded because a null result here is
+worth more than the machinery.
+
+Setup: 6 000 self-play games from `bc10k` at temperature 1.0 (6.4M samples,
+19.6 GB), filtered to seats finishing within 90 % of the winning score (18.2 %
+kept, 1.17M samples), fine-tuned 2 epochs from `bc10k`.
+
+| | bc10k | sp1 |
+|---|---:|---:|
+| vs random | 100.0 % | 100.0 % |
+| vs greedy | 62.2 % | 61.6 % |
+| vs marshal | 44.2 % | 44.4 % |
+| vs tactician | 35.4 % | 35.0 % |
+
+Head to head sp1 beats bc10k 53.6 %, but the interval is [49.2, 57.9] - it
+**straddles 50**, so that is not a separated result and must not be read as an
+improvement. The ladder is flat within noise on every rung.
+
+Three candidate explanations, untested:
+
+1. **Temperature 1.0 makes the games much worse than the policy's argmax
+   play.** The filter then keeps the best 18 % of BAD games, which need not be
+   better than what the policy already does. Lower temperature is the first
+   knob to turn.
+2. **Credit assignment is extremely weak.** A whole-game VP ratio is applied to
+   every decision in the game, including the many that a losing seat would have
+   made identically. This is what the value head is for, and using it -
+   advantage-weighted regression rather than a hard filter - is the principled
+   fix.
+3. **One iteration is one iteration.** Self-play normally needs many rounds
+   before anything shows.
+
+Note the failure §12.3 warned about (beating your predecessor while losing to
+an older checkpoint) did NOT occur - the ladder held. The result is a flat line,
+not a regression.
 
 Without search this is closer to iterated behaviour cloning or league play than
 to AlphaZero: generate games with the current policy, keep what wins, retrain,
