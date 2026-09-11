@@ -1252,7 +1252,7 @@ invariant every army mutation must preserve.
 | ~~M9~~ | ~~Neural policy runtime (§10)~~ | **done — `oo_run --neural` plays full games on random weights: 27 225 evals/s, 9.3 games/s at r7/f8, d=128 x4, after three answer-preserving optimisations (§10.9)** |
 | ~~M10a~~ | ~~Evaluation harness (§12.1)~~ | **done — `oo_eval`. Reproduces the known ordering with non-overlapping intervals, and a self-match lands on exactly 50.0 % (150-150), which is the paired mirror proving itself** |
 | M10b | Imitate tactician (§12.2) | **trained on 10.5M samples: beats `random` 100%, `greedy` 62.2%, near-parity with `marshal` at 44.2%, `tactician` 35.4%.** Exit criterion (beat `marshal`) not quite met - 44.2% [39.9, 48.6] |
-| M10c | Self-play (§12.3) | machinery built (sampling, self-play dumping, outcome filtering). **First iteration produced NO measurable gain** - 53.6% [49.2, 57.9] against its predecessor, interval straddling 50, and a flat ladder. See §12.3 |
+| M10c | Self-play (§12.3) | machinery built (sampling, self-play dumping, outcome filtering, AWR, shaped VP returns). **Four iterations, no measurable gain** - 53.6%, 50.8%, 53.8%, 53.8% against their predecessors, every interval straddling 50, ladder flat throughout. Diagnosed: the buy policy changes on ~32% of positions and strength does not move, so AWR on on-policy data is not a policy improvement operator. Next: one-ply value lookahead on buy. See §12.3 |
 
 M1–M4 are where nearly all the risk lives. M5 is mechanical. M6 is the largest
 *volume* of work (~1 200 lines, §6.1) but low risk, since each agent is parity-tested
@@ -2076,6 +2076,103 @@ Earlier candidate explanations, now largely disproved:
 Note the failure §12.3 warned about (beating your predecessor while losing to
 an older checkpoint) did NOT occur - the ladder held. The result is a flat line,
 not a regression.
+
+#### Third attempt: shaped per-decision returns (`sp2`) - also flat, and why
+
+The value target was moved off win/loss and onto a discounted sum of the VP
+gained over the next few turns (`SampleHeader` v2 carries the trajectory), with
+the advantage taken against that. The corpus was regenerated: 6,000 games,
+6.4 M samples, 19.7 GB.
+
+| | vs random | vs greedy | vs marshal | vs tactician |
+|---|---|---|---|---|
+| `bc10k` | 100.0 % | 62.2 % | 44.2 % | 35.4 % |
+| `sp2` (shaped) | 100.0 % | 61.8 % | 43.2 % | 37.0 % |
+
+Head-to-head `sp2` vs `bc10k`: 53.8 % [49.4, 58.1] - straddling 50 for the
+third time.
+
+**THE DIAGNOSIS THAT MATTERS, and it invalidates the three explanations above.**
+Comparing the two checkpoints' argmax on 6,000 held-out movement decisions:
+
+```
+movement argmax UNCHANGED between bc10k and sp2: 96.6 %
+value head bc10k vs shaped return: corr +0.803  mae 0.165
+value head sp2   vs shaped return: corr +0.879  mae 0.089
+```
+
+The policy changed its move on **3.4 % of positions**. The training run did
+learn - it learned the *value head*, nearly halving its error. The policy barely
+moved. A flat ladder from a policy that did not change is not evidence about
+rewards, credit assignment, or a strength ceiling; it is evidence that the
+update was too small to test any of those.
+
+The mechanism is inherent to advantage-weighted regression on on-policy data.
+The loss is cross-entropy against the policy's *own* actions, to which it
+already assigns 80.7 % probability - so the gradient is small before any
+weighting is applied. Re-weighting can only redistribute mass among actions the
+policy already takes; it cannot introduce one. With beta 0.5 against an
+advantage of sd 0.25, the weights sat in a narrow band around 1.0, and the fixed
+point of "imitate yourself, gently re-weighted" is where you started.
+
+#### The drift measurement, completed - and it says something worse
+
+Movement drift was the wrong place to look. The `--a-fallback` ablation had
+already shown that **buy is the entire strength gap** (routing buy to the
+teacher took the policy to 69 % against greedy; movement and cavalry moved it
+17.3 % and 16.0 %). Measured on the buy head, comparing the decoded purchase
+set rather than an argmax:
+
+```
+buy: sp2 picks an IDENTICAL purchase set to bc10k on 68.0 %  (mean L1 shift 1.443)
+buy: sp3 picks an IDENTICAL purchase set to bc10k on 68.7 %  (mean L1 shift 1.454)
+```
+
+**The buy policy changed on ~32 % of positions and the ladder did not move.**
+Sharpening beta 0.5 -> 0.15 and quadrupling the learning rate changed buy drift
+by 0.7 points - i.e. not at all - while doubling movement drift, and `sp3`
+lands on the same ladder as `sp2` and `bc10k`:
+
+| | vs random | vs greedy | vs marshal | vs tactician | vs `bc10k` |
+|---|---|---|---|---|---|
+| `bc10k` | 100.0 % | 62.2 % | 44.2 % | 35.4 % | - |
+| `sp2` | 100.0 % | 61.8 % | 43.2 % | 37.0 % | 53.8 % [49.4, 58.1] |
+| `sp3` | 100.0 % | 65.4 % | 43.2 % | 36.0 % | 53.8 % [49.4, 58.1] |
+
+So "the update was too small" is only true of movement. Where it matters the
+update was large, and it was a **wash** - the changes it made were neither
+better nor worse than what they replaced.
+
+#### The actual conclusion: there is no policy improvement operator here
+
+Advantage-weighted regression on on-policy data is self-imitation plus a
+re-weighting. It cannot propose an action the policy did not already take, and
+the re-weighting - measured - is close enough to noise with respect to strength
+that moving a third of the buy decisions leaves the ladder where it was. Three
+different objectives (outcome filter, outcome advantage, shaped-return
+advantage) all produce a flat line because they are all the same operator.
+
+AlphaZero does not work because of self-play; it works because **MCTS is a
+policy improvement operator** - it produces a target provably better than the
+network that generated it, and cloning that is what makes the loop climb. We
+have been running the loop without the part that climbs.
+
+The missing ingredient is now cheap, for a reason that was not true earlier:
+the value head is good. Trained on shaped returns it reaches corr +0.88 and
+MAE 0.088 (from +0.80 / 0.165 on win/loss), and it predicts the eventual winner
+at AUC 0.928. That is enough to build the smallest possible improvement
+operator:
+
+**One-ply lookahead on the buy decision only.** Enumerate the top-k candidate
+purchase sets, apply each to a copy of the state, score the result with V, take
+the best. Buy is the entire strength gap, and it happens once per faction per
+turn rather than once per unit - so the cost is k extra forward passes per turn,
+not per move, which is the objection that ruled out MCTS. Generate a corpus with
+that operator, clone it, and the loop finally has something to climb toward.
+
+Whatever comes next: **report drift on the buy head alongside win rate.** A
+null result without it is uninterpretable, and the two nulls above were read
+wrongly for exactly that reason.
 
 Without search this is closer to iterated behaviour cloning or league play than
 to AlphaZero: generate games with the current policy, keep what wins, retrain,
