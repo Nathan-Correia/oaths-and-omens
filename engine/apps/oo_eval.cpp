@@ -198,6 +198,7 @@ struct Side {
     bool neural = false;
     int lookahead = 0;   // one-ply value lookahead on buy; 0/1 disables
     float lookahead_tau = 1.0f;
+    bool lookahead_cells_only = false;
     AgentKind kind = AgentKind::kRandom;
     // Ablation: decision kinds this side hands back to a scripted agent.
     bool fallback[kNumDecisionKinds] = {};
@@ -273,6 +274,7 @@ Result play_matchup(const Side& a, const Side& b, const RunConfig& cfg, long lon
             nc.num_factions = cfg.num_factions;
             nc.lookahead_k = s.lookahead;
             nc.lookahead_tau = s.lookahead_tau;
+            nc.lookahead_cells_only = s.lookahead_cells_only;
             auto p = make_neural_policy(nc, err);
             if (!p) std::fprintf(stderr, "side %s: %s\n", s.name.c_str(), err.c_str());
             return p;
@@ -371,6 +373,7 @@ int main(int argc, char** argv) {
     bool ladder = false;
     int a_look = 0, b_look = 0;
     float look_tau = 1.0f;
+    bool cells_only = false;
 
     for (int i = 1; i < argc; ++i) {
         const std::string s = argv[i];
@@ -382,6 +385,7 @@ int main(int argc, char** argv) {
         else if (s == "--a-lookahead") a_look = std::atoi(next().c_str());
         else if (s == "--b-lookahead") b_look = std::atoi(next().c_str());
         else if (s == "--lookahead-tau") look_tau = float(std::atof(next().c_str()));
+        else if (s == "--lookahead-cells-only") cells_only = true;
         else if (s == "--a-fallback") fallback_kinds = next();
         else if (s == "--a-fallback-agent") fallback_agent = next();
         else if (s == "--games") pairs = std::atoi(next().c_str());
@@ -408,6 +412,7 @@ int main(int argc, char** argv) {
     if (!parse_side(a_name, a_weights, a)) return 2;
     a.lookahead = a_look;
     a.lookahead_tau = look_tau;
+    a.lookahead_cells_only = cells_only;
     if (!fallback_kinds.empty()) {
         for (const std::string& k : split_commas(fallback_kinds)) {
             int found = -1;
@@ -452,6 +457,7 @@ int main(int argc, char** argv) {
         if (!parse_side(name, name == "neural" ? b_weights : std::string(), b)) return 2;
         b.lookahead = b_look;
         b.lookahead_tau = look_tau;
+        b.lookahead_cells_only = cells_only;
         bool ok = true;
         const Result r = play_matchup(a, b, cfg, base_seed, pairs, in_flight, threads, ok);
         if (!ok) return 1;

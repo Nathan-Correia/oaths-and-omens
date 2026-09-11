@@ -1252,7 +1252,7 @@ invariant every army mutation must preserve.
 | ~~M9~~ | ~~Neural policy runtime (§10)~~ | **done — `oo_run --neural` plays full games on random weights: 27 225 evals/s, 9.3 games/s at r7/f8, d=128 x4, after three answer-preserving optimisations (§10.9)** |
 | ~~M10a~~ | ~~Evaluation harness (§12.1)~~ | **done — `oo_eval`. Reproduces the known ordering with non-overlapping intervals, and a self-match lands on exactly 50.0 % (150-150), which is the paired mirror proving itself** |
 | M10b | Imitate tactician (§12.2) | **trained on 10.5M samples: beats `random` 100%, `greedy` 62.2%, near-parity with `marshal` at 44.2%, `tactician` 35.4%.** Exit criterion (beat `marshal`) not quite met - 44.2% [39.9, 48.6] |
-| M10c | Self-play (§12.3) | machinery built (sampling, self-play dumping, outcome filtering, AWR, shaped VP returns). **Four iterations, no measurable gain** - 53.6%, 50.8%, 53.8%, 53.8% against their predecessors, every interval straddling 50, ladder flat throughout. Diagnosed: the buy policy changes on ~32% of positions and strength does not move, so AWR on on-policy data is not a policy improvement operator. Next: one-ply value lookahead on buy. See §12.3 |
+| M10c | Self-play (§12.3) | machinery built (sampling, self-play dumping, outcome filtering, AWR, shaped VP returns). **No self-play objective has produced a gain** - filtering, outcome advantage, shaped-return advantage and one-ply value lookahead all leave the ladder flat. Diagnosed: AWR on on-policy data cannot propose an unseen action, and the value head cannot rank afterstates that differ in spending. The round's real yield was a decoder bug (early break on the type-ordered scan) worth +2 to +4 points against marshal on every checkpoint. Best is now `sp3` at 65.8 / 47.0 / 39.4. See §12.3 |
 
 M1–M4 are where nearly all the risk lives. M5 is mechanical. M6 is the largest
 *volume* of work (~1 200 lines, §6.1) but low risk, since each agent is parity-tested
@@ -2173,6 +2173,95 @@ that operator, clone it, and the loop finally has something to climb toward.
 Whatever comes next: **report drift on the buy head alongside win rate.** A
 null result without it is uninterpretable, and the two nulls above were read
 wrongly for exactly that reason.
+
+#### Fourth attempt: one-ply value lookahead on buy - the operator does not work,
+#### but chasing it found a real bug
+
+The operator: enumerate k candidate purchase sets, apply each to a copy of the
+state, score the successor with the value head, keep the best. Buy only,
+because it is the whole measured strength gap and it fires once per faction per
+TURN rather than once per unit, so the cost is one extra batched forward per
+turn (measured 1.42x on corpus generation).
+
+**The first version appeared to work spectacularly and did not.** Candidates
+were drawn by adding Gumbel noise to the buy scores. Against identical weights
+without lookahead it scored 57.4% [55.2, 59.5] at k=4 over 2,000 games, and the
+ladder moved for the first time in the project: greedy 61.8 -> 66.4, marshal
+43.2 -> 48.8, tactician 37.0 -> 42.4.
+
+Cloning it produced nothing (`la1`: 50.2% against the net that generated it,
+ladder flat). Chasing THAT is what turned up the real story, in three steps:
+
+1. The teacher was a RANDOM function of the state - with tau 0 all k candidates
+   collapse to one decode, so the operator existed only by virtue of noise.
+   Cloning a stochastic teacher learns its expectation, and best-of-k noise has
+   an expectation near the plain policy. Measured: the generating net already
+   reproduced the teacher's decoded set 89.0% of the time, and the cloned net
+   managed 88.5% - it learned nothing, because averaging is exactly what
+   destroys a selection effect.
+
+2. Making the candidates deterministic meant shifting the selection threshold,
+   so candidates differed in HOW MANY purchases to make. That collapsed play to
+   15.6% against the same weights, worsening monotonically with k (11.9% at
+   k=9) and scoring 49 VP against 136. The operator had learned to buy nothing.
+   **The value head is trained only on decision-point states, where the turn's
+   gold is still unspent, so it cannot rank afterstates that differ in total
+   spending** - offered the choice it takes the full treasury every time. This
+   is a genuine limitation of afterstate evaluation with a decision-point
+   critic, and it is worth remembering before any future search work.
+
+3. Holding the count fixed - candidate j swaps the j-th weakest selected action
+   for the j-th strongest rejected one - keeps every candidate on the
+   distribution V was trained on. That version is honest and it is **neutral to
+   slightly harmful**: 46.5% at k=3 and 47.9% at k=5 head to head, and a ladder
+   of 64.0 / 47.2 / 34.8 against the plain 64.8 / 47.2 / 36.8, while changing
+   the answer on 38.2% of decisions. The value head is choosing, and its choices
+   are not better than the policy's.
+
+**THE BUG.** Restructuring the decoder for step 2 changed the baseline, which is
+how it surfaced. The selection loop iterated the TYPE-ORDERED list and broke at
+the first non-positive score:
+
+```cpp
+for (const Scored& sc : scored) {      // sorted by type rank, then score
+    if (sc.score <= 0.0f) break;       // <-- stops the whole scan
+```
+
+Type order is upgrade, outpost, infantry, conversion. So a faction whose
+upgrades all scored negative stopped scanning there and never reached its
+positive-scoring infantry - it bought nothing that turn. Taking every cell that
+scores above zero, and using the type order only for SPEND order where it
+belongs, is what the comment above the sort always claimed the code did.
+
+That single fix, at no runtime cost and on weights that were already trained,
+moves every checkpoint:
+
+| checkpoint | vs greedy | vs marshal | vs tactician |
+|---|---|---|---|
+| `bc10k` | 62.2 -> **64.0** | 44.2 -> **46.2** | 35.4 -> 35.2 |
+| `sp2` | 61.8 -> **64.8** | 43.2 -> **47.2** | 37.0 -> 36.8 |
+| `sp3` | 65.4 -> **65.8** | 43.2 -> **47.0** | 36.0 -> **39.4** |
+
+So the Gumbel operator's apparent +5 ladder points were the noise papering over
+this bug: perturbed scores sometimes lifted a type group above zero, the scan
+did not stop early, and the faction bought what it should have bought anyway.
+The fix delivers that for free and the operator then adds nothing.
+
+`sp3` is now the strongest checkpoint at 65.8 / 47.0 / 39.4. Marshal remains
+unbeaten ([42.7, 51.4] straddles 50), so the §12.2 exit criterion still stands -
+but it is now within noise of falling rather than four points away.
+
+The lookahead machinery is kept, defaulted off (`lookahead_k = 0`), with the
+`--lookahead-cells-only` ablation and the change/quantity counters, because the
+next search attempt will want them and because the afterstate finding in step 2
+is a constraint on any such attempt.
+
+**The methodological lesson, again.** The 150-game head-to-heads that first sold
+the operator read 53.3 / 58.7 / 59.7 for k = 2 / 4 / 8; at 2,000 games the same
+configurations read 57.4 and 58.5, and the effect was real but the ordering was
+noise. Two separate wrong conclusions in this section came from reading an
+interval that straddled its neighbour as though it were a ranking. Head-to-head
+buy experiments need four figures of games, not hundreds.
 
 Without search this is closer to iterated behaviour cloning or league play than
 to AlphaZero: generate games with the current policy, keep what wins, retrain,

@@ -82,6 +82,19 @@ struct NeuralConfig {
     // `temperature` alone never diversified buy at all - perturbing the scores
     // is what produces genuinely different purchase sets.
     float lookahead_tau = 1.0f;
+
+    // ABLATION. After the lookahead picks a purchase list, throw away its
+    // QUANTITIES and rebuild the list from its distinct (hex, variant) cells
+    // with the ordinary repeat-until-broke rule.
+    //
+    // That is exactly the information the training label can carry - the buy
+    // target is a bitmask over cells, so a list that buys four infantry and one
+    // that buys six are the same label. Measured, 12.0% of all buy decisions
+    // are changed by the lookahead in quantity ONLY, against 10.2% changed in
+    // which cells. This flag measures how much of the operator's strength
+    // survives that restriction, which is the ceiling on what cloning it can
+    // ever reach.
+    bool lookahead_cells_only = false;
 };
 
 // Always 0 now: the architecture lives in train/model.py, so a parameter count

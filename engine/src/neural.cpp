@@ -14,6 +14,7 @@
 #include <torch/torch.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
@@ -36,6 +37,16 @@ namespace F = torch::nn::functional;
 // C++: there was previously a second definition of every feature, and a mismatch
 // between them does not raise, it just feeds the net misaligned inputs.
 constexpr int kPosBytes = static_cast<int>(sizeof(EncodedPosition));
+
+// Lookahead diagnostics. The question these answer: when the operator departs
+// from the plain decode, is the difference something the TRAINING LABEL can
+// express? The buy label is a bitmask over (hex, variant) cells, so a change of
+// quantity - four infantry instead of six at the same city - collapses to the
+// same bits and cannot be cloned at all. Printed on destruction.
+std::atomic<long long> g_la_decisions{0};
+std::atomic<long long> g_la_changed{0};
+std::atomic<long long> g_la_cells_differ{0};
+std::atomic<long long> g_la_qty_only{0};
 
 // How many extra copies of each repeatable buy action to propose. Capitals are
 // exempt from the per-turn recruit cap (buy.cpp), so the real limit is gold, and
@@ -297,107 +308,150 @@ void TorchPolicy::evaluate_impl(const DecisionRequest* requests, DecisionAnswer*
     // The buy decode, hoisted so the lookahead below can run it repeatedly with
     // different noise to produce candidate purchase sets. `tau` 0 reproduces the
     // plain deterministic decode exactly.
+    // The buy decode, hoisted so the lookahead below can run it repeatedly to
+    // produce candidate purchase sets.
+    //
+    // `delta` SWAPS ONE MARGINAL CHOICE, and is the whole reason candidates are
+    // generated this way rather than by sampling. The first attempt drew
+    // candidates with Gumbel noise, which made the teacher a RANDOM function of
+    // the state: it answered differently for the same position, so cloning it
+    // learned the expectation of best-of-k noise, which is close to the plain
+    // policy. Measured, the cloned net reproduced the teacher's decoded set
+    // 88.5% of the time against the generating net's own 89.0% - it learned
+    // nothing, because the selection effect is precisely what averaging
+    // destroys.
+    //
+    // Shifting the margin instead is deterministic: candidate j is a fixed
+    // function of the position, so a network CAN represent the operator's
+    // answer. It also aims the search where a value head is actually useful -
+    // the cells right at the threshold, where the policy head is least sure
+    // whether the purchase is worth it.
     auto decode_buy = [&](int i, const DecisionRequest& r, ChosenBuyActions& out,
-                          float tau, Rng& rng) {
-            // Score every legal action by its (hex, variant) cell and take
-            // them in score order while positive. Actions that turn out to be
-            // unaffordable are silently skipped by apply_buy_phase, so a
-            // greedy list cannot produce an illegal state.
-            out.clear();
-            struct Scored {
-                float score;
-                int index;
-            };
-            std::vector<Scored> scored;
-            scored.reserve(static_cast<size_t>(r.legal_buy->size()));
-            for (int k = 0; k < r.legal_buy->size(); ++k) {
-                const BuyAction& act = (*r.legal_buy)[k];
-                int variant = 0;
-                switch (act.type) {
-                    case BuyType::kBuyInfantry: variant = 0; break;
-                    case BuyType::kConvertToSpecial: variant = 1 + act.unit_type; break;
-                    case BuyType::kBuildOutpost: variant = 3 + act.unit_type; break;
-                    default: variant = 6 + act.upgrade; break;
-                }
-                if (variant > 8) variant = 8;
-                float sc = buy_at(i, act.hex, variant);
-                if (tau > 0.0f) {
-                    // Gumbel noise on the logits: perturb-and-argmax draws
-                    // from the softmax, so each candidate is a legitimate
-                    // sample of the policy rather than an arbitrary jitter.
-                    double u = rng.random();
-                    if (u <= 0.0) u = 1e-12;
-                    sc += tau * static_cast<float>(-std::log(-std::log(u)));
-                }
-                scored.push_back({sc, k});
+                          int delta) {
+        out.clear();
+        struct Scored {
+            float score;
+            int index;
+        };
+        std::vector<Scored> scored;
+        scored.reserve(static_cast<size_t>(r.legal_buy->size()));
+        for (int k = 0; k < r.legal_buy->size(); ++k) {
+            const BuyAction& act = (*r.legal_buy)[k];
+            int variant = 0;
+            switch (act.type) {
+                case BuyType::kBuyInfantry: variant = 0; break;
+                case BuyType::kConvertToSpecial: variant = 1 + act.unit_type; break;
+                case BuyType::kBuildOutpost: variant = 3 + act.unit_type; break;
+                default: variant = 6 + act.upgrade; break;
             }
-            // Sort by TYPE first, score second.
-            //
-            // apply_buy_phase spends gold in list order, and an outpost is
-            // the only source of victory points in the game (collect.cpp:
-            // only non-capital cities score). Emitting in pure score order
-            // let infantry - 25 of them at 2 gold each - drain the treasury
-            // before the 3-gold outpost was ever attempted, so the policy
-            // could hold territory and still score nothing.
-            //
-            // The teacher orders the same way and for the same reason:
-            // greedy_buy_common pushes its one upgrade-or-outpost action
-            // before any infantry or conversions. Upgrades come before new
-            // outposts because only one of the two happens per turn, and
-            // improving ground already held beats founding more.
-            auto rank = [](BuyType t) {
-                switch (t) {
-                    case BuyType::kUpgradeOutpost: return 0;
-                    case BuyType::kBuildOutpost: return 1;
-                    case BuyType::kBuyInfantry: return 2;
-                    default: return 3;  // conversions last
-                }
-            };
-            std::stable_sort(scored.begin(), scored.end(),
-                             [&](const Scored& p, const Scored& q) {
-                                 const int rp = rank((*r.legal_buy)[p.index].type);
-                                 const int rq = rank((*r.legal_buy)[q.index].type);
-                                 if (rp != rq) return rp < rq;
-                                 return p.score > q.score;
-                             });
-            int n_selected = 0;
-            for (const Scored& sc : scored) {
-                if (sc.score <= 0.0f) break;
-                if (out.size() >= kMaxChosenBuy) break;
-                out.push_back((*r.legal_buy)[sc.index]);
-                ++n_selected;
-            }
+            if (variant > 8) variant = 8;
+            scored.push_back({buy_at(i, act.hex, variant), k});
+        }
+        if (scored.empty()) return;
 
-            // REPEAT the repeatable picks until the budget stops them.
-            //
-            // The teacher buys `gold / kInfantryCost` infantry - 25 of them
-            // on turn one - by pushing the same action over and over. The
-            // training label is a bitmask with one bit per (hex, variant),
-            // so all 25 collapse into one bit and the net is taught "buy
-            // infantry here" ONCE. Emitting each cell once then made it
-            // structurally impossible to buy more than one unit per city per
-            // turn, which starved it of units. Measured: with buy handed to
-            // the teacher instead, win rate against greedy went 18% -> 69%.
-            //
-            // Repeating is safe because apply_one validates every action and
-            // silently skips what cannot be afforded (buy.cpp), so the
-            // engine - not this decoder - decides where the money runs out.
-            // Only infantry and conversions repeat; the per-turn cap allows
-            // just one outpost or upgrade action anyway.
-            for (int pass = 0; pass < kBuyRepeatPasses && n_selected > 0; ++pass) {
-                bool appended = false;
-                for (int k = 0; k < n_selected; ++k) {
-                    const BuyAction& act = out[k];
-                    if (act.type != BuyType::kBuyInfantry &&
-                        act.type != BuyType::kConvertToSpecial) {
-                        continue;
-                    }
-                    if (out.size() >= kMaxChosenBuy) break;
-                    out.push_back(act);
-                    appended = true;
-                }
-                if (!appended) break;
+        // WHICH actions to take: the top T by score, where T is normally the
+        // number scoring above zero. Sorting by score alone here is right
+        // because the threshold is a score question; the type ordering below is
+        // a separate, spending-order question.
+        std::vector<Scored> by_score = scored;
+        std::stable_sort(by_score.begin(), by_score.end(),
+                         [](const Scored& p, const Scored& q) { return p.score > q.score; });
+        int n_pass = 0;
+        while (n_pass < static_cast<int>(by_score.size()) &&
+               by_score[static_cast<size_t>(n_pass)].score > 0.0f) {
+            ++n_pass;
+        }
+        int take = n_pass;
+        if (take > kMaxChosenBuy) take = kMaxChosenBuy;
+
+        // Candidate `delta` SWAPS the delta-th weakest selected action for the
+        // delta-th strongest rejected one. The count is preserved exactly, and
+        // that is not a detail - it is the constraint the whole operator lives
+        // under.
+        //
+        // The first deterministic attempt shifted the threshold instead, so
+        // candidates differed in HOW MANY purchases they made. That collapsed
+        // play to 15.6% against the same weights without lookahead, worsening
+        // monotonically with k (11.9% at k=9) and scoring 49 VP against 136:
+        // the operator had learned to buy nothing. The value head is trained
+        // only on decision-point states, where the turn's gold is still unspent,
+        // so it cannot rank afterstates that differ in total spending - offered
+        // the choice it prefers the full treasury every time. Holding the count
+        // fixed keeps every candidate on the distribution V was actually
+        // trained on, and asks it only the question it can answer: given that
+        // this much is being spent, on WHAT should it go.
+        const int n_all = static_cast<int>(by_score.size());
+        if (delta > 0 && take - delta >= 0 && take - 1 + delta < n_all) {
+            std::swap(by_score[static_cast<size_t>(take - delta)],
+                      by_score[static_cast<size_t>(take - 1 + delta)]);
+        }
+        by_score.resize(static_cast<size_t>(take));
+
+        // IN WHAT ORDER to spend: by TYPE first, score second.
+        //
+        // apply_buy_phase spends gold in list order, and an outpost is the only
+        // source of victory points in the game (collect.cpp: only non-capital
+        // cities score). Emitting in pure score order let infantry - 25 of them
+        // at 2 gold each - drain the treasury before the 3-gold outpost was ever
+        // attempted, so the policy could hold territory and still score nothing.
+        //
+        // The teacher orders the same way and for the same reason:
+        // greedy_buy_common pushes its one upgrade-or-outpost action before any
+        // infantry or conversions. Upgrades come before new outposts because
+        // only one of the two happens per turn, and improving ground already
+        // held beats founding more.
+        auto rank = [](BuyType t) {
+            switch (t) {
+                case BuyType::kUpgradeOutpost: return 0;
+                case BuyType::kBuildOutpost: return 1;
+                case BuyType::kBuyInfantry: return 2;
+                default: return 3;  // conversions last
             }
+        };
+        std::stable_sort(by_score.begin(), by_score.end(),
+                         [&](const Scored& p, const Scored& q) {
+                             const int rp = rank((*r.legal_buy)[p.index].type);
+                             const int rq = rank((*r.legal_buy)[q.index].type);
+                             if (rp != rq) return rp < rq;
+                             return p.score > q.score;
+                         });
+        int n_selected = 0;
+        for (const Scored& sc : by_score) {
+            if (out.size() >= kMaxChosenBuy) break;
+            out.push_back((*r.legal_buy)[sc.index]);
+            ++n_selected;
+        }
+
+        // REPEAT the repeatable picks until the budget stops them.
+        //
+        // The teacher buys `gold / kInfantryCost` infantry - 25 of them on turn
+        // one - by pushing the same action over and over. The training label is
+        // a bitmask with one bit per (hex, variant), so all 25 collapse into one
+        // bit and the net is taught "buy infantry here" ONCE. Emitting each cell
+        // once then made it structurally impossible to buy more than one unit
+        // per city per turn, which starved it of units. Measured: with buy
+        // handed to the teacher instead, win rate against greedy went 18% ->
+        // 69%.
+        //
+        // Repeating is safe because apply_one validates every action and
+        // silently skips what cannot be afforded (buy.cpp), so the engine - not
+        // this decoder - decides where the money runs out. Only infantry and
+        // conversions repeat; the per-turn cap allows just one outpost or
+        // upgrade action anyway.
+        for (int pass = 0; pass < kBuyRepeatPasses && n_selected > 0; ++pass) {
+            bool appended = false;
+            for (int k = 0; k < n_selected; ++k) {
+                const BuyAction& act = out[k];
+                if (act.type != BuyType::kBuyInfantry &&
+                    act.type != BuyType::kConvertToSpecial) {
+                    continue;
+                }
+                if (out.size() >= kMaxChosenBuy) break;
+                out.push_back(act);
+                appended = true;
+            }
+            if (!appended) break;
+        }
     };
 
     for (int i = 0; i < n; ++i) {
@@ -466,7 +520,7 @@ void TorchPolicy::evaluate_impl(const DecisionRequest* requests, DecisionAnswer*
                 a.flag = swap_at(i, 0) > swap_at(i, 1);
                 break;
             case DecisionKind::kBuy:
-                decode_buy(i, r, *a.buy, 0.0f, sample_rng);
+                decode_buy(i, r, *a.buy, 0);
                 break;
             case DecisionKind::kRectification: {
                 // Score (battle slot, unit type) and send units back one at a
@@ -560,7 +614,11 @@ void TorchPolicy::evaluate_impl(const DecisionRequest* requests, DecisionAnswer*
                 if (r.faction < 0 || r.faction >= MAX_FACTIONS) continue;
                 for (int j = 0; j < k; ++j) {
                     ChosenBuyActions& c = cand[si * static_cast<size_t>(k) + j];
-                    decode_buy(i, r, c, j == 0 ? 0.0f : cfg_.lookahead_tau, sample_rng);
+                    // Candidate 0 is the plain decode; j>0 swaps the j-th
+                    // marginal selection for the j-th best rejected one, so the
+                    // operator can only depart from the policy when the value
+                    // head prefers a DIFFERENT purchase, never a cheaper turn.
+                    decode_buy(i, r, c, j);
                     // Gumbel noise reproduces the plain decode often enough that
                     // skipping duplicates is most of the batch back.
                     bool dup = false;
@@ -605,18 +663,106 @@ void TorchPolicy::evaluate_impl(const DecisionRequest* requests, DecisionAnswer*
                         best_j[static_cast<size_t>(si)] = which[static_cast<size_t>(t)];
                     }
                 }
+                // The set of (hex, variant) cells a purchase list touches -
+                // exactly what the training bitmask records, and nothing more.
+                auto cell_set = [](const ChosenBuyActions& c) {
+                    std::vector<int> v;
+                    for (int t = 0; t < c.size(); ++t) {
+                        int variant = 0;
+                        switch (c[t].type) {
+                            case BuyType::kBuyInfantry: variant = 0; break;
+                            case BuyType::kConvertToSpecial: variant = 1 + c[t].unit_type; break;
+                            case BuyType::kBuildOutpost: variant = 3 + c[t].unit_type; break;
+                            default: variant = 6 + c[t].upgrade; break;
+                        }
+                        if (variant > 8) variant = 8;
+                        v.push_back(c[t].hex * 9 + variant);
+                    }
+                    std::sort(v.begin(), v.end());
+                    v.erase(std::unique(v.begin(), v.end()), v.end());
+                    return v;
+                };
                 for (size_t si = 0; si < slots; ++si) {
                     ChosenBuyActions* dst_buy = answers[buy_idx[si]].buy;
-                    if (dst_buy) {
-                        *dst_buy = cand[si * static_cast<size_t>(k) +
-                                        static_cast<size_t>(best_j[si])];
+                    const ChosenBuyActions& plain = cand[si * static_cast<size_t>(k)];
+                    const ChosenBuyActions& pick =
+                        cand[si * static_cast<size_t>(k) + static_cast<size_t>(best_j[si])];
+                    g_la_decisions.fetch_add(1, std::memory_order_relaxed);
+                    if (best_j[si] != 0) {
+                        g_la_changed.fetch_add(1, std::memory_order_relaxed);
+                        if (cell_set(plain) != cell_set(pick)) {
+                            g_la_cells_differ.fetch_add(1, std::memory_order_relaxed);
+                        } else {
+                            g_la_qty_only.fetch_add(1, std::memory_order_relaxed);
+                        }
                     }
+                    if (!dst_buy) continue;
+                    if (!cfg_.lookahead_cells_only) {
+                        *dst_buy = pick;
+                        continue;
+                    }
+                    // Keep only what a bitmask label could reproduce: the
+                    // distinct cells, in the decoder's type order, re-expanded
+                    // by the ordinary repeat rule.
+                    ChosenBuyActions reduced;
+                    reduced.clear();
+                    std::vector<int> seen;
+                    for (int t = 0; t < pick.size(); ++t) {
+                        int variant = 0;
+                        switch (pick[t].type) {
+                            case BuyType::kBuyInfantry: variant = 0; break;
+                            case BuyType::kConvertToSpecial: variant = 1 + pick[t].unit_type; break;
+                            case BuyType::kBuildOutpost: variant = 3 + pick[t].unit_type; break;
+                            default: variant = 6 + pick[t].upgrade; break;
+                        }
+                        if (variant > 8) variant = 8;
+                        const int cell = pick[t].hex * 9 + variant;
+                        if (std::find(seen.begin(), seen.end(), cell) != seen.end()) continue;
+                        seen.push_back(cell);
+                        reduced.push_back(pick[t]);
+                    }
+                    const int base_n = reduced.size();
+                    for (int pass = 0; pass < kBuyRepeatPasses && base_n > 0; ++pass) {
+                        bool appended = false;
+                        for (int t = 0; t < base_n; ++t) {
+                            const BuyAction& act = reduced[t];
+                            if (act.type != BuyType::kBuyInfantry &&
+                                act.type != BuyType::kConvertToSpecial) {
+                                continue;
+                            }
+                            if (reduced.size() >= kMaxChosenBuy) break;
+                            reduced.push_back(act);
+                            appended = true;
+                        }
+                        if (!appended) break;
+                    }
+                    *dst_buy = reduced;
                 }
             }
         }
     }
 }
 
+}  // namespace
+
+namespace {
+struct LookaheadReport {
+    ~LookaheadReport() {
+        const long long d = g_la_decisions.load();
+        if (d == 0) return;
+        const long long c = g_la_changed.load();
+        std::fprintf(stderr,
+                     "buy lookahead: %lld decisions, changed the answer %lld "
+                     "(%.1f%%); of those %lld differ in WHICH cells (%.1f%% of all) "
+                     "and %lld differ only in QUANTITY (%.1f%% of all, invisible to "
+                     "the training label)\n",
+                     d, c, 100.0 * double(c) / double(d), g_la_cells_differ.load(),
+                     100.0 * double(g_la_cells_differ.load()) / double(d),
+                     g_la_qty_only.load(),
+                     100.0 * double(g_la_qty_only.load()) / double(d));
+    }
+};
+LookaheadReport g_la_report;
 }  // namespace
 
 bool neural_available() { return true; }
