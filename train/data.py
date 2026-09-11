@@ -224,3 +224,51 @@ def unpack_bits(mask_bytes: torch.Tensor, n_bits: int) -> torch.Tensor:
     bits = torch.arange(8, device=mask_bytes.device, dtype=torch.uint8)
     out = (mask_bytes.unsqueeze(-1) >> bits) & 1
     return out.view(b, -1)[:, :n_bits].float()
+
+
+class ConcatSampleFile:
+    """Several corpora as one dataset - DAgger's aggregation step.
+
+    DAgger trains on the union of every round's data, not just the latest. The
+    point is retention: each round's corpus covers the states THAT round's
+    student visited, and a student whose distribution has narrowed will happily
+    forget positions it used to handle. Initialising from the previous
+    checkpoint is a weaker substitute, because nothing in the loss pushes back
+    when the new data disagrees.
+
+    Exposes the same surface SampleFile does - info, index, kind, ret - because
+    the trainer samples and weights by those directly.
+    """
+
+    def __init__(self, paths):
+        self.parts = [SampleFile(p) for p in paths]
+        first = self.parts[0].info
+        for p, part in zip(paths, self.parts):
+            i = part.info
+            if (i.radius, i.num_factions, i.num_hexes, i.position_bytes) != (
+                    first.radius, first.num_factions, first.num_hexes,
+                    first.position_bytes):
+                raise ValueError(
+                    f"{p} was dumped for radius {i.radius}/{i.num_factions} factions, "
+                    f"but {paths[0]} is radius {first.radius}/{first.num_factions}. "
+                    f"Corpora can only be aggregated within one bucket.")
+        self.info = first
+        self._offsets = np.cumsum([0] + [len(p) for p in self.parts])
+        # Global row ids, so index/kind/ret line up with __getitem__.
+        self.index = np.concatenate(
+            [p.index + off for p, off in zip(self.parts, self._offsets[:-1])])
+        self.kind = np.concatenate([p.kind for p in self.parts])
+        self.ret = np.concatenate([p.ret for p in self.parts])
+
+    def shaped_return(self, **kw):
+        for p in self.parts:
+            p.shaped_return(**kw)
+        self.ret = np.concatenate([p.ret for p in self.parts])
+        return self.ret
+
+    def __len__(self):
+        return int(self._offsets[-1])
+
+    def __getitem__(self, row):
+        j = int(np.searchsorted(self._offsets, row, side="right")) - 1
+        return self.parts[j][row - int(self._offsets[j])]

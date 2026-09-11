@@ -38,7 +38,8 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from data import (KIND_BUY, KIND_HEAD, KIND_NAMES, MULTI_LABEL_KINDS, SampleFile,
+from data import (ConcatSampleFile, KIND_BUY, KIND_HEAD, KIND_NAMES,
+                  MULTI_LABEL_KINDS, SampleFile,
                   action_bits, unpack_bits)
 from model import BUY_VARIANTS
 from model import Policy
@@ -248,7 +249,13 @@ def main():
         print("kind weights: " + ", ".join(
             f"{n} {w:g}" for n, w in zip(KIND_NAMES, kind_weights) if w != 1.0))
 
-    ds = SampleFile(args.data[0])
+    if len(args.data) == 1:
+        ds = SampleFile(args.data[0])
+    else:
+        ds = ConcatSampleFile(args.data)
+        print(f"aggregating {len(args.data)} corpora: " +
+              ", ".join(f"{os.path.basename(p)} ({len(d):,})"
+                        for p, d in zip(args.data, ds.parts)))
     info = ds.info
     ds.shaped_return(gamma=args.gamma, win_bonus=args.win_bonus, scale=args.reward_scale)
     print(f"shaped return: gamma {args.gamma}, win bonus {args.win_bonus}, "
