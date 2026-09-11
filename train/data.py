@@ -181,9 +181,23 @@ class SampleFile(Dataset):
     # pickle, which does not point anywhere near the cause). Drop the handle on
     # the way out and reopen it in the worker; the file is read-only, so every
     # process mapping it independently is free.
+    # Arrays only the PARENT uses - for sampling, loss weighting and the
+    # shaped return. __getitem__ touches index, kind, won and ret and nothing
+    # else, so these are dead weight in a worker.
+    _PARENT_ONLY = ("faction", "final_vp", "max_vp", "turn",
+                    "vp_now", "vp_p1", "vp_p2", "vp_p3", "vp_p5")
+
     def __getstate__(self):
+        # DataLoader workers are SPAWNED on Windows, so the whole dataset is
+        # pickled down a pipe to each one. The memmap cannot survive that and
+        # is reopened on the far side; the per-row header arrays CAN survive it
+        # but at 31 bytes a row they need not - three aggregated corpora came to
+        # 521 MB per worker and the pickle truncated. Dropping the nine the
+        # worker never reads takes that to 14 bytes a row.
         state = self.__dict__.copy()
         state["mm"] = None
+        for k in self._PARENT_ONLY:
+            state[k] = None
         return state
 
     def __setstate__(self, state):
@@ -196,6 +210,17 @@ class SampleFile(Dataset):
     def counts_by_kind(self):
         return {KIND_NAMES[k]: int((self.kind == k).sum()) for k in range(9)
                 if (self.kind == k).any()}
+
+    def bulk_masks(self, rows, chunk=8192):
+        """Mask bytes for `rows`, in chunks. See ConcatSampleFile.bulk_masks -
+        reading these one at a time through __getitem__ meant 60k scattered
+        reads over a 32 GB file and took longer than an epoch."""
+        rows = np.sort(np.asarray(rows))
+        for start in range(0, len(rows), chunk):
+            r = rows[start:start + chunk]
+            if len(r) == 0:
+                continue
+            yield np.asarray(self.mm[r, self._pos_end:])
 
     def __getitem__(self, i):
         r = int(self.index[i])
@@ -253,6 +278,17 @@ class ConcatSampleFile:
                     f"but {paths[0]} is radius {first.radius}/{first.num_factions}. "
                     f"Corpora can only be aggregated within one bucket.")
         self.info = first
+        # The offsets below are used BOTH to address rows (kind, ret, final_vp
+        # are indexed by row id) and to address dataset positions (__getitem__
+        # and __len__). Those two spaces coincide only because SampleFile builds
+        # index as arange over every record; a kind-filtered part would make
+        # them differ silently, so refuse it rather than corrupt the mapping.
+        for path, part in zip(paths, self.parts):
+            if len(part.index) != part.info.num_records:
+                raise ValueError(
+                    f"{path} was opened with a kind filter ({len(part.index):,} of "
+                    f"{part.info.num_records:,} records). Aggregation indexes rows "
+                    f"directly and cannot mix filtered corpora.")
         self._offsets = np.cumsum([0] + [len(p) for p in self.parts])
         # Global row ids, so index/kind/ret line up with __getitem__.
         self.index = np.concatenate(
@@ -260,11 +296,70 @@ class ConcatSampleFile:
         self.kind = np.concatenate([p.kind for p in self.parts])
         self.ret = np.concatenate([p.ret for p in self.parts])
 
-    def shaped_return(self, **kw):
-        for p in self.parts:
-            p.shaped_return(**kw)
+    def shaped_return(self, gamma=0.8, win_bonus=1.0, scale=None):
+        """One shared reward scale across every corpus.
+
+        Letting each part auto-calibrate its own 95th percentile would give the
+        same position a different return depending on which file it came from,
+        and the value head would be fitting the average of three inconsistent
+        targets. Calibrate on the first part, then apply that scale to all of
+        them - later DAgger rounds are drawn from a stronger student and score
+        more, which is real signal the scale should preserve rather than
+        normalise away.
+        """
+        self.parts[0].shaped_return(gamma=gamma, win_bonus=win_bonus, scale=scale)
+        shared = self.parts[0].reward_scale
+        for p in self.parts[1:]:
+            p.shaped_return(gamma=gamma, win_bonus=win_bonus, scale=shared)
+        self.reward_scale = shared
         self.ret = np.concatenate([p.ret for p in self.parts])
         return self.ret
+
+    def __getstate__(self):
+        # DataLoader workers are SPAWNED on Windows, so the dataset is pickled
+        # to each one. They only ever call __getitem__, which needs `parts` and
+        # `_offsets` - the index/kind/ret arrays are for sampling and loss
+        # weighting in the parent. Aggregated over three corpora those are
+        # ~220 MB, and shipping them down six worker pipes truncates the pickle.
+        state = self.__dict__.copy()
+        for k in ("index", "kind", "ret"):
+            state[k] = None
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+
+    def counts_by_kind(self):
+        return {KIND_NAMES[k]: int((self.kind == k).sum()) for k in range(9)
+                if (self.kind == k).any()}
+
+    def bulk_masks(self, rows, chunk=8192):
+        """Mask bytes for `rows`, yielded in chunks, part by part.
+
+        SampleFile lets the caller slice its memmap directly, which a
+        concatenation cannot offer - the rows live in different files. Rather
+        than expose a fake `mm`, this hands back the same bytes the caller was
+        slicing for, already grouped so each part's reads stay sequential. Row
+        ids are global; they come back sorted within a part.
+        """
+        rows = np.asarray(rows)
+        for j, part in enumerate(self.parts):
+            lo_row = int(self._offsets[j])
+            hi_row = int(self._offsets[j + 1])
+            mine = np.sort(rows[(rows >= lo_row) & (rows < hi_row)]) - lo_row
+            for start in range(0, len(mine), chunk):
+                r = mine[start:start + chunk]
+                if len(r) == 0:
+                    continue
+                yield np.asarray(part.mm[r, part._pos_end:])
+
+    @property
+    def final_vp(self):
+        return np.concatenate([p.final_vp for p in self.parts])
+
+    @property
+    def max_vp(self):
+        return np.concatenate([p.max_vp for p in self.parts])
 
     def __len__(self):
         return int(self._offsets[-1])

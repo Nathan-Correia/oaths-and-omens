@@ -151,11 +151,7 @@ def buy_variant_weights(ds, idx, sample=60000):
     # at a time through __getitem__ meant 60k scattered reads over a 32 GB file
     # and took longer than an epoch; sorting the row ids first also keeps the
     # access roughly sequential.
-    rows = np.sort(buy_rows)
-    lo, mid = ds._pos_end, ds._legal_end
-    for start in range(0, len(rows), 8192):
-        r = rows[start:start + 8192]
-        block = np.asarray(ds.mm[r, lo:])
+    for block in ds.bulk_masks(buy_rows):
         lg = np.unpackbits(block[:, :ds.info.mask_bytes], axis=1, bitorder="little")[:, :bits]
         ch = np.unpackbits(block[:, ds.info.mask_bytes:], axis=1, bitorder="little")[:, :bits]
         for v in range(BUY_VARIANTS):
