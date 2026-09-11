@@ -69,9 +69,28 @@ enum class AgentKind {
     kRandom, kGreedy, kHeuristic, kVanguard, kMarshal,       // M6a
     kTurtle, kDenier, kWarlord, kLegion, kHussar, kSentinel,  // M6b leaves
     kTactician,                                              // M6b, the search agent
+
+    // A TEACHER, not an opponent. Identical to marshal except that greedy's buy
+    // tie-breaks deterministically instead of by RNG (PLAN.md §12.5).
+    //
+    // greedy_buy_common shuffles the candidate hex list and samples a city per
+    // infantry purchase, so its answer is a random variable given the position.
+    // Measured over 8 draws of the same decision, two draws agree on the
+    // purchase SET only 44% of the time and the modal set comes up 56%. A
+    // network trained on it therefore cannot exceed roughly half agreement no
+    // matter how it is trained - and measured, ours sits at 45.2% and does not
+    // move for 8x gradient weight, three epochs, or any decode threshold.
+    //
+    // Since buy is the entire measured strength gap (+8.8 points when handed
+    // back to the teacher) and the teacher is only a greedy heuristic, the
+    // target being unlearnable is the binding constraint. This kind exists to
+    // remove it. It is deliberately NOT added to the ladder: opponents stay as
+    // they were so every earlier measurement stays comparable.
+    kMarshalDet,
+    kTacticianDet,
 };
 
-inline constexpr int kNumAgentKinds = 12;
+inline constexpr int kNumAgentKinds = 14;
 
 // `seed` is the per-GAME seed; each faction's generator is seeded
 // seed * 1_000_003 + faction, exactly as engine_old does.

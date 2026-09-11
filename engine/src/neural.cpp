@@ -358,7 +358,7 @@ void TorchPolicy::evaluate_impl(const DecisionRequest* requests, DecisionAnswer*
                          [](const Scored& p, const Scored& q) { return p.score > q.score; });
         int n_pass = 0;
         while (n_pass < static_cast<int>(by_score.size()) &&
-               by_score[static_cast<size_t>(n_pass)].score > 0.0f) {
+               by_score[static_cast<size_t>(n_pass)].score > cfg_.buy_threshold) {
             ++n_pass;
         }
         int take = n_pass;

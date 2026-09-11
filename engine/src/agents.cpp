@@ -115,7 +115,7 @@ constexpr int kUpgradePriority[NUM_UPGRADE_TYPES] = {kTemple, kBarracks, kWorksh
 // unit type (see the `hussar_conversions` branch at the bottom).
 void greedy_buy_common(Rng& rng, const GameState& state, int faction,
                        const LegalBuyActions& legal, ChosenBuyActions& out,
-                       bool hussar_conversions) {
+                       bool hussar_conversions, bool deterministic) {
     out.clear();
 
     // Bucket by kind, preserving `legal`'s order.
@@ -165,8 +165,12 @@ void greedy_buy_common(Rng& rng, const GameState& state, int faction,
         if (hexes.empty()) return;
 
         // rng.shuffle over the hex list, then take the first. Shuffled in place
-        // on the fixed buffer - no allocation in the turn loop.
-        rng.shuffle(hexes.items, static_cast<size_t>(hexes.count));
+        // on the fixed buffer - no allocation in the turn loop. The
+        // deterministic teacher keeps discovery order instead, which is a
+        // function of the position alone and so can actually be learned.
+        if (!deterministic) {
+            rng.shuffle(hexes.items, static_cast<size_t>(hexes.count));
+        }
         const int16_t chosen_hex = hexes[0];
 
         const int n_pref = is_upgrade ? NUM_UPGRADE_TYPES : NUM_UNIT_TYPES;
@@ -192,8 +196,15 @@ void greedy_buy_common(Rng& rng, const GameState& state, int faction,
     if (!infantry_actions.empty()) {
         const int num_purchases = state.gold[faction] / kInfantryCost;
         for (int i = 0; i < num_purchases; ++i) {
-            out.push_back(legal[infantry_actions[static_cast<int>(
-                rng.choice_index(static_cast<size_t>(infantry_actions.size())))]]);
+            // Round-robin is the deterministic analogue of sampling uniformly:
+            // it spreads recruits over the same cities in the same proportion,
+            // which matters because the per-outpost recruit cap would otherwise
+            // silently discard purchases piled onto one city.
+            const int slot = deterministic
+                                 ? (i % infantry_actions.size())
+                                 : static_cast<int>(rng.choice_index(
+                                       static_cast<size_t>(infantry_actions.size())));
+            out.push_back(legal[infantry_actions[slot]]);
         }
     }
 
@@ -225,8 +236,11 @@ void greedy_buy_common(Rng& rng, const GameState& state, int faction,
             }
             const SmallVec<int16_t, kMaxLegalBuy>& pool =
                 matching.empty() ? convert_actions : matching;
-            out.push_back(
-                legal[pool[static_cast<int>(rng.choice_index(static_cast<size_t>(pool.size())))]]);
+            const int pslot = deterministic
+                                  ? 0
+                                  : static_cast<int>(
+                                        rng.choice_index(static_cast<size_t>(pool.size())));
+            out.push_back(legal[pool[pslot]]);
             if (hussar_conversions && want == kCavalry) ++cav_count;
         }
     }
@@ -234,12 +248,20 @@ void greedy_buy_common(Rng& rng, const GameState& state, int faction,
 
 void greedy_buy(Rng& rng, const GameState& state, int faction, const LegalBuyActions& legal,
                 ChosenBuyActions& out) {
-    greedy_buy_common(rng, state, faction, legal, out, /*hussar_conversions=*/false);
+    greedy_buy_common(rng, state, faction, legal, out, /*hussar_conversions=*/false,
+                      /*deterministic=*/false);
+}
+
+void greedy_buy_det(Rng& rng, const GameState& state, int faction,
+                    const LegalBuyActions& legal, ChosenBuyActions& out) {
+    greedy_buy_common(rng, state, faction, legal, out, /*hussar_conversions=*/false,
+                      /*deterministic=*/true);
 }
 
 void hussar_buy(Rng& rng, const GameState& state, int faction, const LegalBuyActions& legal,
                 ChosenBuyActions& out) {
-    greedy_buy_common(rng, state, faction, legal, out, /*hussar_conversions=*/true);
+    greedy_buy_common(rng, state, faction, legal, out, /*hussar_conversions=*/true,
+                      /*deterministic=*/false);
 }
 
 // Distance from `hex_index` to the nearest of `others`.
@@ -1411,6 +1433,33 @@ SetupDecisions make_setup_decisions(const AgentSet& agents) {
     return sd;
 }
 
+// marshal, but greedy's buy tie-breaks deterministically. A TEACHER only - see
+// AgentKind::kMarshalDet. Everything else, including the RNG-driven movement
+// and targeting, is untouched: only the buy answer becomes a function of the
+// position alone.
+class MarshalDetAgent : public MarshalAgent {
+public:
+    void decide_buy(const GameState& s, int faction, const LegalBuyActions& legal,
+                    ChosenBuyActions& out) override {
+        greedy_buy_det(rng, s, faction, legal, out);
+    }
+};
+
+// tactician, with greedy's buy tie-breaking deterministically. The teacher used
+// to generate training corpora: tactician's search quality on every other head,
+// and a buy target that is a function of the position alone.
+class TacticianDetAgent : public TacticianAgent {
+public:
+    TacticianDetAgent(std::shared_ptr<TacticianShared> shared,
+                      std::shared_ptr<GameState> scratch)
+        : TacticianAgent(std::move(shared), std::move(scratch)) {}
+
+    void decide_buy(const GameState& s, int faction, const LegalBuyActions& legal,
+                    ChosenBuyActions& out) override {
+        greedy_buy_det(rng, s, faction, legal, out);
+    }
+};
+
 void build_agents(AgentSet& out, AgentKind kind, int num_factions, int64_t seed) {
     out.num_factions = num_factions;
 
@@ -1420,7 +1469,7 @@ void build_agents(AgentSet& out, AgentKind kind, int num_factions, int64_t seed)
     // faction) is load-bearing, not an optimisation.
     std::shared_ptr<TacticianShared> shared;
     std::shared_ptr<GameState> scratch;
-    if (kind == AgentKind::kTactician) {
+    if (kind == AgentKind::kTactician || kind == AgentKind::kTacticianDet) {
         shared = std::make_shared<TacticianShared>();
         build_agents(shared->mine, AgentKind::kMarshal, num_factions, seed);
         build_agents(shared->opp, AgentKind::kRandom, num_factions, seed + 999983);
@@ -1441,8 +1490,12 @@ void build_agents(AgentSet& out, AgentKind kind, int num_factions, int64_t seed)
             case AgentKind::kLegion: a = std::make_unique<LegionAgent>(); break;
             case AgentKind::kHussar: a = std::make_unique<HussarAgent>(); break;
             case AgentKind::kSentinel: a = std::make_unique<SentinelAgent>(); break;
+            case AgentKind::kMarshalDet: a = std::make_unique<MarshalDetAgent>(); break;
             case AgentKind::kTactician:
                 a = std::make_unique<TacticianAgent>(shared, scratch);
+                break;
+            case AgentKind::kTacticianDet:
+                a = std::make_unique<TacticianDetAgent>(shared, scratch);
                 break;
         }
         // Same per-faction seeding as every make_X_agents in agents/.
@@ -1481,6 +1534,8 @@ const char* agent_kind_name(AgentKind kind) {
         case AgentKind::kLegion: return "legion";
         case AgentKind::kHussar: return "hussar";
         case AgentKind::kSentinel: return "sentinel";
+        case AgentKind::kMarshalDet: return "marshaldet";
+        case AgentKind::kTacticianDet: return "tacticiandet";
         default: return "tactician";
     }
 }
@@ -1499,6 +1554,8 @@ bool agent_kind_from_name(const char* name, AgentKind& out) {
     if (n == "hussar") { out = AgentKind::kHussar; return true; }
     if (n == "sentinel") { out = AgentKind::kSentinel; return true; }
     if (n == "tactician") { out = AgentKind::kTactician; return true; }
+    if (n == "marshaldet") { out = AgentKind::kMarshalDet; return true; }
+    if (n == "tacticiandet") { out = AgentKind::kTacticianDet; return true; }
     return false;
 }
 

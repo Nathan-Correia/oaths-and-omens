@@ -51,6 +51,21 @@ struct NeuralConfig {
     // generator lookup on every decision.
     int64_t sample_seed = 1;
 
+    // The logit above which a buy cell is purchased.
+    //
+    // The buy head is per-cell BCE, so the decoder takes every cell the network
+    // thinks is more likely than not - the mode of a product of independent
+    // marginals. That is not a coherent purchase: measured against tactician it
+    // buys 4.71 cells where tactician buys 3.96, with recall 93.8% against
+    // precision 78.7%, i.e. nearly everything tactician would buy PLUS extras.
+    //
+    // Exact-set agreement cannot see this. Tactician's buy is stochastic
+    // (greedy_buy_common shuffles hexes and picks among equal-scoring infantry),
+    // and two draws from tactician agree with each other only 45.2% of the time
+    // - exactly what the network already scores, so that metric is pinned at
+    // its ceiling and is blind to over-buying. Win rate is not.
+    float buy_threshold = 0.0f;
+
     // ONE-PLY VALUE LOOKAHEAD ON THE BUY DECISION (PLAN.md §12.3).
     //
     // Three self-play objectives in a row produced a flat ladder, and the

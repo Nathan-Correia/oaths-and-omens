@@ -28,6 +28,7 @@
 
 #include <cmath>
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <memory>
@@ -202,6 +203,9 @@ struct Side {
     bool lookahead_cells_only = false;
     // Squeeze this side's buy answers through the neural buy representation.
     bool buy_roundtrip = false;
+    // Ask this side's buy question twice and report self-agreement.
+    bool buy_selfagree = false;
+    float buy_threshold = 0.0f;
     AgentKind kind = AgentKind::kRandom;
     // Ablation: decision kinds this side hands back to a scripted agent.
     bool fallback[kNumDecisionKinds] = {};
@@ -226,6 +230,128 @@ bool parse_side(const std::string& name, const std::string& weights, Side& out) 
     }
     return true;
 }
+
+// Asks the wrapped policy the SAME buy question twice and records how often it
+// agrees with itself.
+//
+// This measures the ceiling on imitating it. Tactician's buy runs through
+// greedy_buy_common, which does rng.shuffle over the hex list and
+// rng.choice_index among equal-scoring infantry actions, so its answer is a
+// random variable given the position. A network trained with per-cell BCE
+// learns the marginal probability of each cell and decodes the most likely
+// set; it cannot agree with a sampled draw more often than two draws agree
+// with each other. If that self-agreement is near the 45.2% the network
+// already reaches, imitation is finished and no amount of capacity, gradient
+// share or data will move it.
+//
+// The second call is the one that plays, so the games are ordinary tactician
+// games - only the RNG stream is consumed twice as fast.
+class BuySelfAgreePolicy : public BatchedPolicy {
+public:
+    explicit BuySelfAgreePolicy(BatchedPolicy* inner) : inner_(inner) {}
+
+    void evaluate(const DecisionRequest* requests, DecisionAnswer* answers, int n) override {
+        std::vector<int> buys;
+        for (int i = 0; i < n; ++i) {
+            if (requests[i].kind == DecisionKind::kBuy && answers[i].buy) buys.push_back(i);
+        }
+        if (buys.empty()) {
+            inner_->evaluate(requests, answers, n);
+            return;
+        }
+        // Draw the same decision kDraws times. The last draw is the one that
+        // plays, so these are ordinary games with a faster-consumed RNG.
+        //
+        // Two statistics come out, and the difference between them is the
+        // point. Pairwise agreement estimates sum(p^2) - how often two samples
+        // of the teacher collide, which is what a sampling imitator could
+        // reach. Modal frequency estimates max(p) - how often the single most
+        // likely set comes up, which is what a DETERMINISTIC imitator like our
+        // decoder can reach. max(p) >= sum(p^2) always, with equality only for
+        // a uniform distribution, so quoting self-agreement alone understates
+        // the ceiling.
+        std::vector<std::vector<std::vector<int> > > draws(buys.size());
+        std::vector<ChosenBuyActions> scratch(buys.size());
+        std::vector<ChosenBuyActions*> saved(buys.size());
+        for (size_t j = 0; j < buys.size(); ++j) saved[j] = answers[buys[j]].buy;
+
+        for (int d = 0; d < kDraws; ++d) {
+            const bool last = (d == kDraws - 1);
+            for (size_t j = 0; j < buys.size(); ++j) {
+                answers[buys[j]].buy = last ? saved[j] : &scratch[j];
+            }
+            inner_->evaluate(requests, answers, n);
+            for (size_t j = 0; j < buys.size(); ++j) {
+                draws[j].push_back(cells(*answers[buys[j]].buy));
+            }
+        }
+        for (size_t j = 0; j < buys.size(); ++j) answers[buys[j]].buy = saved[j];
+
+        for (size_t j = 0; j < buys.size(); ++j) {
+            const std::vector<std::vector<int> >& d = draws[j];
+            long long pairs = 0, same = 0;
+            for (size_t x = 0; x < d.size(); ++x) {
+                for (size_t y = x + 1; y < d.size(); ++y) {
+                    ++pairs;
+                    if (d[x] == d[y]) ++same;
+                }
+            }
+            int best = 0;
+            for (size_t x = 0; x < d.size(); ++x) {
+                int c = 0;
+                for (size_t y = 0; y < d.size(); ++y) {
+                    if (d[x] == d[y]) ++c;
+                }
+                if (c > best) best = c;
+            }
+            total_.fetch_add(1, std::memory_order_relaxed);
+            pair_num_.fetch_add(same, std::memory_order_relaxed);
+            pair_den_.fetch_add(pairs, std::memory_order_relaxed);
+            modal_.fetch_add(best, std::memory_order_relaxed);
+        }
+    }
+    void on_game_start(const GameState* s, int g) override { inner_->on_game_start(s, g); }
+    void on_game_end(const GameState* s) override { inner_->on_game_end(s); }
+
+    void report() const {
+        const long long t = total_.load();
+        if (t == 0) return;
+        const double pairwise = double(pair_num_.load()) / double(pair_den_.load());
+        const double modal = double(modal_.load()) / double(t * kDraws);
+        std::printf("  teacher buy over %lld decisions, %d draws each:\n"
+                    "    pairwise agreement  %.1f%%  (sum p^2 - ceiling for a "
+                    "SAMPLING imitator)\n"
+                    "    modal frequency     %.1f%%  (max p - ceiling for a "
+                    "DETERMINISTIC one)\n",
+                    t, kDraws, 100.0 * pairwise, 100.0 * modal);
+    }
+
+private:
+    static std::vector<int> cells(const ChosenBuyActions& b) {
+        std::vector<int> v;
+        for (int t = 0; t < b.size(); ++t) {
+            int q = 0;
+            switch (b[t].type) {
+                case BuyType::kBuyInfantry: q = 0; break;
+                case BuyType::kConvertToSpecial: q = 1 + b[t].unit_type; break;
+                case BuyType::kBuildOutpost: q = 3 + b[t].unit_type; break;
+                default: q = 6 + b[t].upgrade; break;
+            }
+            if (q > 8) q = 8;
+            v.push_back(b[t].hex * 9 + q);
+        }
+        std::sort(v.begin(), v.end());
+        v.erase(std::unique(v.begin(), v.end()), v.end());
+        return v;
+    }
+
+    static const int kDraws = 8;
+    BatchedPolicy* inner_;
+    mutable std::atomic<long long> total_{0};
+    mutable std::atomic<long long> pair_num_{0};
+    mutable std::atomic<long long> pair_den_{0};
+    mutable std::atomic<long long> modal_{0};
+};
 
 // Passes every answer through untouched EXCEPT buy, which is squeezed through
 // the neural policy's buy representation and back out again.
@@ -363,6 +489,7 @@ Result play_matchup(const Side& a, const Side& b, const RunConfig& cfg, long lon
             nc.lookahead_k = s.lookahead;
             nc.lookahead_tau = s.lookahead_tau;
             nc.lookahead_cells_only = s.lookahead_cells_only;
+            nc.buy_threshold = s.buy_threshold;
             auto p = make_neural_policy(nc, err);
             if (!p) std::fprintf(stderr, "side %s: %s\n", s.name.c_str(), err.c_str());
             return p;
@@ -398,6 +525,11 @@ Result play_matchup(const Side& a, const Side& b, const RunConfig& cfg, long lon
             hybrid = std::make_unique<KindFallbackPolicy>(pa, fb.get(), a.fallback);
             pa = hybrid.get();
         }
+        std::unique_ptr<BuySelfAgreePolicy> sa;
+        if (a.buy_selfagree) {
+            sa = std::make_unique<BuySelfAgreePolicy>(pa);
+            pa = sa.get();
+        }
         std::unique_ptr<BuyRoundtripPolicy> rt;
         if (a.buy_roundtrip) {
             rt = std::make_unique<BuyRoundtripPolicy>(pa);
@@ -410,6 +542,8 @@ Result play_matchup(const Side& a, const Side& b, const RunConfig& cfg, long lon
         const bool any_neural = a.neural || b.neural;
         run_games_batched(cfg, specs.data(), results.data(), pairs,
                           any_neural ? in_flight : threads, any_neural ? in_flight : 1, split);
+
+        if (sa) sa->report();
 
         for (int g = 0; g < pairs; ++g) {
             const GameResult& res = results[static_cast<size_t>(g)];
@@ -468,6 +602,8 @@ int main(int argc, char** argv) {
     float look_tau = 1.0f;
     bool cells_only = false;
     bool a_roundtrip = false;
+    bool a_selfagree = false;
+    float a_bt = 0.0f;
 
     for (int i = 1; i < argc; ++i) {
         const std::string s = argv[i];
@@ -481,6 +617,8 @@ int main(int argc, char** argv) {
         else if (s == "--lookahead-tau") look_tau = float(std::atof(next().c_str()));
         else if (s == "--lookahead-cells-only") cells_only = true;
         else if (s == "--a-buy-roundtrip") a_roundtrip = true;
+        else if (s == "--a-buy-selfagree") a_selfagree = true;
+        else if (s == "--a-buy-threshold") a_bt = float(std::atof(next().c_str()));
         else if (s == "--a-fallback") fallback_kinds = next();
         else if (s == "--a-fallback-agent") fallback_agent = next();
         else if (s == "--games") pairs = std::atoi(next().c_str());
@@ -509,6 +647,8 @@ int main(int argc, char** argv) {
     a.lookahead_tau = look_tau;
     a.lookahead_cells_only = cells_only;
     a.buy_roundtrip = a_roundtrip;
+    a.buy_selfagree = a_selfagree;
+    a.buy_threshold = a_bt;
     if (!fallback_kinds.empty()) {
         for (const std::string& k : split_commas(fallback_kinds)) {
             int found = -1;
