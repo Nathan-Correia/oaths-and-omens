@@ -40,7 +40,7 @@ inline constexpr int kMaxActionBits = MAX_HEXES * 9;
 inline constexpr int kMaskBytes = (kMaxActionBits + 7) / 8;  // 373
 
 inline constexpr uint32_t kTrainMagic = 0x4f4f5431;  // "OOT1"
-inline constexpr int kTrainVersion = 1;
+inline constexpr int kTrainVersion = 2;
 
 #pragma pack(push, 1)
 // One file header, then nothing but fixed-size records.
@@ -72,11 +72,33 @@ struct SampleHeader {
     int16_t turn;       // when in the game this decision happened
     int16_t total_turns;
     int32_t game_id;
+
+    // THE VP TRAJECTORY AHEAD OF THIS DECISION (v2).
+    //
+    // Training on win/loss alone failed, measurably: a terminal result spread
+    // over a sixteen-turn game leaves `R - V(s)` dominated by future
+    // randomness rather than by the action taken (§12.3). The fix is not a
+    // denser reward for its own sake, it is a SHORTER credit horizon - an
+    // action that founds an outpost should be paid within a turn or two.
+    //
+    // Several horizons are stored rather than one precomputed return, because
+    // regenerating this corpus costs 32 GB and a discount rate is exactly the
+    // kind of thing worth re-tuning without paying that again.
+    //
+    // Victory points are the literal win condition here (kVpToWin), not a
+    // correlate of it, which is why shaping on them carries little of the usual
+    // reward-hacking risk.
+    int16_t vp_now;   // this faction's VP when the decision was taken
+    int16_t vp_p1;    // ...at the end of turn+1, clamped to the last turn played
+    int16_t vp_p2;
+    int16_t vp_p3;
+    int16_t vp_p5;
+    int16_t pad2[3];
 };
 #pragma pack(pop)
 
 static_assert(sizeof(TrainFileHeader) == 32, "file header layout is on-disk format");
-static_assert(sizeof(SampleHeader) == 16, "sample header layout is on-disk format");
+static_assert(sizeof(SampleHeader) == 32, "sample header layout is on-disk format");
 
 // Number of valid action bits for a decision kind on a board of `num_hexes`.
 // Bits past this are always zero in both masks.

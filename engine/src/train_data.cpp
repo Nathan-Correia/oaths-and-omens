@@ -84,6 +84,48 @@ void TrainWriter::write_game(const std::vector<uint8_t>& samples, int count,
     for (int f = 0; f < num_factions; ++f) {
         if (victory_points[f] > max_vp) max_vp = victory_points[f];
     }
+
+    // Rebuild each faction's VP-by-turn curve FROM THE SAMPLES THEMSELVES.
+    // Every record already carries (faction, turn, vp_now), and a game produces
+    // many records per faction per turn, so the curve is recoverable here
+    // without threading a per-turn callback through two different drivers.
+    // Turns past the end of the game hold the final score, which is the correct
+    // value for "what did this seat have at turn t+k" when the game ended
+    // first.
+    int max_turn = 0;
+    for (int i = 0; i < count; ++i) {
+        SampleHeader h;
+        std::memcpy(&h, block.data() + static_cast<size_t>(i) * record_bytes_, sizeof(h));
+        if (h.turn > max_turn) max_turn = h.turn;
+    }
+    const int span = max_turn + 2;
+    std::vector<std::vector<int32_t> > curve(
+        static_cast<size_t>(num_factions), std::vector<int32_t>(static_cast<size_t>(span), -1));
+    for (int i = 0; i < count; ++i) {
+        SampleHeader h;
+        std::memcpy(&h, block.data() + static_cast<size_t>(i) * record_bytes_, sizeof(h));
+        if (h.faction < 0 || h.faction >= num_factions) continue;
+        if (h.turn < 0 || h.turn >= span) continue;
+        curve[static_cast<size_t>(h.faction)][static_cast<size_t>(h.turn)] = h.vp_now;
+    }
+    // Forward-fill: a turn where a faction happened to be asked nothing still
+    // needs a value, and its score cannot have changed without a decision.
+    for (int f = 0; f < num_factions; ++f) {
+        int32_t last = 0;
+        for (int t = 0; t < span; ++t) {
+            if (curve[static_cast<size_t>(f)][static_cast<size_t>(t)] < 0) {
+                curve[static_cast<size_t>(f)][static_cast<size_t>(t)] = last;
+            } else {
+                last = curve[static_cast<size_t>(f)][static_cast<size_t>(t)];
+            }
+        }
+    }
+    auto vp_at = [&](int f, int t) -> int16_t {
+        if (f < 0 || f >= num_factions) return 0;
+        if (t >= span) return static_cast<int16_t>(victory_points[f]);
+        return static_cast<int16_t>(curve[static_cast<size_t>(f)][static_cast<size_t>(t)]);
+    };
+
     for (int i = 0; i < count; ++i) {
         SampleHeader h;
         std::memcpy(&h, block.data() + static_cast<size_t>(i) * record_bytes_, sizeof(h));
@@ -93,6 +135,10 @@ void TrainWriter::write_game(const std::vector<uint8_t>& samples, int count,
         h.won = (winner >= 0 && winner == f) ? 1u : 0u;
         h.total_turns = static_cast<int16_t>(total_turns);
         h.game_id = game_id;
+        h.vp_p1 = vp_at(f, h.turn + 1);
+        h.vp_p2 = vp_at(f, h.turn + 2);
+        h.vp_p3 = vp_at(f, h.turn + 3);
+        h.vp_p5 = vp_at(f, h.turn + 5);
         std::memcpy(block.data() + static_cast<size_t>(i) * record_bytes_, &h, sizeof(h));
     }
     std::fwrite(block.data(), 1, block.size(), f_);

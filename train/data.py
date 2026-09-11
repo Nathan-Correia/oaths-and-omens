@@ -13,7 +13,7 @@ import torch
 from torch.utils.data import Dataset
 
 MAGIC = 0x4F4F5431
-SAMPLE_HEADER_BYTES = 16
+SAMPLE_HEADER_BYTES = 32
 FILE_HEADER_BYTES = 32
 
 # DecisionKind, mirroring engine/include/oo/policy.hpp.
@@ -55,8 +55,11 @@ def read_info(path) -> FileInfo:
      record_bytes, position_bytes, num_records) = struct.unpack("<IHHHHHHIIQ", raw)
     if magic != MAGIC:
         raise ValueError(f"{path} is not a training file (magic {magic:#x})")
-    if version != 1:
-        raise ValueError(f"{path} is version {version}, expected 1")
+    if version != 2:
+        raise ValueError(
+            f"{path} is training-file version {version}, expected 2. Version 1 has no VP "
+            f"trajectory, so shaped returns cannot be computed from it - regenerate with "
+            f"oo_dump_training.")
     return FileInfo(radius, num_factions, num_hexes, mask_bytes, record_bytes,
                     position_bytes, num_records, enc_version)
 
@@ -104,7 +107,16 @@ class SampleFile(Dataset):
         self.faction = heads[:, 3].astype(np.int8)
         self.final_vp = heads[:, 4:6].copy().view(np.int16).reshape(-1)
         self.max_vp = heads[:, 6:8].copy().view(np.int16).reshape(-1)
+        self.turn = heads[:, 8:10].copy().view(np.int16).reshape(-1)
         self.won = heads[:, 2].copy()
+        # The VP trajectory ahead of each decision (v2). Offsets follow
+        # SampleHeader: 16 bytes of the original fields, then vp_now and the
+        # four lookaheads.
+        self.vp_now = heads[:, 16:18].copy().view(np.int16).reshape(-1)
+        self.vp_p1 = heads[:, 18:20].copy().view(np.int16).reshape(-1)
+        self.vp_p2 = heads[:, 20:22].copy().view(np.int16).reshape(-1)
+        self.vp_p3 = heads[:, 22:24].copy().view(np.int16).reshape(-1)
+        self.vp_p5 = heads[:, 24:26].copy().view(np.int16).reshape(-1)
 
         if kinds is None:
             self.index = np.arange(self.info.num_records, dtype=np.int64)
@@ -114,6 +126,51 @@ class SampleFile(Dataset):
 
         self._pos_end = SAMPLE_HEADER_BYTES + self.info.position_bytes
         self._legal_end = self._pos_end + self.info.mask_bytes
+        self.shaped_return()
+
+    def shaped_return(self, gamma=0.8, win_bonus=1.0, scale=None):
+        """Per-decision return: discounted VP gained over the next few turns.
+
+        A terminal win/loss is credited to every decision in a sixteen-turn game
+        and is therefore mostly noise by the time it reaches any one of them -
+        measured, the residual after the value head had sd 0.251 and left 85 %
+        of advantage weights within 0.5 of 1.0. Paying an action for the VP that
+        actually follows it, soon, is what shortens the credit horizon.
+
+        Victory points are the win condition itself rather than a proxy for it,
+        so this is shaping with unusually little room to be gamed - but a
+        terminal win bonus is kept anyway so the objective still knows the
+        difference between scoring and winning.
+        """
+        d1 = (self.vp_p1.astype(np.float32) - self.vp_now)
+        d2 = (self.vp_p2.astype(np.float32) - self.vp_p1)
+        d3 = (self.vp_p3.astype(np.float32) - self.vp_p2)
+        # p5 spans two turns; split it so each is discounted about right.
+        d45 = (self.vp_p5.astype(np.float32) - self.vp_p3) / 2.0
+        disc = (d1
+                + gamma * d2
+                + gamma ** 2 * d3
+                + gamma ** 3 * d45
+                + gamma ** 4 * d45)
+
+        # AUTO-CALIBRATE the scale by default. A hand-picked one saturates: at
+        # 4 VP per unit, a typical five-turn window already exceeds the clip and
+        # every good position looks identical, which throws away exactly the
+        # gradations the advantage needs. The 95th percentile puts the bulk of
+        # the distribution inside [0, 1] and clips only genuine outliers.
+        if scale is None or scale <= 0:
+            scale = float(np.percentile(disc, 95))
+            if scale <= 0:
+                scale = 1.0
+        self.reward_scale = scale
+
+        shaped = np.clip(disc / scale, 0.0, 1.0)
+        # A terminal bonus keeps the objective aware that scoring is not the
+        # same as winning - VP is the win condition, but only for whoever gets
+        # there first.
+        self.ret = ((shaped + win_bonus * self.won.astype(np.float32))
+                    / (1.0 + win_bonus)).astype(np.float32)
+        return self.ret
 
     def _open(self):
         self.mm = np.memmap(self.path, dtype=np.uint8, mode="r", offset=FILE_HEADER_BYTES,
@@ -154,7 +211,7 @@ class SampleFile(Dataset):
             "chosen": chosen,
             "kind": int(self.kind[r]),
             "won": float(self.won[r]),
-            "vp": float(self.final_vp[r]) / 50.0,
+            "ret": float(self.ret[r]),
         }
 
 

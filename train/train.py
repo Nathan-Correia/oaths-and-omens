@@ -109,6 +109,7 @@ def collate(batch):
         "legal": torch.stack([s["legal"] for s in batch]),
         "chosen": torch.stack([s["chosen"] for s in batch]),
         "won": torch.tensor([s["won"] for s in batch]),
+        "ret": torch.tensor([s["ret"] for s in batch]),
         "kind": torch.tensor([s["kind"] for s in batch], dtype=torch.long),
     }
 
@@ -205,6 +206,14 @@ def main():
     ap.add_argument("--init-from", default="",
                     help="start from this checkpoint instead of random init - "
                          "self-play fine-tuning must, or the policy forgets")
+    ap.add_argument("--gamma", type=float, default=0.8,
+                    help="discount for the shaped VP return")
+    ap.add_argument("--win-bonus", type=float, default=1.0,
+                    help="terminal bonus added to the shaped return, so the "
+                         "objective still distinguishes scoring from winning")
+    ap.add_argument("--reward-scale", type=float, default=0.0,
+                    help="VP per unit of shaped reward; 0 auto-calibrates to the "
+                         "95th percentile, which is what keeps it off the clip")
     ap.add_argument("--advantage-beta", type=float, default=0.0,
                     help="SELF-PLAY: advantage-weighted regression. Weights each "
                          "sample by exp((outcome - V(s)) / beta) instead of hard "
@@ -226,6 +235,11 @@ def main():
 
     ds = SampleFile(args.data[0])
     info = ds.info
+    ds.shaped_return(gamma=args.gamma, win_bonus=args.win_bonus, scale=args.reward_scale)
+    print(f"shaped return: gamma {args.gamma}, win bonus {args.win_bonus}, "
+          f"scale {ds.reward_scale:.1f} VP -> mean {ds.ret.mean():.3f} sd {ds.ret.std():.3f}, "
+          f"{(ds.ret > 0.01).mean()*100:.0f}% non-zero, "
+          f"{(ds.ret >= 0.999).mean()*100:.1f}% at the clip")
     print(f"data: {info.num_records:,} samples, radius {info.radius}, {info.num_factions} factions, "
           f"{info.num_hexes} hexes, {info.record_bytes} B/record")
     print("      by kind: " + ", ".join(f"{k}={v:,}" for k, v in ds.counts_by_kind().items()))
@@ -320,14 +334,19 @@ def main():
                 legal_b = groups["legal"].to(device, non_blocking=True)
                 chosen_b = groups["chosen"].to(device, non_blocking=True)
                 won = groups["won"].to(device, non_blocking=True)
+                ret = groups["ret"].to(device, non_blocking=True)
                 qh = query_hex_of(pos, info.num_hexes, hex_off).to(device)
 
                 # ONE trunk pass for the whole batch; the heads then read the
                 # rows that belong to them.
                 outs = net(pos, qh)
 
-                # The value head applies to every row regardless of kind.
-                vloss = F.binary_cross_entropy_with_logits(outs["value"], won)
+                # The value head predicts the SHAPED RETURN, not win/loss.
+                # A binary win target at a 12.5% base rate carries far less
+                # information per sample than "how much VP follows from here",
+                # and the advantage below is only ever as sharp as this
+                # baseline is.
+                vloss = F.binary_cross_entropy_with_logits(outs["value"], ret)
 
                 # ADVANTAGE WEIGHTING (PLAN.md §12.3).
                 #
@@ -349,7 +368,7 @@ def main():
                 adv_w = None
                 if args.advantage_beta > 0.0:
                     baseline = torch.sigmoid(outs["value"].detach())
-                    adv = won - baseline
+                    adv = ret - baseline
                     adv_w = torch.exp(adv / args.advantage_beta).clamp(
                         max=args.advantage_clip)
                     # Normalised so the weighting changes the SHAPE of the loss,

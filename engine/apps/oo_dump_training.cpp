@@ -82,6 +82,11 @@ struct Recorder {
         h.step = static_cast<uint8_t>(req.step);
         h.faction = static_cast<int8_t>(req.faction);
         h.turn = static_cast<int16_t>(state->turn_number);
+        // The rest of the VP trajectory is filled in by TrainWriter once the
+        // game ends and the whole curve is known.
+        h.vp_now = static_cast<int16_t>(req.faction >= 0 && req.faction < num_factions
+                                            ? state->victory_points[req.faction]
+                                            : 0);
         std::memcpy(p, &h, sizeof(h));
         p += sizeof(h);
 
