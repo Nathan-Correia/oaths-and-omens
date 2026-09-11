@@ -214,6 +214,10 @@ def main():
     ap.add_argument("--reward-scale", type=float, default=0.0,
                     help="VP per unit of shaped reward; 0 auto-calibrates to the "
                          "95th percentile, which is what keeps it off the clip")
+    ap.add_argument("--kind-weight", action="append", default=[],
+                    metavar="KIND=W",
+                    help="scale one decision kind's loss, e.g. --kind-weight buy=8. "
+                         "Repeatable. Kinds default to 1.0")
     ap.add_argument("--advantage-beta", type=float, default=0.0,
                     help="SELF-PLAY: advantage-weighted regression. Weights each "
                          "sample by exp((outcome - V(s)) / beta) instead of hard "
@@ -232,6 +236,17 @@ def main():
 
     device = torch.device("cpu" if args.cpu or not torch.cuda.is_available() else "cuda")
     print(f"device: {device}")
+
+    kind_weights = [1.0] * len(KIND_NAMES)
+    for spec in args.kind_weight:
+        name, _, val = spec.partition("=")
+        if name not in KIND_NAMES:
+            raise SystemExit(f"--kind-weight: unknown kind {name!r}, "
+                             f"expected one of {', '.join(KIND_NAMES)}")
+        kind_weights[KIND_NAMES.index(name)] = float(val)
+    if any(w != 1.0 for w in kind_weights):
+        print("kind weights: " + ", ".join(
+            f"{n} {w:g}" for n, w in zip(KIND_NAMES, kind_weights) if w != 1.0))
 
     ds = SampleFile(args.data[0])
     info = ds.info
@@ -413,7 +428,17 @@ def main():
                         correct = (masked.argmax(1) == tgt).sum()
 
                     k = sel.numel()
-                    batch_loss = batch_loss + loss * k
+                    # PER-KIND LOSS WEIGHT.
+                    #
+                    # Every kind contributes in proportion to its row count,
+                    # which is the right default and the wrong one here. Buy is
+                    # 12.25% of rows and, measured by the fallback ablation,
+                    # 100% of the strength gap: handing buy to tactician takes
+                    # the policy from 39.4% to 48.2% against it, while movement,
+                    # cavalry, target and rectification each move it by nothing.
+                    # Gradient share should follow what a head is worth, not how
+                    # often the engine happens to ask about it.
+                    batch_loss = batch_loss + loss * k * kind_weights[kind]
                     batch_n += k
                     st = per_kind[kind]
                     st[0] += float(loss.detach()) * k

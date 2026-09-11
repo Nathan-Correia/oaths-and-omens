@@ -1,4 +1,4 @@
-// Head-to-head evaluation (PLAN.md §12.1, M10a).
+﻿// Head-to-head evaluation (PLAN.md Â§12.1, M10a).
 //
 //   oo_eval --a tactician --b marshal --games 2000
 //   oo_eval --a neural --a-weights checkpoints/bc.ts --b tactician --games 2000
@@ -15,7 +15,7 @@
 //   instead of adding variance.
 //
 //   SEAT ROTATION comes free with that mirror: seat win rates ranged 9-19 %
-//   among IDENTICAL agents in an earlier 3-tactician/5-greedy run (§6.8a), so an
+//   among IDENTICAL agents in an earlier 3-tactician/5-greedy run (Â§6.8a), so an
 //   unmirrored comparison largely measures placement order.
 //
 //   A WILSON INTERVAL rather than the normal approximation, which misbehaves
@@ -27,6 +27,7 @@
 #include "oo/run.hpp"
 
 #include <cmath>
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <memory>
@@ -199,6 +200,8 @@ struct Side {
     int lookahead = 0;   // one-ply value lookahead on buy; 0/1 disables
     float lookahead_tau = 1.0f;
     bool lookahead_cells_only = false;
+    // Squeeze this side's buy answers through the neural buy representation.
+    bool buy_roundtrip = false;
     AgentKind kind = AgentKind::kRandom;
     // Ablation: decision kinds this side hands back to a scripted agent.
     bool fallback[kNumDecisionKinds] = {};
@@ -223,6 +226,91 @@ bool parse_side(const std::string& name, const std::string& weights, Side& out) 
     }
     return true;
 }
+
+// Passes every answer through untouched EXCEPT buy, which is squeezed through
+// the neural policy's buy representation and back out again.
+//
+// That representation is lossy in three specific ways, and this measures what
+// the loss is worth in win rate. The training label is a BITMASK over (hex,
+// variant) cells, so how many of a repeatable action to buy cannot be
+// expressed. The decoder fixes the spend order by TYPE RANK, so preferring
+// infantry before an upgrade cannot be expressed. And quantity comes from
+// repeat-until-broke, so spending part of the treasury cannot be expressed.
+//
+// Wrapping TACTICIAN in it answers the question that decides what to build
+// next: if tactician survives the round trip, the buy representation is
+// adequate and the network simply has not learned to use it; if tactician is
+// crippled by it, no amount of training will close the gap and the action
+// space itself has to change.
+class BuyRoundtripPolicy : public BatchedPolicy {
+public:
+    explicit BuyRoundtripPolicy(BatchedPolicy* inner) : inner_(inner) {}
+
+    void evaluate(const DecisionRequest* requests, DecisionAnswer* answers, int n) override {
+        inner_->evaluate(requests, answers, n);
+        for (int i = 0; i < n; ++i) {
+            if (requests[i].kind != DecisionKind::kBuy || !answers[i].buy) continue;
+            roundtrip(*answers[i].buy);
+        }
+    }
+    void on_game_start(const GameState* s, int g) override { inner_->on_game_start(s, g); }
+    void on_game_end(const GameState* s) override { inner_->on_game_end(s); }
+
+private:
+    static int variant_of(const BuyAction& a) {
+        int v = 0;
+        switch (a.type) {
+            case BuyType::kBuyInfantry: v = 0; break;
+            case BuyType::kConvertToSpecial: v = 1 + a.unit_type; break;
+            case BuyType::kBuildOutpost: v = 3 + a.unit_type; break;
+            default: v = 6 + a.upgrade; break;
+        }
+        return v > 8 ? 8 : v;
+    }
+    static int rank_of(BuyType t) {
+        switch (t) {
+            case BuyType::kUpgradeOutpost: return 0;
+            case BuyType::kBuildOutpost: return 1;
+            case BuyType::kBuyInfantry: return 2;
+            default: return 3;
+        }
+    }
+    static void roundtrip(ChosenBuyActions& buy) {
+        // 1. Collapse to the set of cells a bitmask could hold.
+        ChosenBuyActions cells;
+        cells.clear();
+        std::vector<int> seen;
+        for (int t = 0; t < buy.size(); ++t) {
+            const int cell = buy[t].hex * 9 + variant_of(buy[t]);
+            if (std::find(seen.begin(), seen.end(), cell) != seen.end()) continue;
+            seen.push_back(cell);
+            cells.push_back(buy[t]);
+        }
+        // 2. Impose the decoder's spend order.
+        std::stable_sort(cells.items, cells.items + cells.count,
+                         [](const BuyAction& x, const BuyAction& y) {
+                             return rank_of(x.type) < rank_of(y.type);
+                         });
+        // 3. Re-expand by repeat-until-broke.
+        const int base = cells.size();
+        for (int pass = 0; pass < 128 && base > 0; ++pass) {
+            bool appended = false;
+            for (int t = 0; t < base; ++t) {
+                const BuyAction& a = cells[t];
+                if (a.type != BuyType::kBuyInfantry && a.type != BuyType::kConvertToSpecial) {
+                    continue;
+                }
+                if (cells.size() >= kMaxChosenBuy) break;
+                cells.push_back(a);
+                appended = true;
+            }
+            if (!appended) break;
+        }
+        buy = cells;
+    }
+
+    BatchedPolicy* inner_;
+};
 
 struct Result {
     long long a_wins = 0, b_wins = 0, draws = 0;
@@ -310,6 +398,11 @@ Result play_matchup(const Side& a, const Side& b, const RunConfig& cfg, long lon
             hybrid = std::make_unique<KindFallbackPolicy>(pa, fb.get(), a.fallback);
             pa = hybrid.get();
         }
+        std::unique_ptr<BuyRoundtripPolicy> rt;
+        if (a.buy_roundtrip) {
+            rt = std::make_unique<BuyRoundtripPolicy>(pa);
+            pa = rt.get();
+        }
         BatchedPolicy* pb = b.neural ? net_b.get() : &scripted;
         SplitPolicy split(pa, pb, a_seats, nf);
 
@@ -374,6 +467,7 @@ int main(int argc, char** argv) {
     int a_look = 0, b_look = 0;
     float look_tau = 1.0f;
     bool cells_only = false;
+    bool a_roundtrip = false;
 
     for (int i = 1; i < argc; ++i) {
         const std::string s = argv[i];
@@ -386,6 +480,7 @@ int main(int argc, char** argv) {
         else if (s == "--b-lookahead") b_look = std::atoi(next().c_str());
         else if (s == "--lookahead-tau") look_tau = float(std::atof(next().c_str()));
         else if (s == "--lookahead-cells-only") cells_only = true;
+        else if (s == "--a-buy-roundtrip") a_roundtrip = true;
         else if (s == "--a-fallback") fallback_kinds = next();
         else if (s == "--a-fallback-agent") fallback_agent = next();
         else if (s == "--games") pairs = std::atoi(next().c_str());
@@ -413,6 +508,7 @@ int main(int argc, char** argv) {
     a.lookahead = a_look;
     a.lookahead_tau = look_tau;
     a.lookahead_cells_only = cells_only;
+    a.buy_roundtrip = a_roundtrip;
     if (!fallback_kinds.empty()) {
         for (const std::string& k : split_commas(fallback_kinds)) {
             int found = -1;
