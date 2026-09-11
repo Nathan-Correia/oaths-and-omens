@@ -44,6 +44,11 @@ void usage() {
                  "  --a NAME          side A: an agent kind, or 'neural'\n"
                  "  --b NAME          side B (ignored with --ladder)\n"
                  "  --a-weights PATH  TorchScript for side A when it is neural\n"
+                 "  --a-lookahead K   one-ply value lookahead on buy for side A:\n"
+                 "                    score K candidate purchase sets with\n"
+                 "                    the value head, keep the best (0/1 off)\n"
+                 "  --b-lookahead K   the same for side B\n"
+                 "  --lookahead-tau T Gumbel noise generating the candidates\n"
                  "  --b-weights PATH  ditto for side B\n"
                  "  --games N         seed pairs; each is played twice (default 500)\n"
                  "  --ladder          play A against random, greedy, marshal, tactician\n"
@@ -191,6 +196,8 @@ struct Side {
     std::string name;
     std::string weights;
     bool neural = false;
+    int lookahead = 0;   // one-ply value lookahead on buy; 0/1 disables
+    float lookahead_tau = 1.0f;
     AgentKind kind = AgentKind::kRandom;
     // Ablation: decision kinds this side hands back to a scripted agent.
     bool fallback[kNumDecisionKinds] = {};
@@ -264,6 +271,8 @@ Result play_matchup(const Side& a, const Side& b, const RunConfig& cfg, long lon
             nc.weights = s.weights;
             nc.radius = cfg.radius;
             nc.num_factions = cfg.num_factions;
+            nc.lookahead_k = s.lookahead;
+            nc.lookahead_tau = s.lookahead_tau;
             auto p = make_neural_policy(nc, err);
             if (!p) std::fprintf(stderr, "side %s: %s\n", s.name.c_str(), err.c_str());
             return p;
@@ -360,6 +369,8 @@ int main(int argc, char** argv) {
     int pairs = 500, radius = 7, factions = 8, max_turns = 100, in_flight = 256, threads = 0;
     long long base_seed = 1;
     bool ladder = false;
+    int a_look = 0, b_look = 0;
+    float look_tau = 1.0f;
 
     for (int i = 1; i < argc; ++i) {
         const std::string s = argv[i];
@@ -368,6 +379,9 @@ int main(int argc, char** argv) {
         else if (s == "--b") b_name = next();
         else if (s == "--a-weights") a_weights = next();
         else if (s == "--b-weights") b_weights = next();
+        else if (s == "--a-lookahead") a_look = std::atoi(next().c_str());
+        else if (s == "--b-lookahead") b_look = std::atoi(next().c_str());
+        else if (s == "--lookahead-tau") look_tau = float(std::atof(next().c_str()));
         else if (s == "--a-fallback") fallback_kinds = next();
         else if (s == "--a-fallback-agent") fallback_agent = next();
         else if (s == "--games") pairs = std::atoi(next().c_str());
@@ -392,6 +406,8 @@ int main(int argc, char** argv) {
 
     Side a;
     if (!parse_side(a_name, a_weights, a)) return 2;
+    a.lookahead = a_look;
+    a.lookahead_tau = look_tau;
     if (!fallback_kinds.empty()) {
         for (const std::string& k : split_commas(fallback_kinds)) {
             int found = -1;
@@ -434,6 +450,8 @@ int main(int argc, char** argv) {
     for (const std::string& name : opponents) {
         Side b;
         if (!parse_side(name, name == "neural" ? b_weights : std::string(), b)) return 2;
+        b.lookahead = b_look;
+        b.lookahead_tau = look_tau;
         bool ok = true;
         const Result r = play_matchup(a, b, cfg, base_seed, pairs, in_flight, threads, ok);
         if (!ok) return 1;

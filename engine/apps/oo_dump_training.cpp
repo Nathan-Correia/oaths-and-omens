@@ -468,6 +468,16 @@ int main(int argc, char** argv) {
     int num_games = 1000, radius = 7, num_factions = 8, max_turns = 100, every = 1, threads = 0;
     int in_flight = 256;
     float temperature = 1.0f;
+    // One-ply value lookahead on buy. THIS IS THE POINT OF A SELF-PLAY CORPUS
+    // NOW: cloning a policy's own argmax teaches it nothing it does not already
+    // know, which is exactly what three flat iterations showed (PLAN.md 12.3).
+    // With lookahead the games are played by something STRONGER than the
+    // network that generated them - measured at 58.7% head to head against the
+    // same weights without it - so the labels carry information the network
+    // does not yet have. That is the whole mechanism behind AlphaZero-style
+    // improvement, with one ply of value search standing in for MCTS.
+    int lookahead = 0;
+    float look_tau = 1.0f;
     long long base_seed = 1;
 
     for (int i = 1; i < argc; ++i) {
@@ -484,6 +494,8 @@ int main(int argc, char** argv) {
         else if (a == "--threads") threads = std::atoi(next().c_str());
         else if (a == "--net-weights") net_weights = next();
         else if (a == "--temperature") temperature = float(std::atof(next().c_str()));
+        else if (a == "--lookahead") lookahead = std::atoi(next().c_str());
+        else if (a == "--lookahead-tau") look_tau = float(std::atof(next().c_str()));
         else if (a == "--in-flight") in_flight = std::atoi(next().c_str());
         else {
             std::fprintf(stderr, "unknown option '%s'\n\n", a.c_str());
@@ -533,6 +545,8 @@ int main(int argc, char** argv) {
         ncfg.num_factions = num_factions;
         ncfg.temperature = temperature;
         ncfg.sample_seed = base_seed;
+        ncfg.lookahead_k = lookahead;
+        ncfg.lookahead_tau = look_tau;
         std::string nerr;
         auto policy = oo::make_neural_policy(ncfg, nerr);
         if (!policy) {
@@ -541,6 +555,11 @@ int main(int argc, char** argv) {
         }
         std::printf("SELF-PLAY: %s, temperature %.2f, %d games in flight\n",
                     oo::neural_describe(*policy).c_str(), temperature, in_flight);
+        if (lookahead > 1) {
+            std::printf("  buy lookahead: %d candidates, tau %.2f - the recorded buy "
+                        "labels come from the value head, not the policy head\n",
+                        lookahead, look_tau);
+        }
         if (temperature <= 0.0f) {
             std::printf("  WARNING: temperature 0 is argmax, so every game shows only the\n"
                         "  moves the policy already makes and the corpus teaches nothing.\n");

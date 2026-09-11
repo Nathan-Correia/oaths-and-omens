@@ -50,6 +50,38 @@ struct NeuralConfig {
     // not need bit-reproducibility, and making it per game would mean a
     // generator lookup on every decision.
     int64_t sample_seed = 1;
+
+    // ONE-PLY VALUE LOOKAHEAD ON THE BUY DECISION (PLAN.md §12.3).
+    //
+    // Three self-play objectives in a row produced a flat ladder, and the
+    // measurement that explains it is that the buy policy changed on ~32 % of
+    // positions while strength did not move. Advantage-weighted regression on
+    // on-policy data is self-imitation plus a re-weighting: it cannot propose an
+    // action the policy did not already take, so it is not a policy improvement
+    // operator, and a self-play loop built on one has nothing to climb.
+    //
+    // This is the smallest operator that is one. Enumerate k candidate purchase
+    // sets, apply each to a copy of the state, score the successor with the
+    // value head, keep the best. The result is stronger than the network that
+    // proposed it, which is the property cloning needs.
+    //
+    // Buy specifically, for two reasons. It is the entire measured strength gap
+    // (routing buy to the teacher took the policy from 18 % to 69 % against
+    // greedy, where movement and cavalry moved it to 17.3 % and 16.0 %). And it
+    // fires once per faction per TURN rather than once per unit, so the cost is
+    // k extra encodes and one extra batched forward per turn - which is the
+    // objection that ruled out MCTS, and it does not apply at this frequency.
+    //
+    // 0 or 1 disables it. Candidate 0 is always the un-perturbed decode, so the
+    // operator can only pick something other than the plain policy's answer when
+    // the value head prefers it.
+    int lookahead_k = 0;
+
+    // Gumbel noise added to the buy scores to generate candidates 1..k-1. The
+    // buy decoder is a threshold-and-sort with no sampling in it, which is why
+    // `temperature` alone never diversified buy at all - perturbing the scores
+    // is what produces genuinely different purchase sets.
+    float lookahead_tau = 1.0f;
 };
 
 // Always 0 now: the architecture lives in train/model.py, so a parameter count

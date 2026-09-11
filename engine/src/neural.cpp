@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <utility>
@@ -293,6 +294,112 @@ void TorchPolicy::evaluate_impl(const DecisionRequest* requests, DecisionAnswer*
     auto swap_at = [&](int i, int k) { return base[i * row + off_swap + k]; };
     auto rect_at = [&](int i, int k) { return base[i * row + off_rect + k]; };
 
+    // The buy decode, hoisted so the lookahead below can run it repeatedly with
+    // different noise to produce candidate purchase sets. `tau` 0 reproduces the
+    // plain deterministic decode exactly.
+    auto decode_buy = [&](int i, const DecisionRequest& r, ChosenBuyActions& out,
+                          float tau, Rng& rng) {
+            // Score every legal action by its (hex, variant) cell and take
+            // them in score order while positive. Actions that turn out to be
+            // unaffordable are silently skipped by apply_buy_phase, so a
+            // greedy list cannot produce an illegal state.
+            out.clear();
+            struct Scored {
+                float score;
+                int index;
+            };
+            std::vector<Scored> scored;
+            scored.reserve(static_cast<size_t>(r.legal_buy->size()));
+            for (int k = 0; k < r.legal_buy->size(); ++k) {
+                const BuyAction& act = (*r.legal_buy)[k];
+                int variant = 0;
+                switch (act.type) {
+                    case BuyType::kBuyInfantry: variant = 0; break;
+                    case BuyType::kConvertToSpecial: variant = 1 + act.unit_type; break;
+                    case BuyType::kBuildOutpost: variant = 3 + act.unit_type; break;
+                    default: variant = 6 + act.upgrade; break;
+                }
+                if (variant > 8) variant = 8;
+                float sc = buy_at(i, act.hex, variant);
+                if (tau > 0.0f) {
+                    // Gumbel noise on the logits: perturb-and-argmax draws
+                    // from the softmax, so each candidate is a legitimate
+                    // sample of the policy rather than an arbitrary jitter.
+                    double u = rng.random();
+                    if (u <= 0.0) u = 1e-12;
+                    sc += tau * static_cast<float>(-std::log(-std::log(u)));
+                }
+                scored.push_back({sc, k});
+            }
+            // Sort by TYPE first, score second.
+            //
+            // apply_buy_phase spends gold in list order, and an outpost is
+            // the only source of victory points in the game (collect.cpp:
+            // only non-capital cities score). Emitting in pure score order
+            // let infantry - 25 of them at 2 gold each - drain the treasury
+            // before the 3-gold outpost was ever attempted, so the policy
+            // could hold territory and still score nothing.
+            //
+            // The teacher orders the same way and for the same reason:
+            // greedy_buy_common pushes its one upgrade-or-outpost action
+            // before any infantry or conversions. Upgrades come before new
+            // outposts because only one of the two happens per turn, and
+            // improving ground already held beats founding more.
+            auto rank = [](BuyType t) {
+                switch (t) {
+                    case BuyType::kUpgradeOutpost: return 0;
+                    case BuyType::kBuildOutpost: return 1;
+                    case BuyType::kBuyInfantry: return 2;
+                    default: return 3;  // conversions last
+                }
+            };
+            std::stable_sort(scored.begin(), scored.end(),
+                             [&](const Scored& p, const Scored& q) {
+                                 const int rp = rank((*r.legal_buy)[p.index].type);
+                                 const int rq = rank((*r.legal_buy)[q.index].type);
+                                 if (rp != rq) return rp < rq;
+                                 return p.score > q.score;
+                             });
+            int n_selected = 0;
+            for (const Scored& sc : scored) {
+                if (sc.score <= 0.0f) break;
+                if (out.size() >= kMaxChosenBuy) break;
+                out.push_back((*r.legal_buy)[sc.index]);
+                ++n_selected;
+            }
+
+            // REPEAT the repeatable picks until the budget stops them.
+            //
+            // The teacher buys `gold / kInfantryCost` infantry - 25 of them
+            // on turn one - by pushing the same action over and over. The
+            // training label is a bitmask with one bit per (hex, variant),
+            // so all 25 collapse into one bit and the net is taught "buy
+            // infantry here" ONCE. Emitting each cell once then made it
+            // structurally impossible to buy more than one unit per city per
+            // turn, which starved it of units. Measured: with buy handed to
+            // the teacher instead, win rate against greedy went 18% -> 69%.
+            //
+            // Repeating is safe because apply_one validates every action and
+            // silently skips what cannot be afforded (buy.cpp), so the
+            // engine - not this decoder - decides where the money runs out.
+            // Only infantry and conversions repeat; the per-turn cap allows
+            // just one outpost or upgrade action anyway.
+            for (int pass = 0; pass < kBuyRepeatPasses && n_selected > 0; ++pass) {
+                bool appended = false;
+                for (int k = 0; k < n_selected; ++k) {
+                    const BuyAction& act = out[k];
+                    if (act.type != BuyType::kBuyInfantry &&
+                        act.type != BuyType::kConvertToSpecial) {
+                        continue;
+                    }
+                    if (out.size() >= kMaxChosenBuy) break;
+                    out.push_back(act);
+                    appended = true;
+                }
+                if (!appended) break;
+            }
+    };
+
     for (int i = 0; i < n; ++i) {
         const DecisionRequest& r = requests[i];
         DecisionAnswer& a = answers[i];
@@ -358,99 +465,9 @@ void TorchPolicy::evaluate_impl(const DecisionRequest* requests, DecisionAnswer*
             case DecisionKind::kSwap:
                 a.flag = swap_at(i, 0) > swap_at(i, 1);
                 break;
-            case DecisionKind::kBuy: {
-                // Score every legal action by its (hex, variant) cell and take
-                // them in score order while positive. Actions that turn out to be
-                // unaffordable are silently skipped by apply_buy_phase, so a
-                // greedy list cannot produce an illegal state.
-                a.buy->clear();
-                struct Scored {
-                    float score;
-                    int index;
-                };
-                std::vector<Scored> scored;
-                scored.reserve(static_cast<size_t>(r.legal_buy->size()));
-                for (int k = 0; k < r.legal_buy->size(); ++k) {
-                    const BuyAction& act = (*r.legal_buy)[k];
-                    int variant = 0;
-                    switch (act.type) {
-                        case BuyType::kBuyInfantry: variant = 0; break;
-                        case BuyType::kConvertToSpecial: variant = 1 + act.unit_type; break;
-                        case BuyType::kBuildOutpost: variant = 3 + act.unit_type; break;
-                        default: variant = 6 + act.upgrade; break;
-                    }
-                    if (variant > 8) variant = 8;
-                    scored.push_back({buy_at(i, act.hex, variant), k});
-                }
-                // Sort by TYPE first, score second.
-                //
-                // apply_buy_phase spends gold in list order, and an outpost is
-                // the only source of victory points in the game (collect.cpp:
-                // only non-capital cities score). Emitting in pure score order
-                // let infantry - 25 of them at 2 gold each - drain the treasury
-                // before the 3-gold outpost was ever attempted, so the policy
-                // could hold territory and still score nothing.
-                //
-                // The teacher orders the same way and for the same reason:
-                // greedy_buy_common pushes its one upgrade-or-outpost action
-                // before any infantry or conversions. Upgrades come before new
-                // outposts because only one of the two happens per turn, and
-                // improving ground already held beats founding more.
-                auto rank = [](BuyType t) {
-                    switch (t) {
-                        case BuyType::kUpgradeOutpost: return 0;
-                        case BuyType::kBuildOutpost: return 1;
-                        case BuyType::kBuyInfantry: return 2;
-                        default: return 3;  // conversions last
-                    }
-                };
-                std::stable_sort(scored.begin(), scored.end(),
-                                 [&](const Scored& p, const Scored& q) {
-                                     const int rp = rank((*r.legal_buy)[p.index].type);
-                                     const int rq = rank((*r.legal_buy)[q.index].type);
-                                     if (rp != rq) return rp < rq;
-                                     return p.score > q.score;
-                                 });
-                int n_selected = 0;
-                for (const Scored& sc : scored) {
-                    if (sc.score <= 0.0f) break;
-                    if (a.buy->size() >= kMaxChosenBuy) break;
-                    a.buy->push_back((*r.legal_buy)[sc.index]);
-                    ++n_selected;
-                }
-
-                // REPEAT the repeatable picks until the budget stops them.
-                //
-                // The teacher buys `gold / kInfantryCost` infantry - 25 of them
-                // on turn one - by pushing the same action over and over. The
-                // training label is a bitmask with one bit per (hex, variant),
-                // so all 25 collapse into one bit and the net is taught "buy
-                // infantry here" ONCE. Emitting each cell once then made it
-                // structurally impossible to buy more than one unit per city per
-                // turn, which starved it of units. Measured: with buy handed to
-                // the teacher instead, win rate against greedy went 18% -> 69%.
-                //
-                // Repeating is safe because apply_one validates every action and
-                // silently skips what cannot be afforded (buy.cpp), so the
-                // engine - not this decoder - decides where the money runs out.
-                // Only infantry and conversions repeat; the per-turn cap allows
-                // just one outpost or upgrade action anyway.
-                for (int pass = 0; pass < kBuyRepeatPasses && n_selected > 0; ++pass) {
-                    bool appended = false;
-                    for (int k = 0; k < n_selected; ++k) {
-                        const BuyAction& act = (*a.buy)[k];
-                        if (act.type != BuyType::kBuyInfantry &&
-                            act.type != BuyType::kConvertToSpecial) {
-                            continue;
-                        }
-                        if (a.buy->size() >= kMaxChosenBuy) break;
-                        a.buy->push_back(act);
-                        appended = true;
-                    }
-                    if (!appended) break;
-                }
+            case DecisionKind::kBuy:
+                decode_buy(i, r, *a.buy, 0.0f, sample_rng);
                 break;
-            }
             case DecisionKind::kRectification: {
                 // Score (battle slot, unit type) and send units back one at a
                 // time until the stack is under the cap.
@@ -498,6 +515,103 @@ void TorchPolicy::evaluate_impl(const DecisionRequest* requests, DecisionAnswer*
                     a.send_back->push_back(e);
                 }
                 break;
+            }
+        }
+    }
+
+    // --- ONE-PLY VALUE LOOKAHEAD ON BUY (see NeuralConfig::lookahead_k) -----
+    //
+    // Everything above is the plain policy. This is the part that makes the
+    // answer BETTER than the policy that proposed it, which is the property a
+    // self-play loop needs and the one three previous objectives lacked.
+    if (cfg_.lookahead_k > 1) {
+        std::vector<int> buy_idx;
+        for (int i = 0; i < n; ++i) {
+            if (requests[i].kind == DecisionKind::kBuy) buy_idx.push_back(i);
+        }
+        if (!buy_idx.empty()) {
+            const int k = cfg_.lookahead_k;
+            const size_t slots = buy_idx.size();
+
+            auto same_buy = [](const ChosenBuyActions& x, const ChosenBuyActions& y) {
+                if (x.size() != y.size()) return false;
+                for (int t = 0; t < x.size(); ++t) {
+                    if (!(x[t] == y[t])) return false;
+                }
+                return true;
+            };
+
+            // Candidate 0 is always the un-perturbed decode, so the operator can
+            // only depart from the plain policy when the value head says to.
+            std::vector<ChosenBuyActions> cand(slots * static_cast<size_t>(k));
+            std::vector<EncodedPosition> succ;
+            std::vector<int> owner, which;
+            succ.reserve(slots * static_cast<size_t>(k));
+
+            // A GameState is far too big for the stack, and this runs on a game
+            // thread that is already deep in a turn. One scratch copy is enough:
+            // each successor is encoded immediately and the copy reused.
+            std::unique_ptr<GameState> scratch(new GameState());
+            std::vector<ChosenBuyActions> per_faction(MAX_FACTIONS);
+
+            for (size_t si = 0; si < slots; ++si) {
+                const int i = buy_idx[si];
+                const DecisionRequest& r = requests[i];
+                if (r.faction < 0 || r.faction >= MAX_FACTIONS) continue;
+                for (int j = 0; j < k; ++j) {
+                    ChosenBuyActions& c = cand[si * static_cast<size_t>(k) + j];
+                    decode_buy(i, r, c, j == 0 ? 0.0f : cfg_.lookahead_tau, sample_rng);
+                    // Gumbel noise reproduces the plain decode often enough that
+                    // skipping duplicates is most of the batch back.
+                    bool dup = false;
+                    for (int p = 0; p < j && !dup; ++p) {
+                        dup = same_buy(cand[si * static_cast<size_t>(k) + p], c);
+                    }
+                    if (dup) continue;
+
+                    *scratch = *r.state;
+                    for (int f = 0; f < MAX_FACTIONS; ++f) per_faction[f].clear();
+                    per_faction[r.faction] = c;
+                    apply_buy_phase(*scratch, per_faction.data());
+
+                    DecisionRequest sr = r;
+                    sr.state = scratch.get();
+                    succ.emplace_back();
+                    encode_position(*scratch, sr, succ.back());
+                    owner.push_back(static_cast<int>(si));
+                    which.push_back(j);
+                }
+            }
+
+            const int m = static_cast<int>(succ.size());
+            if (m > 0) {
+                std::vector<int64_t> q(static_cast<size_t>(m), 0);
+                auto in = torch::from_blob(succ.data(), {m, kPosBytes}, torch::kUInt8);
+
+                std::unique_lock<std::mutex> lk(gpu_mu_);
+                auto raw2 = in.to(device_);
+                auto q2 = torch::from_blob(q.data(), {m}, torch::kLong).to(device_);
+                auto o2 = module_.forward({raw2, q2}).toGenericDict();
+                auto v = o2.at("value").toTensor().to(torch::kFloat32).to(torch::kCPU);
+                lk.unlock();
+
+                const float* vp = v.data_ptr<float>();
+                std::vector<float> best(slots, -3.0e38f);
+                std::vector<int> best_j(slots, 0);
+                for (int t = 0; t < m; ++t) {
+                    const int si = owner[static_cast<size_t>(t)];
+                    if (vp[t] > best[static_cast<size_t>(si)]) {
+                        best[static_cast<size_t>(si)] = vp[t];
+                        best_j[static_cast<size_t>(si)] = which[static_cast<size_t>(t)];
+                    }
+                }
+                for (size_t si = 0; si < slots; ++si) {
+                    ChosenBuyActions* dst_buy = answers[buy_idx[si]].buy;
+                    if (dst_buy) {
+                        *dst_buy = cand[si * static_cast<size_t>(k) +
+                                        static_cast<size_t>(best_j[si])];
+                    }
+                }
             }
         }
     }
