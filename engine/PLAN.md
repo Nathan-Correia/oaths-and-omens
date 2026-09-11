@@ -1252,7 +1252,7 @@ invariant every army mutation must preserve.
 | ~~M9~~ | ~~Neural policy runtime (§10)~~ | **done — `oo_run --neural` plays full games on random weights: 27 225 evals/s, 9.3 games/s at r7/f8, d=128 x4, after three answer-preserving optimisations (§10.9)** |
 | ~~M10a~~ | ~~Evaluation harness (§12.1)~~ | **done — `oo_eval`. Reproduces the known ordering with non-overlapping intervals, and a self-match lands on exactly 50.0 % (150-150), which is the paired mirror proving itself** |
 | M10b | Imitate tactician (§12.2) | **trained on 10.5M samples: beats `random` 100%, `greedy` 62.2%, near-parity with `marshal` at 44.2%, `tactician` 35.4%.** Exit criterion (beat `marshal`) not quite met - 44.2% [39.9, 48.6] |
-| M10c | Self-play (§12.3) | machinery built (sampling, self-play dumping, outcome filtering, AWR, shaped VP returns). **No self-play objective has produced a gain** - filtering, outcome advantage, shaped-return advantage and one-ply value lookahead all leave the ladder flat. Diagnosed: AWR on on-policy data cannot propose an unseen action, and the value head cannot rank afterstates that differ in spending. The round's real yield was a decoder bug (early break on the type-ordered scan) worth +2 to +4 points against marshal on every checkpoint. Best is now `sp3` at 65.8 / 47.0 / 39.4. See §12.3 |
+| M10c | Self-play (§12.3, §12.5) | **THE TEACHER WAS THE BOTTLENECK** (§12.5): `tacticiandet` with deterministic buy tie-breaks took buy agreement 45.2% -> 99.1% and the ladder to 100 / 68.4 / 49.2 / 40.2, the best yet, with the remaining gap now diffuse across every head. Earlier in the milestone: machinery built (sampling, self-play dumping, outcome filtering, AWR, shaped VP returns). **No self-play objective has produced a gain** - filtering, outcome advantage, shaped-return advantage and one-ply value lookahead all leave the ladder flat. Diagnosed: AWR on on-policy data cannot propose an unseen action, and the value head cannot rank afterstates that differ in spending. The round's real yield was a decoder bug (early break on the type-ordered scan) worth +2 to +4 points against marshal on every checkpoint. Best is now `sp3` at 65.8 / 47.0 / 39.4. See §12.3 |
 
 M1–M4 are where nearly all the risk lives. M5 is mechanical. M6 is the largest
 *volume* of work (~1 200 lines, §6.1) but low risk, since each agent is parity-tested
@@ -2262,6 +2262,77 @@ configurations read 57.4 and 58.5, and the effect was real but the ordering was
 noise. Two separate wrong conclusions in this section came from reading an
 interval that straddled its neighbour as though it were a ranking. Head-to-head
 buy experiments need four figures of games, not hundreds.
+
+### 12.5 The teacher was the bottleneck
+
+Everything in §12.3 - four self-play objectives and a search operator - was
+aimed at a gap that turned out to be a property of the TARGET, not of the
+learner, the objective, or the architecture.
+
+**Buy is not tactician's.** The comment at the top of `agents.cpp` says marshal
+reuses greedy's buy, and tactician wraps marshal. Handing buy back to greedy,
+marshal and tactician produces byte-identical results - 48.2% each - so all
+three call `greedy_buy_common`. There is no search anywhere in the buy
+decision. The whole 8.8-point gap was a failure to clone a greedy heuristic.
+
+**And that heuristic is stochastic.** It shuffles the candidate hex list to
+site an outpost and samples a city per infantry recruit. Asked the same
+question eight times:
+
+```
+teacher buy, 8 draws each:
+  pairwise agreement  44.3%   (sum p^2 - ceiling for a SAMPLING imitator)
+  modal frequency     56.3%   (max p   - ceiling for a DETERMINISTIC one)
+```
+
+The network was at 45.2% and would not move for 8x gradient weight, three
+epochs at 3e-4, or any decode threshold from -2 to +3. It was fitting noise.
+
+Note the two statistics, because quoting only the first is a trap this document
+fell into: self-agreement is `sum p^2`, but a deterministic decoder's ceiling is
+`max p`, and `max p >= sum p^2` with equality only for a uniform distribution.
+"The net matches the teacher as well as the teacher matches itself" sounds like
+a proof of optimality and is not one.
+
+**The fix: `marshaldet` and `tacticiandet`.** Identical agents whose buy
+tie-breaks deterministically - discovery order for the site, ROUND-ROBIN over
+cities for recruits, first candidate for conversions. Round-robin rather than
+"always the first city" because the per-outpost recruit cap would silently
+discard purchases piled onto one city, so spreading them is part of the
+behaviour being copied, not an aesthetic choice.
+
+Both verified at 100% self-agreement with unchanged strength (`marshaldet` 49.0%
+[44.6, 53.4] vs marshal; `tacticiandet` 49.6% [45.2, 54.0] vs tactician). They
+are NOT in the ladder, so every earlier measurement stays comparable.
+
+**Result.** Training from scratch on a 10,000-game `tacticiandet` corpus takes
+buy from 45.2% to **99.1%** exact-set agreement, and movement to 81.2%:
+
+| | vs random | vs greedy | vs marshal | vs tactician |
+|---|---|---|---|---|
+| `bc10k` | 100.0% | 64.0% | 46.2% | 35.2% |
+| `sp3` (prior best) | 100.0% | 65.8% | 47.0% | 39.4% |
+| **`det1`** | 100.0% | **68.4%** | **49.2%** | **40.2%** |
+| `tacticiandet` (the teacher) | - | 70.0% | 57.4% | 49.6% |
+
+**And the gap is now diffuse.** Re-running the fallback ablation on `det1`, each
+head handed to `tacticiandet` in turn: none 40.2, movement 42.8, buy 42.4,
+target 41.4, rectification 41.2, cavalry 40.8, resource 40.4. The increments sum
+to about 48%, near the teacher's 49.6%. There is no bottleneck left - the
+network is uniformly slightly worse than its teacher everywhere, which is what
+capacity- and data-limited imitation is supposed to look like, and which is why
+the generic levers (more parameters, more data, more epochs) finally apply where
+they would have been wasted before.
+
+**What this says about §12.3.** None of those four objectives was given a fair
+test. Self-play generated data with a policy whose buy head was fitting a coin
+flip, and every measurement of "did the policy improve" was taken through that
+noise. Self-play is worth revisiting, but only from `det1` or better, and only
+after the imitation ceiling is actually reached.
+
+**The rule to carry forward:** before concluding a learner cannot fit a target,
+measure whether the target is a function of its input. Ask the teacher the same
+question twice.
 
 Without search this is closer to iterated behaviour cloning or league play than
 to AlphaZero: generate games with the current policy, keep what wins, retrain,
