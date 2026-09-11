@@ -54,7 +54,11 @@ void usage() {
                  "                    0 is argmax, which makes the corpus useless -\n"
                  "                    a deterministic policy only ever shows you the\n"
                  "                    moves it already makes)\n"
-                 "  --in-flight N     self-play: games in flight (default 256)\n");
+                 "  --in-flight N     self-play: games in flight (default 256)\n"
+                 "  --dagger AGENT    DAGGER: --net-weights plays, AGENT labels.\n"
+                 "                    Trains on the STUDENT's own positions, which\n"
+                 "                    is where cloning fails. Use a deterministic\n"
+                 "                    teacher (tacticiandet)\n");
 }
 
 // Collects one game's samples. Everything is built in the final on-disk layout
@@ -297,15 +301,43 @@ bool rec_swap(const oo::GameState& s, int faction, int leftover, int placer, int
 // request carries only the state - and that is also what makes this safe under
 // the batch gate, where several games are mid-flight on different threads at
 // once.
+// ScriptedPolicy needs a RunConfig and the one in main is declared after the
+// recorder; this keeps the two in step without reordering the setup.
+oo::RunConfig rcfg_for_labeler(int radius, int num_factions, int max_turns) {
+    oo::RunConfig c;
+    c.radius = radius;
+    c.num_factions = num_factions;
+    c.max_turns = max_turns;
+    return c;
+}
+
 class SelfPlayRecorder : public oo::BatchedPolicy {
 public:
+    // `labeler` turns this into DAGGER. When it is null the recorder writes down
+    // whatever `inner` did, which is self-play. When it is set, `inner` still
+    // PLAYS but `labeler` is asked the same question and its answer is what
+    // gets recorded.
+    //
+    // That distinction is the whole point. Ordinary behaviour cloning trains on
+    // the teacher's own trajectories, so the student never sees the positions
+    // its own mistakes lead to - and it is exactly there that it has no idea
+    // what to do, which is why errors compound over sixteen turns. Measured:
+    // det2 copies buy at 99.5% and cavalry at 99.6% and still loses to its
+    // teacher by nine points, and making the model 5.5x larger changed nothing
+    // (51.7% [48.6, 54.8] head to head). That residual is covariate shift, not
+    // fitting error, and no amount of i.i.d. teacher data addresses it.
+    //
+    // This is only possible now because the teacher is deterministic
+    // (tacticiandet, §12.5). Against the old stochastic buy the labels would
+    // have been a coin flip on every one of these states too.
     SelfPlayRecorder(oo::BatchedPolicy* inner, oo::TrainWriter* writer, int num_factions,
-                     int num_hexes, int every)
-        : inner_(inner), writer_(writer), num_factions_(num_factions), num_hexes_(num_hexes),
-          every_(every) {}
+                     int num_hexes, int every, oo::BatchedPolicy* labeler = nullptr)
+        : inner_(inner), labeler_(labeler), writer_(writer), num_factions_(num_factions),
+          num_hexes_(num_hexes), every_(every) {}
 
     void on_game_start(const oo::GameState* s, int game_index) override {
         inner_->on_game_start(s, game_index);
+        if (labeler_) labeler_->on_game_start(s, game_index);
         std::lock_guard<std::mutex> lock(mu_);
         auto& g = games_[s];
         g.rec.state = s;
@@ -319,6 +351,7 @@ public:
 
     void on_game_end(const oo::GameState* s) override {
         inner_->on_game_end(s);
+        if (labeler_) labeler_->on_game_end(s);
         Entry taken;
         {
             std::lock_guard<std::mutex> lock(mu_);
@@ -334,12 +367,40 @@ public:
     }
 
     void evaluate(const oo::DecisionRequest* reqs, oo::DecisionAnswer* ans, int n) override {
+        if (!labeler_) {
+            inner_->evaluate(reqs, ans, n);
+            std::lock_guard<std::mutex> lock(mu_);
+            for (int i = 0; i < n; ++i) {
+                auto it = games_.find(reqs[i].state);
+                if (it == games_.end()) continue;
+                record(it->second.rec, reqs[i], ans[i]);
+            }
+            return;
+        }
+
+        // DAgger: ask the teacher first, into scratch answers so the caller's
+        // buffers are untouched, then let the student answer for real.
+        //
+        // THREAD_LOCAL because the batch gate evaluates outside its lock, so
+        // several threads are in here at once (oo/policy.hpp).
+        thread_local std::vector<oo::DecisionAnswer> lab;
+        thread_local std::vector<oo::ChosenBuyActions> lab_buy;
+        thread_local std::vector<oo::SendBack> lab_sb;
+        lab.assign(ans, ans + n);
+        lab_buy.resize(static_cast<size_t>(n));
+        lab_sb.resize(static_cast<size_t>(n));
+        for (int i = 0; i < n; ++i) {
+            lab[static_cast<size_t>(i)].buy = &lab_buy[static_cast<size_t>(i)];
+            lab[static_cast<size_t>(i)].send_back = &lab_sb[static_cast<size_t>(i)];
+        }
+        labeler_->evaluate(reqs, lab.data(), n);
         inner_->evaluate(reqs, ans, n);
+
         std::lock_guard<std::mutex> lock(mu_);
         for (int i = 0; i < n; ++i) {
             auto it = games_.find(reqs[i].state);
             if (it == games_.end()) continue;
-            record(it->second.rec, reqs[i], ans[i]);
+            record(it->second.rec, reqs[i], lab[static_cast<size_t>(i)]);
         }
     }
 
@@ -455,6 +516,7 @@ private:
     }
 
     oo::BatchedPolicy* inner_;
+    oo::BatchedPolicy* labeler_ = nullptr;
     oo::TrainWriter* writer_;
     int num_factions_, num_hexes_, every_;
     std::mutex mu_;
@@ -478,6 +540,8 @@ int main(int argc, char** argv) {
     // improvement, with one ply of value search standing in for MCTS.
     int lookahead = 0;
     float look_tau = 1.0f;
+    // DAGGER: the student named by --net-weights plays, this agent labels.
+    std::string dagger;
     long long base_seed = 1;
 
     for (int i = 1; i < argc; ++i) {
@@ -497,6 +561,7 @@ int main(int argc, char** argv) {
         else if (a == "--lookahead") lookahead = std::atoi(next().c_str());
         else if (a == "--lookahead-tau") look_tau = float(std::atof(next().c_str()));
         else if (a == "--in-flight") in_flight = std::atoi(next().c_str());
+        else if (a == "--dagger") dagger = next();
         else {
             std::fprintf(stderr, "unknown option '%s'\n\n", a.c_str());
             usage();
@@ -574,7 +639,29 @@ int main(int argc, char** argv) {
             }
         }
 
-        SelfPlayRecorder rec(policy.get(), &writer, num_factions, grid.num_hexes(), every);
+        // DAgger labeller: a scripted agent sitting in every seat of the SAME
+        // games, so it sees the student's positions and answers from them.
+        std::unique_ptr<oo::ScriptedPolicy> labeler;
+        if (!dagger.empty()) {
+            oo::AgentKind dkind;
+            if (!oo::agent_kind_from_name(dagger.c_str(), dkind)) {
+                std::fprintf(stderr, "unknown --dagger agent '%s'\n", dagger.c_str());
+                return 2;
+            }
+            for (int g = 0; g < num_games; ++g) {
+                for (int f = 0; f < num_factions; ++f) {
+                    specs[static_cast<size_t>(g)].seats[f] = dkind;
+                }
+            }
+            labeler = std::make_unique<oo::ScriptedPolicy>(rcfg_for_labeler(radius, num_factions,
+                                                                           max_turns),
+                                                           specs.data(), num_games);
+            std::printf("DAGGER: the network plays, %s labels every decision\n", dagger.c_str());
+            std::fflush(stdout);
+        }
+
+        SelfPlayRecorder rec(policy.get(), &writer, num_factions, grid.num_hexes(), every,
+                             labeler.get());
         oo::RunConfig rcfg;
         rcfg.radius = radius;
         rcfg.num_factions = num_factions;
