@@ -248,13 +248,18 @@ bool parse_side(const std::string& name, const std::string& weights, Side& out) 
 // games - only the RNG stream is consumed twice as fast.
 class BuySelfAgreePolicy : public BatchedPolicy {
 public:
-    explicit BuySelfAgreePolicy(BatchedPolicy* inner) : inner_(inner) {}
+    explicit BuySelfAgreePolicy(BatchedPolicy* inner) : inner_(inner) {
+        for (int k = 0; k < kNumDecisionKinds; ++k) {
+            total_[k] = 0;
+            pair_num_[k] = 0;
+            pair_den_[k] = 0;
+            modal_[k] = 0;
+        }
+    }
 
     void evaluate(const DecisionRequest* requests, DecisionAnswer* answers, int n) override {
         std::vector<int> buys;
-        for (int i = 0; i < n; ++i) {
-            if (requests[i].kind == DecisionKind::kBuy && answers[i].buy) buys.push_back(i);
-        }
+        for (int i = 0; i < n; ++i) buys.push_back(i);
         if (buys.empty()) {
             inner_->evaluate(requests, answers, n);
             return;
@@ -282,12 +287,13 @@ public:
             }
             inner_->evaluate(requests, answers, n);
             for (size_t j = 0; j < buys.size(); ++j) {
-                draws[j].push_back(cells(*answers[buys[j]].buy));
+                draws[j].push_back(fingerprint(requests[buys[j]], answers[buys[j]]));
             }
         }
         for (size_t j = 0; j < buys.size(); ++j) answers[buys[j]].buy = saved[j];
 
         for (size_t j = 0; j < buys.size(); ++j) {
+            const int kind = static_cast<int>(requests[buys[j]].kind);
             const std::vector<std::vector<int> >& d = draws[j];
             long long pairs = 0, same = 0;
             for (size_t x = 0; x < d.size(); ++x) {
@@ -304,29 +310,65 @@ public:
                 }
                 if (c > best) best = c;
             }
-            total_.fetch_add(1, std::memory_order_relaxed);
-            pair_num_.fetch_add(same, std::memory_order_relaxed);
-            pair_den_.fetch_add(pairs, std::memory_order_relaxed);
-            modal_.fetch_add(best, std::memory_order_relaxed);
+            total_[kind].fetch_add(1, std::memory_order_relaxed);
+            pair_num_[kind].fetch_add(same, std::memory_order_relaxed);
+            pair_den_[kind].fetch_add(pairs, std::memory_order_relaxed);
+            modal_[kind].fetch_add(best, std::memory_order_relaxed);
         }
     }
     void on_game_start(const GameState* s, int g) override { inner_->on_game_start(s, g); }
     void on_game_end(const GameState* s) override { inner_->on_game_end(s); }
 
     void report() const {
-        const long long t = total_.load();
-        if (t == 0) return;
-        const double pairwise = double(pair_num_.load()) / double(pair_den_.load());
-        const double modal = double(modal_.load()) / double(t * kDraws);
-        std::printf("  teacher buy over %lld decisions, %d draws each:\n"
-                    "    pairwise agreement  %.1f%%  (sum p^2 - ceiling for a "
-                    "SAMPLING imitator)\n"
-                    "    modal frequency     %.1f%%  (max p - ceiling for a "
-                    "DETERMINISTIC one)\n",
-                    t, kDraws, 100.0 * pairwise, 100.0 * modal);
+        std::printf("  teacher self-agreement, %d draws of each decision:\n"
+                    "    %-14s %10s  %9s  %9s\n",
+                    kDraws, "kind", "decisions", "pairwise", "modal");
+        for (int k = 0; k < kNumDecisionKinds; ++k) {
+            const long long t = total_[k].load();
+            if (t == 0) continue;
+            const long long den = pair_den_[k].load();
+            const double pairwise = den ? double(pair_num_[k].load()) / double(den) : 0.0;
+            const double modal = double(modal_[k].load()) / double(t * kDraws);
+            std::printf("    %-14s %10lld  %8.1f%%  %8.1f%%\n",
+                        decision_kind_name(static_cast<DecisionKind>(k)), t,
+                        100.0 * pairwise, 100.0 * modal);
+        }
+        std::printf("    pairwise = sum p^2, the ceiling for a SAMPLING imitator;\n"
+                    "    modal    = max p,   the ceiling for a DETERMINISTIC one\n");
     }
 
 private:
+    // A comparable fingerprint of an answer. Only the fields that kind uses.
+    static std::vector<int> fingerprint(const DecisionRequest& r, const DecisionAnswer& a) {
+        switch (r.kind) {
+            case DecisionKind::kBuy:
+                return a.buy ? cells(*a.buy) : std::vector<int>();
+            case DecisionKind::kMovement:
+            case DecisionKind::kCavalry:
+                return a.flag ? std::vector<int>{1, a.move.hex, a.move.dir}
+                              : std::vector<int>{0};
+            case DecisionKind::kTarget:
+            case DecisionKind::kPlacement:
+            case DecisionKind::kDraft:
+                return std::vector<int>{a.index};
+            case DecisionKind::kResource:
+                return std::vector<int>{static_cast<int>(a.resource)};
+            case DecisionKind::kSwap:
+                return std::vector<int>{a.flag ? 1 : 0};
+            default: {  // rectification
+                std::vector<int> v;
+                if (a.send_back) {
+                    for (int i = 0; i < a.send_back->size(); ++i) {
+                        const SendBackEntry& e = (*a.send_back)[i];
+                        v.push_back(e.origin_hex);
+                        for (int t = 0; t < NUM_UNIT_TYPES; ++t) v.push_back(e.units[t]);
+                    }
+                }
+                return v;
+            }
+        }
+    }
+
     static std::vector<int> cells(const ChosenBuyActions& b) {
         std::vector<int> v;
         for (int t = 0; t < b.size(); ++t) {
@@ -347,10 +389,10 @@ private:
 
     static const int kDraws = 8;
     BatchedPolicy* inner_;
-    mutable std::atomic<long long> total_{0};
-    mutable std::atomic<long long> pair_num_{0};
-    mutable std::atomic<long long> pair_den_{0};
-    mutable std::atomic<long long> modal_{0};
+    mutable std::atomic<long long> total_[kNumDecisionKinds];
+    mutable std::atomic<long long> pair_num_[kNumDecisionKinds];
+    mutable std::atomic<long long> pair_den_[kNumDecisionKinds];
+    mutable std::atomic<long long> modal_[kNumDecisionKinds];
 };
 
 // Passes every answer through untouched EXCEPT buy, which is squeezed through

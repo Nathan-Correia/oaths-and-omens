@@ -920,6 +920,43 @@ double evaluate(const GameState& state, int faction) {
            kArmyPowerWeight * power;
 }
 
+// A deterministic fingerprint of a position, for the deterministic teacher.
+//
+// Tactician's movement is a random variable given the state, for two reasons:
+// the per-decision rollout seed is drawn from the agent's own stream, whose
+// position depends on the whole game history, and the shared rollout agents
+// carry RNGs that persist across rollouts ("how many rollouts run is itself
+// part of the state"). Measured over eight draws of the same decision,
+// movement self-agrees 84.3% of the time against 100% for every other kind -
+// and the network sits at 85.2%, i.e. already at that ceiling.
+//
+// Hashing the position and seeding everything from it makes the answer a
+// function of the position alone, which is what an imitator can actually
+// learn. FNV-1a over the fields that decide a move; terrain and settle order
+// are fixed for a game and add nothing.
+uint64_t position_fingerprint(const GameState& s, int faction, int step) {
+    uint64_t h = 1469598103934665603ull;
+    auto mix = [&h](uint64_t v) {
+        h ^= v;
+        h *= 1099511628211ull;
+    };
+    mix(static_cast<uint64_t>(s.turn_number));
+    mix(static_cast<uint64_t>(faction));
+    mix(static_cast<uint64_t>(step));
+    for (int f = 0; f < s.num_factions; ++f) {
+        mix(static_cast<uint64_t>(s.gold[f]));
+        mix(static_cast<uint64_t>(s.victory_points[f]));
+        mix(static_cast<uint64_t>(s.kill_xp[f]));
+    }
+    for (int hx = 0; hx < s.num_hexes; ++hx) {
+        mix(static_cast<uint64_t>(static_cast<uint8_t>(s.city_owner[hx] + 1)));
+        for (int t = 0; t < NUM_UNIT_TYPES; ++t) {
+            mix(static_cast<uint64_t>(s.army_units[hx][t]));
+        }
+    }
+    return h;
+}
+
 // The two policy sets a rollout runs on, shared by every tactician in a game
 // exactly as make_tactician_agents shares one marshal set and one random set
 // across all factions. Their RNGs are mutated by rollouts and persist, so how
@@ -1308,6 +1345,14 @@ public:
         return heuristic_target(s, hex_index, faction);
     }
 
+protected:
+    // Where the rollout dice come from. The default draws from this agent's own
+    // stream, which is what the Python original does and what keeps the two in
+    // step; the deterministic teacher derives it from the position instead.
+    virtual int64_t rollout_seed(const GameState&, int /*faction*/) {
+        return rng.randrange(static_cast<int64_t>(1) << 31);
+    }
+
 private:
     bool search_first_move(const GameState& state, int faction, const LegalMask& legal,
                            Move& out) {
@@ -1341,7 +1386,7 @@ private:
 
         // One seed for the whole decision, reused for every candidate, so they
         // are compared against identical dice rather than different luck.
-        const int64_t seed = rng.randrange(static_cast<int64_t>(1) << 31);
+        const int64_t seed = rollout_seed(state, faction);
         // Seeded ONCE and copied per candidate. Constructing an Rng runs
         // MT19937's init_by_array over 624 words; doing that inside the loop made
         // Rng::seed 4.5 % of a tactician game on its own. A copy is a 2.5 KB
@@ -1363,6 +1408,10 @@ private:
         return have_best;
     }
 
+protected:
+    // protected, not private: the deterministic teacher reseeds these per
+    // decision so a rollout's dice depend on the position rather than on how
+    // many rollouts have run before it.
     std::shared_ptr<TacticianShared> shared_;
     std::shared_ptr<GameState> scratch_;  // reused rollout buffer; GameState is ~65 KB
 };
@@ -1443,6 +1492,7 @@ public:
                     ChosenBuyActions& out) override {
         greedy_buy_det(rng, s, faction, legal, out);
     }
+
 };
 
 // tactician, with greedy's buy tie-breaking deterministically. The teacher used
@@ -1457,6 +1507,28 @@ public:
     void decide_buy(const GameState& s, int faction, const LegalBuyActions& legal,
                     ChosenBuyActions& out) override {
         greedy_buy_det(rng, s, faction, legal, out);
+    }
+protected:
+    // Both halves of the nondeterminism, pinned to the position.
+    //
+    // The seed itself is the easy half. The shared rollout agents are the other
+    // one: their generators are mutated by every rollout and persist across the
+    // game, so the same position reached twice faces different dice even with
+    // an identical seed. Reseeding them here from the same fingerprint makes a
+    // decision depend on the position and nothing else.
+    int64_t rollout_seed(const GameState& s, int faction) override {
+        const uint64_t fp = position_fingerprint(s, faction, 0);
+        if (shared_) {
+            for (int f = 0; f < shared_->mine.num_factions; ++f) {
+                if (shared_->mine.agents[f]) shared_->mine.agents[f]->rng = Rng(int64_t(fp + f));
+            }
+            for (int f = 0; f < shared_->opp.num_factions; ++f) {
+                if (shared_->opp.agents[f]) {
+                    shared_->opp.agents[f]->rng = Rng(int64_t(fp + 999983 + f));
+                }
+            }
+        }
+        return static_cast<int64_t>(fp & ((static_cast<uint64_t>(1) << 31) - 1));
     }
 };
 
