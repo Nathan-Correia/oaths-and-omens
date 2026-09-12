@@ -1252,7 +1252,7 @@ invariant every army mutation must preserve.
 | ~~M9~~ | ~~Neural policy runtime (§10)~~ | **done — `oo_run --neural` plays full games on random weights: 27 225 evals/s, 9.3 games/s at r7/f8, d=128 x4, after three answer-preserving optimisations (§10.9)** |
 | ~~M10a~~ | ~~Evaluation harness (§12.1)~~ | **done — `oo_eval`. Reproduces the known ordering with non-overlapping intervals, and a self-match lands on exactly 50.0 % (150-150), which is the paired mirror proving itself** |
 | M10b | Imitate tactician (§12.2) | **trained on 10.5M samples: beats `random` 100%, `greedy` 62.2%, near-parity with `marshal` at 44.2%, `tactician` 35.4%.** Exit criterion (beat `marshal`) not quite met - 44.2% [39.9, 48.6] |
-| M10c | Self-play (§12.3, §12.5) | **THE TEACHER WAS THE BOTTLENECK** (§12.5): `tacticiandet` with deterministic buy tie-breaks took buy agreement 45.2% -> 99.1% and the ladder to 100 / 68.4 / 49.2 / 40.2, the best yet, with the remaining gap now diffuse across every head. Earlier in the milestone: machinery built (sampling, self-play dumping, outcome filtering, AWR, shaped VP returns). **No self-play objective has produced a gain** - filtering, outcome advantage, shaped-return advantage and one-ply value lookahead all leave the ladder flat. Diagnosed: AWR on on-policy data cannot propose an unseen action, and the value head cannot rank afterstates that differ in spending. The round's real yield was a decoder bug (early break on the type-ordered scan) worth +2 to +4 points against marshal on every checkpoint. Best is now `sp3` at 65.8 / 47.0 / 39.4. See §12.3 |
+| M10c | Self-play (§12.3, §12.5, §12.6) | **THE TEACHER WAS THE BOTTLENECK** (§12.5): `tacticiandet` with deterministic buy tie-breaks took buy agreement 45.2% -> 99.1% and the ladder to 100 / 68.4 / 49.2 / 40.2, the best yet; DAgger (§12.6) then took it to 67.8 / 51.6 / 44.0, and imitation of this teacher is close to exhausted - deterministic movement and a second DAgger round both bought nothing. Next: a stronger teacher. Earlier in the milestone: machinery built (sampling, self-play dumping, outcome filtering, AWR, shaped VP returns). **No self-play objective has produced a gain** - filtering, outcome advantage, shaped-return advantage and one-ply value lookahead all leave the ladder flat. Diagnosed: AWR on on-policy data cannot propose an unseen action, and the value head cannot rank afterstates that differ in spending. The round's real yield was a decoder bug (early break on the type-ordered scan) worth +2 to +4 points against marshal on every checkpoint. Best is now `sp3` at 65.8 / 47.0 / 39.4. See §12.3 |
 
 M1–M4 are where nearly all the risk lives. M5 is mechanical. M6 is the largest
 *volume* of work (~1 200 lines, §6.1) but low risk, since each agent is parity-tested
@@ -2333,6 +2333,71 @@ after the imitation ceiling is actually reached.
 **The rule to carry forward:** before concluding a learner cannot fit a target,
 measure whether the target is a function of its input. Ask the teacher the same
 question twice.
+
+### 12.6 DAgger, and the same rule applied once too often
+
+**DAgger works, once.** `det2` copied buy at 99.5 % and cavalry at 99.6 % and
+still lost to its teacher by nine points, and 5.5x the parameters changed
+nothing (51.7 % [48.6, 54.8] head to head) - so neither fitting error nor
+capacity. Covariate shift: cloning only ever shows the student the TEACHER's
+trajectories, never the positions the student's own mistakes lead to.
+`SelfPlayRecorder` gained a labeller, so `--net-weights` plays while `--dagger
+AGENT` answers the same question and its answer is recorded.
+
+| | vs greedy | vs marshal | vs tactician |
+|---|---|---|---|
+| `det2` | 68.4 % | 51.8 % | 40.2 % |
+| **`dag1`** | 67.8 % | 51.6 % | **44.0 %** |
+
+The +3.8 lands entirely against tactician, the opponent that drives the student
+furthest off the teacher's distribution - the asymmetry the diagnosis predicts.
+
+**Round two gave nothing**, with or without aggregation: `dag2` (dag2+dag1+det1)
+42.0 %, `dag2b` (DAgger corpora only) 43.0 %, head to head 52.8 % [49.7, 55.9]
+and 49.0 % [45.9, 52.1]. One round of DAgger, then converged.
+
+#### The overcorrection
+
+Generalising the self-agreement probe to every kind found movement at 84.3 %
+pairwise / 89.1 % modal where every other head was 100 %, against a network
+sitting at 85.2 %. That looked exactly like the buy story, so tactician's
+movement was made deterministic too - the rollout seed derived from a position
+fingerprint, and the shared rollout agents (whose generators persist across
+rollouts) reseeded from it. Verified 100 % self-agreement on every kind, teacher
+strength unchanged.
+
+**It bought nothing.** `det3`: 66.8 / 50.8 / 41.0, movement agreement 83.9 %,
+47.4 % [44.3, 50.5] against `dag1`.
+
+| run | params | teacher movement | movement agreement |
+|---|---|---|---|
+| `det1` | 1.0 M | stochastic | 81.2 % |
+| `det2` | 5.7 M | stochastic | 85.3 % |
+| `det3` | 5.7 M | **deterministic** | 83.9 % |
+
+Capacity moved movement +4.1 points; determinism moved it nothing. Movement is
+limited by CAPACITY AND FUNCTION DIFFICULTY, not by the teacher's dice - the
+opposite of buy.
+
+What made this look confirmed was a coincidence: the teacher's movement
+self-agreement (84.3 %) and the network's independent fitting limit (~85 %)
+landed on nearly the same number. Two unrelated limits, one number. §12.5 warns
+that matching agreement "sounds like a proof of optimality and is not one"; the
+same trap runs in the other direction, and a matching number is not evidence
+that the two limits are the SAME limit. The test that would have separated them
+was already in hand - capacity had already moved movement four points while
+leaving buy at 45.2 %, which is the signature of a fitting limit, not a ceiling.
+
+The deterministic teacher is kept regardless: a reproducible teacher is worth
+having, and it costs nothing.
+
+**Where imitation stands.** `dag1` at 67.8 / 51.6 / 44.0 against a teacher at
+72.0 / 58.6 / 49.2, with the per-head ablation diffuse and movement worth only
++2.6 even if fitted perfectly. Imitating THIS teacher is close to exhausted.
+The next lever is a STRONGER teacher, and the economics favour one: teacher cost
+is paid once at corpus generation (10,000 games in 47 s) and never at inference,
+so a teacher several times slower than tactician is affordable in a way a slower
+policy would not be.
 
 Without search this is closer to iterated behaviour cloning or league play than
 to AlphaZero: generate games with the current policy, keep what wins, retrain,
