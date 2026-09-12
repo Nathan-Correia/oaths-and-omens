@@ -2452,12 +2452,70 @@ deeper-searching teacher.
 
 - **A rollout more than one turn deep.** §12.7 localises tactician's weakness to
   what a rollout measures. This is the only untried lever on teacher strength.
-- **Self-play, revisited.** §12.3's four objectives were all measured through a
-  buy head fitting noise, so none was fairly tested. `dag1` is the first policy
-  worth running them from.
+- ~~**Self-play, revisited.**~~ Done - see §12.9. Worth +5 on greedy and
+  marshal, once.
 - **Accept it.** `dag1` plays near marshal and takes 44 % off tactician at
   neural-network speed. If the goal is a fast strong-ish policy rather than a
   tactician-beater, this is already it.
+
+### 12.9 Self-play, revisited - it works, once
+
+**§12.3's four objectives never had a chance, for a reason that is not about
+the objective.** `temperature` is applied inside `choose()`, which serves the
+single-choice heads. Buy is decoded by thresholding and sorting per-cell scores
+with no sampling anywhere in it, so every self-play corpus in §12.3 contained
+exactly ONE purchase set per position - the argmax one, in every game.
+Filtering and advantage weighting reweight variation that exists, and in the
+head that is 100 % of the strength gap there was none. Together with the buy
+head fitting a coin flip (§12.5), self-play was blocked twice over.
+
+`buy_temperature` adds Gumbel noise to the buy scores, so perturb-and-argmax
+draws a real sample of the policy's own distribution over purchase sets. It is
+nearly free, because the noise only flips genuinely marginal cells:
+
+| buy tau | `dag1` vs tactician |
+|---|---|
+| 0 | 44.0 % |
+| 0.5 | 45.0 % |
+| 2.0 | 43.5 % |
+
+**One round then works.** `sp4` = `dag1` + advantage-weighted self-play
+(beta 0.3) on shaped VP returns:
+
+| | vs greedy | vs marshal | vs tactician |
+|---|---|---|---|
+| `dag1` | 67.8 % | 51.6 % | 44.0 % |
+| **`sp4`** | **72.4 %** | **58.2 %** | **45.8 %** |
+| `tacticiandet` (teacher) | 72.0 % | 58.6 % | 49.2 % |
+
+55.8 % [52.7, 58.9] over 1,000 games, replicated on a second seed. `sp4` has
+CAUGHT ITS TEACHER on greedy and marshal - the first time anything here has
+gone past imitation.
+
+**And then stops.** Round two at the same exploration gives 51.4 % [48.3, 54.5];
+round two at higher exploration (movement tau 1.6, buy tau 2.5) gives 46.6 %
+[43.5, 49.7] - actively worse, because the noisier corpus degrades the labels
+(buy agreement 99.9 % -> 98.8 %, movement 85.0 % -> 83.1 %) by more than the
+extra alternatives are worth. So exploration is not the limiting factor, and
+more of it costs.
+
+Every mechanism in this milestone has given exactly one round: DAgger once,
+self-play once. The common shape is that each fixes a finite deficit - DAgger
+covers states the teacher never showed, self-play selects among alternatives at
+one noise level - and neither generates new deficits to fix.
+
+#### On reading drift
+
+The gain came with buy drift of 0.1 % and movement drift of 3.4 %, against
+§12.3 where 32 % buy drift bought nothing. Drift MAGNITUDE means nothing alone:
+there it was churn from a head fitting noise, here it is small directed change
+across many heads compounding over sixteen turns. Only measuring drift and
+strength together separates the two.
+
+One red herring worth recording: swap drifted 98.9 %, which looked like the
+whole story. It is 0.08 % of decisions, and handing swap back to the teacher
+leaves the ladder unchanged (72.6 / 58.0 against `sp4`'s 72.4 / 58.2). A head
+with almost no gradient pinning it will flip wholesale and mean nothing.
 
 Without search this is closer to iterated behaviour cloning or league play than
 to AlphaZero: generate games with the current policy, keep what wins, retrain,
