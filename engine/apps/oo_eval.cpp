@@ -206,6 +206,7 @@ struct Side {
     // Ask this side's buy question twice and report self-agreement.
     bool buy_selfagree = false;
     float buy_threshold = 0.0f;
+    float buy_temperature = 0.0f;
     AgentKind kind = AgentKind::kRandom;
     // Ablation: decision kinds this side hands back to a scripted agent.
     bool fallback[kNumDecisionKinds] = {};
@@ -532,6 +533,7 @@ Result play_matchup(const Side& a, const Side& b, const RunConfig& cfg, long lon
             nc.lookahead_tau = s.lookahead_tau;
             nc.lookahead_cells_only = s.lookahead_cells_only;
             nc.buy_threshold = s.buy_threshold;
+            nc.buy_temperature = s.buy_temperature;
             auto p = make_neural_policy(nc, err);
             if (!p) std::fprintf(stderr, "side %s: %s\n", s.name.c_str(), err.c_str());
             return p;
@@ -646,6 +648,7 @@ int main(int argc, char** argv) {
     bool a_roundtrip = false;
     bool a_selfagree = false;
     float a_bt = 0.0f;
+    float a_btemp = 0.0f;
 
     for (int i = 1; i < argc; ++i) {
         const std::string s = argv[i];
@@ -661,6 +664,7 @@ int main(int argc, char** argv) {
         else if (s == "--a-buy-roundtrip") a_roundtrip = true;
         else if (s == "--a-buy-selfagree") a_selfagree = true;
         else if (s == "--a-buy-threshold") a_bt = float(std::atof(next().c_str()));
+        else if (s == "--a-buy-temperature") a_btemp = float(std::atof(next().c_str()));
         else if (s == "--a-fallback") fallback_kinds = next();
         else if (s == "--a-fallback-agent") fallback_agent = next();
         else if (s == "--games") pairs = std::atoi(next().c_str());
@@ -691,6 +695,7 @@ int main(int argc, char** argv) {
     a.buy_roundtrip = a_roundtrip;
     a.buy_selfagree = a_selfagree;
     a.buy_threshold = a_bt;
+    a.buy_temperature = a_btemp;
     if (!fallback_kinds.empty()) {
         for (const std::string& k : split_commas(fallback_kinds)) {
             int found = -1;

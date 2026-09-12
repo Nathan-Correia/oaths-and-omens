@@ -327,7 +327,7 @@ void TorchPolicy::evaluate_impl(const DecisionRequest* requests, DecisionAnswer*
     // the cells right at the threshold, where the policy head is least sure
     // whether the purchase is worth it.
     auto decode_buy = [&](int i, const DecisionRequest& r, ChosenBuyActions& out,
-                          int delta) {
+                          int delta, Rng* explore) {
         out.clear();
         struct Scored {
             float score;
@@ -345,7 +345,16 @@ void TorchPolicy::evaluate_impl(const DecisionRequest* requests, DecisionAnswer*
                 default: variant = 6 + act.upgrade; break;
             }
             if (variant > 8) variant = 8;
-            scored.push_back({buy_at(i, act.hex, variant), k});
+            float sc = buy_at(i, act.hex, variant);
+            if (explore != nullptr && cfg_.buy_temperature > 0.0f) {
+                // Perturb-and-argmax: adding Gumbel noise to logits and taking
+                // the top-k draws that set from the softmax, so each corpus game
+                // shows a legitimate sample of the policy rather than jitter.
+                double u = explore->random();
+                if (u <= 0.0) u = 1e-12;
+                sc += cfg_.buy_temperature * static_cast<float>(-std::log(-std::log(u)));
+            }
+            scored.push_back({sc, k});
         }
         if (scored.empty()) return;
 
@@ -520,7 +529,7 @@ void TorchPolicy::evaluate_impl(const DecisionRequest* requests, DecisionAnswer*
                 a.flag = swap_at(i, 0) > swap_at(i, 1);
                 break;
             case DecisionKind::kBuy:
-                decode_buy(i, r, *a.buy, 0);
+                decode_buy(i, r, *a.buy, 0, &sample_rng);
                 break;
             case DecisionKind::kRectification: {
                 // Score (battle slot, unit type) and send units back one at a
@@ -618,7 +627,7 @@ void TorchPolicy::evaluate_impl(const DecisionRequest* requests, DecisionAnswer*
                     // marginal selection for the j-th best rejected one, so the
                     // operator can only depart from the policy when the value
                     // head prefers a DIFFERENT purchase, never a cheaper turn.
-                    decode_buy(i, r, c, j);
+                    decode_buy(i, r, c, j, nullptr);
                     // Gumbel noise reproduces the plain decode often enough that
                     // skipping duplicates is most of the batch back.
                     bool dup = false;

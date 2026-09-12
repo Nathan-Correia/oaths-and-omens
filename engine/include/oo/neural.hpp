@@ -51,6 +51,24 @@ struct NeuralConfig {
     // generator lookup on every decision.
     int64_t sample_seed = 1;
 
+    // Gumbel noise on the buy scores, for SELF-PLAY EXPLORATION.
+    //
+    // `temperature` above does not reach buy at all. It is applied inside the
+    // choose() helper, which serves the single-choice heads; buy is decoded by
+    // thresholding and sorting the per-cell scores, with no sampling anywhere
+    // in it. So a self-play corpus generated at any temperature contains
+    // exactly ONE purchase set per position - the argmax one, every game.
+    //
+    // That is why §12.3's four self-play objectives could not move buy. Filtering
+    // and advantage weighting reweight variation that already exists, and in the
+    // head that is 100 % of the strength gap there was none. Perturb-and-argmax
+    // with Gumbel noise draws a genuine sample of the policy's own distribution
+    // over purchase sets, which is the variation those objectives need.
+    //
+    // 0 keeps the decode deterministic, which is how the policy PLAYS and what
+    // the ladder measures.
+    float buy_temperature = 0.0f;
+
     // The logit above which a buy cell is purchased.
     //
     // The buy head is per-cell BCE, so the decoder takes every cell the network

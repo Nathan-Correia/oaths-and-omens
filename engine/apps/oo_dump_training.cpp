@@ -55,6 +55,9 @@ void usage() {
                  "                    a deterministic policy only ever shows you the\n"
                  "                    moves it already makes)\n"
                  "  --in-flight N     self-play: games in flight (default 256)\n"
+                 "  --buy-temperature T  self-play: Gumbel noise on the buy\n"
+                 "                    scores. REQUIRED for self-play to explore buy at\n"
+                 "                    all - plain --temperature does not reach it\n"
                  "  --dagger AGENT    DAGGER: --net-weights plays, AGENT labels.\n"
                  "                    Trains on the STUDENT's own positions, which\n"
                  "                    is where cloning fails. Use a deterministic\n"
@@ -542,6 +545,9 @@ int main(int argc, char** argv) {
     float look_tau = 1.0f;
     // DAGGER: the student named by --net-weights plays, this agent labels.
     std::string dagger;
+    // Buy exploration. Without it a self-play corpus has one purchase set per
+    // position and no self-play objective can move the buy head at all.
+    float buy_temp = 0.0f;
     long long base_seed = 1;
 
     for (int i = 1; i < argc; ++i) {
@@ -562,6 +568,7 @@ int main(int argc, char** argv) {
         else if (a == "--lookahead-tau") look_tau = float(std::atof(next().c_str()));
         else if (a == "--in-flight") in_flight = std::atoi(next().c_str());
         else if (a == "--dagger") dagger = next();
+        else if (a == "--buy-temperature") buy_temp = float(std::atof(next().c_str()));
         else {
             std::fprintf(stderr, "unknown option '%s'\n\n", a.c_str());
             usage();
@@ -612,6 +619,7 @@ int main(int argc, char** argv) {
         ncfg.sample_seed = base_seed;
         ncfg.lookahead_k = lookahead;
         ncfg.lookahead_tau = look_tau;
+        ncfg.buy_temperature = buy_temp;
         std::string nerr;
         auto policy = oo::make_neural_policy(ncfg, nerr);
         if (!policy) {
@@ -624,6 +632,14 @@ int main(int argc, char** argv) {
             std::printf("  buy lookahead: %d candidates, tau %.2f - the recorded buy "
                         "labels come from the value head, not the policy head\n",
                         lookahead, look_tau);
+        }
+        if (buy_temp > 0.0f) {
+            std::printf("  buy exploration: Gumbel tau %.2f - without this the buy "
+                        "decode is deterministic and the corpus shows one purchase "
+                        "set per position\n", buy_temp);
+        } else {
+            std::printf("  WARNING: --buy-temperature 0, so every game plays the SAME\n"
+                        "  buy from a given position and no objective can move that head.\n");
         }
         if (temperature <= 0.0f) {
             std::printf("  WARNING: temperature 0 is argmax, so every game shows only the\n"
