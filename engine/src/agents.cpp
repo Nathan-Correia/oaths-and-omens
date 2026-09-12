@@ -884,6 +884,10 @@ bool sentinel_move(const GameState& state, int faction, int step, const LegalMas
 // memcpy here, where the Python original ran a dozen np.copy calls per rollout.
 
 inline constexpr int kMaxCandidates = 10;
+// Buffer capacity only - how many are actually searched is
+// TacticianAgent::max_candidates(), which defaults to kMaxCandidates so
+// tactician's behaviour is untouched.
+inline constexpr int kMaxCandidatesDeep = 32;
 inline constexpr double kRivalWeight = 0.5;
 inline constexpr double kOutpostWeight = 2.0;
 inline constexpr double kArmyPowerWeight = 0.05;
@@ -1353,6 +1357,11 @@ protected:
         return rng.randrange(static_cast<int64_t>(1) << 31);
     }
 
+    // How wide the candidate list is, and how many rollouts are averaged to
+    // score each one. Both default to tactician's behaviour exactly.
+    virtual int max_candidates() const { return kMaxCandidates; }
+    virtual int rollout_samples() const { return 1; }
+
 private:
     bool search_first_move(const GameState& state, int faction, const LegalMask& legal,
                            Move& out) {
@@ -1366,9 +1375,9 @@ private:
         greedy_match(state, mobile, targets, matches);
         if (matches.empty()) return false;
 
-        SmallVec<Move, kMaxCandidates> candidates;
+        SmallVec<Move, kMaxCandidatesDeep> candidates;
         candidates.clear();
-        const int n = std::min(kMaxCandidates, matches.size());
+        const int n = std::min(max_candidates(), matches.size());
         for (int i = 0; i < n; ++i) {
             const MatchPair& m = matches[i];
             if (hex_distance(state.grid->coord_of(m.origin), m.target) == 0) continue;
@@ -1395,10 +1404,19 @@ private:
         const Rng seeded(seed);
         bool have_best = false;
         double best_score = 0.0;
+        const int samples = rollout_samples();
         for (int i = 0; i < candidates.size(); ++i) {
-            Rng rollout_rng = seeded;
-            const double score =
-                rollout_and_score(state, faction, candidates[i], *shared_, rollout_rng, *scratch_);
+            // Averaged over `samples` independent sets of dice. One sample per
+            // candidate makes the comparison mostly luck; every candidate still
+            // faces the SAME dice as every other, which is what keeps the
+            // comparison fair.
+            double total = 0.0;
+            for (int j = 0; j < samples; ++j) {
+                Rng rollout_rng = (j == 0) ? seeded : Rng(seed + j * 7919);
+                total += rollout_and_score(state, faction, candidates[i], *shared_, rollout_rng,
+                                           *scratch_);
+            }
+            const double score = total / double(samples);
             if (!have_best || score > best_score) {  // strict: first maximum wins
                 have_best = true;
                 best_score = score;
@@ -1532,6 +1550,18 @@ protected:
     }
 };
 
+// The strong teacher: tacticiandet, searched harder. See AgentKind::kTacticianDeep.
+class TacticianDeepAgent : public TacticianDetAgent {
+public:
+    TacticianDeepAgent(std::shared_ptr<TacticianShared> shared,
+                       std::shared_ptr<GameState> scratch)
+        : TacticianDetAgent(std::move(shared), std::move(scratch)) {}
+
+protected:
+    int max_candidates() const override { return kMaxCandidatesDeep; }
+    int rollout_samples() const override { return 8; }
+};
+
 void build_agents(AgentSet& out, AgentKind kind, int num_factions, int64_t seed) {
     out.num_factions = num_factions;
 
@@ -1541,7 +1571,8 @@ void build_agents(AgentSet& out, AgentKind kind, int num_factions, int64_t seed)
     // faction) is load-bearing, not an optimisation.
     std::shared_ptr<TacticianShared> shared;
     std::shared_ptr<GameState> scratch;
-    if (kind == AgentKind::kTactician || kind == AgentKind::kTacticianDet) {
+    if (kind == AgentKind::kTactician || kind == AgentKind::kTacticianDet ||
+        kind == AgentKind::kTacticianDeep) {
         shared = std::make_shared<TacticianShared>();
         build_agents(shared->mine, AgentKind::kMarshal, num_factions, seed);
         build_agents(shared->opp, AgentKind::kRandom, num_factions, seed + 999983);
@@ -1568,6 +1599,9 @@ void build_agents(AgentSet& out, AgentKind kind, int num_factions, int64_t seed)
                 break;
             case AgentKind::kTacticianDet:
                 a = std::make_unique<TacticianDetAgent>(shared, scratch);
+                break;
+            case AgentKind::kTacticianDeep:
+                a = std::make_unique<TacticianDeepAgent>(shared, scratch);
                 break;
         }
         // Same per-faction seeding as every make_X_agents in agents/.
@@ -1608,6 +1642,7 @@ const char* agent_kind_name(AgentKind kind) {
         case AgentKind::kSentinel: return "sentinel";
         case AgentKind::kMarshalDet: return "marshaldet";
         case AgentKind::kTacticianDet: return "tacticiandet";
+        case AgentKind::kTacticianDeep: return "tacticiandeep";
         default: return "tactician";
     }
 }
@@ -1628,6 +1663,7 @@ bool agent_kind_from_name(const char* name, AgentKind& out) {
     if (n == "tactician") { out = AgentKind::kTactician; return true; }
     if (n == "marshaldet") { out = AgentKind::kMarshalDet; return true; }
     if (n == "tacticiandet") { out = AgentKind::kTacticianDet; return true; }
+    if (n == "tacticiandeep") { out = AgentKind::kTacticianDeep; return true; }
     return false;
 }
 

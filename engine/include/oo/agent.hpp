@@ -88,9 +88,22 @@ enum class AgentKind {
     // they were so every earlier measurement stays comparable.
     kMarshalDet,
     kTacticianDet,
+
+    // A STRONGER teacher (PLAN.md §12.7). tacticiandet with a wider candidate
+    // list and several rollouts averaged per candidate.
+    //
+    // Worth building because of where the cost lands. A rollout scores a
+    // candidate by playing one turn with RANDOM opponents, so the score is a
+    // high-variance estimate and taking the argmax of one sample each throws
+    // away most of the search. Averaging cuts that variance; widening the list
+    // gives it more to choose from. Both are linear in time - and teacher time
+    // is paid ONCE, at corpus generation (10,000 games in 47 s), never at
+    // inference, where the network pays instead. A teacher ten times slower
+    // than tactician costs nothing that matters.
+    kTacticianDeep,
 };
 
-inline constexpr int kNumAgentKinds = 14;
+inline constexpr int kNumAgentKinds = 15;
 
 // `seed` is the per-GAME seed; each faction's generator is seeded
 // seed * 1_000_003 + faction, exactly as engine_old does.

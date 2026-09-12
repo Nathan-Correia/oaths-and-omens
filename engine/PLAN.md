@@ -2399,6 +2399,66 @@ is paid once at corpus generation (10,000 games in 47 s) and never at inference,
 so a teacher several times slower than tactician is affordable in a way a slower
 policy would not be.
 
+### 12.7 A stronger teacher, attempt one: more search does not help
+
+`tacticiandeep` is `tacticiandet` with 8 rollouts averaged per candidate instead
+of 1, and 32 candidates instead of 10. The reasoning: a rollout scores a
+candidate by playing one turn against RANDOM opponents, so the score is a
+high-variance estimate, and picking the argmax of one noisy sample each should
+waste most of the search.
+
+It is not stronger.
+
+| | vs greedy | vs marshal | vs tactician | vs `tacticiandet` |
+|---|---|---|---|---|
+| `tacticiandet` | 72.0 % | 58.6 % | 49.2 % | - |
+| `tacticiandeep` | 73.8 % | 56.6 % | 49.0 % | 49.8 % [45.4, 54.2] |
+
+Dead even, for eight times the rollout cost. So tactician's search is limited
+neither by score variance nor by candidate count: the binding constraint is what
+a rollout MEASURES - one turn of play scored by a positional heuristic. More
+samples of the same estimator do not improve the estimate, and a wider list only
+adds candidates the greedy matcher already ranked lower.
+
+Kept, off the ladder, because the `max_candidates()` / `rollout_samples()` hooks
+are the natural place to try the thing that might work: a rollout several turns
+deep, where the score has something to measure.
+
+### 12.8 Where M10 ends
+
+| | vs random | vs greedy | vs marshal | vs tactician |
+|---|---|---|---|---|
+| `bc10k` (start of the run) | 100.0 % | 62.2 % | 44.2 % | 35.4 % |
+| **`dag1` (best)** | 100.0 % | **67.8 %** | **51.6 %** | **44.0 %** |
+| `tacticiandet` (teacher) | - | 72.0 % | 58.6 % | 49.2 % |
+
+Marshal went from clearly lost to clearly won; tactician from 35.4 % to 44.0 %.
+Three things produced all of it:
+
+1. **A decoder bug** (§12.3) - the type-ordered scan broke at the first
+   non-positive score, so a faction whose upgrades scored negative bought
+   nothing. Worth +2 to +4 against marshal on every checkpoint, free.
+2. **A deterministic buy teacher** (§12.5) - the target was a coin flip, so the
+   head was fitting noise and pinned at 45.2 %. Deterministic, it reached 99 %.
+3. **DAgger** (§12.6) - one round, +3.8 against tactician.
+
+And a list of things that did not work, which is the more useful half: four
+self-play objectives, one-ply value lookahead, 5.5x the parameters, 8x the
+gradient weight on buy, every buy decode threshold from -2 to +3, a second
+DAgger round with and without aggregation, deterministic movement, and a
+deeper-searching teacher.
+
+**What is left, in order of expected value:**
+
+- **A rollout more than one turn deep.** §12.7 localises tactician's weakness to
+  what a rollout measures. This is the only untried lever on teacher strength.
+- **Self-play, revisited.** §12.3's four objectives were all measured through a
+  buy head fitting noise, so none was fairly tested. `dag1` is the first policy
+  worth running them from.
+- **Accept it.** `dag1` plays near marshal and takes 44 % off tactician at
+  neural-network speed. If the goal is a fast strong-ish policy rather than a
+  tactician-beater, this is already it.
+
 Without search this is closer to iterated behaviour cloning or league play than
 to AlphaZero: generate games with the current policy, keep what wins, retrain,
 repeat. The obvious failure is a policy that beats its immediate predecessor
