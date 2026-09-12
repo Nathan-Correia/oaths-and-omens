@@ -1,4 +1,4 @@
-// The five native agents of M6a: random, greedy, heuristic, vanguard, marshal.
+﻿// The five native agents of M6a: random, greedy, heuristic, vanguard, marshal.
 //
 // Ported from agents/*.py. They form a chain - greedy reuses random's targeting
 // and rectification, heuristic reuses greedy's buy and setup policies, vanguard
@@ -13,6 +13,7 @@
 // they are retired at M8.
 
 #include "oo/agent.hpp"
+#include "oo/turn.hpp"
 
 #include "oo/agent_util.hpp"
 #include "oo/battle.hpp"
@@ -888,6 +889,9 @@ inline constexpr int kMaxCandidates = 10;
 // TacticianAgent::max_candidates(), which defaults to kMaxCandidates so
 // tactician's behaviour is untouched.
 inline constexpr int kMaxCandidatesDeep = 32;
+// Whole turns per rollout for tacticiandeep. Games run ~16 turns, so this
+// is a meaningful fraction of the horizon rather than a lookahead tweak.
+inline constexpr int kDeepRolloutDepth = 3;
 inline constexpr double kRivalWeight = 0.5;
 inline constexpr double kOutpostWeight = 2.0;
 inline constexpr double kArmyPowerWeight = 0.05;
@@ -991,6 +995,13 @@ bool rc_cavalry(const GameState& s, int faction, int step, const LegalMask& lega
     return static_cast<RolloutCtx*>(ctx)->agent_for(faction)->decide_cavalry(s, faction, step,
                                                                             legal, out);
 }
+// The rollout had no buy callback because it only ever played the remainder of
+// ONE turn, which starts after the buy phase. A multi-turn rollout runs whole
+// turns, so it needs one.
+void rc_buy(const GameState& s, int faction, const LegalBuyActions& legal, ChosenBuyActions& out,
+            void* ctx) {
+    static_cast<RolloutCtx*>(ctx)->agent_for(faction)->decide_buy(s, faction, legal, out);
+}
 int rc_target(const GameState& s, int hex_index, int faction, void* ctx) {
     return static_cast<RolloutCtx*>(ctx)->agent_for(faction)->decide_target(s, hex_index, faction);
 }
@@ -1008,11 +1019,12 @@ Resource rc_resource(const GameState& s, int faction, int hex_index, void* ctx) 
 // turn, and scores the result. `rng` is freshly seeded per candidate so every
 // candidate faces identical dice - an apples-to-apples comparison.
 double rollout_and_score(const GameState& state, int faction, const Move& first_action,
-                         const TacticianShared& shared, Rng& rng, GameState& sim) {
+                         const TacticianShared& shared, Rng& rng, GameState& sim, int depth) {
     sim = state;  // memcpy - the whole point of the POD layout
     RolloutCtx ctx{&shared, faction};
 
     TurnDecisions td;
+    td.buy = &rc_buy;
     td.movement = &rc_movement;
     td.cavalry = &rc_cavalry;
     td.target = &rc_target;
@@ -1068,6 +1080,23 @@ double rollout_and_score(const GameState& state, int faction, const Move& first_
     run_battle_phase(sim, td, rng);
     apply_terrain_effects(sim);
     apply_collect_phase(sim, td.resource_choice, td.ctx);
+
+    // EXTRA WHOLE TURNS (PLAN.md Â§12.10).
+    //
+    // Â§12.7 showed tactician's search is limited neither by score variance nor
+    // by candidate count - averaging eight rollouts and widening the list to 32
+    // both changed nothing. What a rollout MEASURES is the constraint: one turn
+    // of play scored by a positional heuristic, which cannot see a move whose
+    // cost lands now and whose payoff lands two turns later. Founding an
+    // outpost is exactly that shape, and outposts are the only source of
+    // victory points in the game.
+    //
+    // Stop early once someone has won - the position is decided and further
+    // turns only add noise to the score.
+    for (int t = 1; t < depth; ++t) {
+        if (get_game_winner(sim) >= 0) break;
+        run_turn(sim, td, rng);
+    }
     return evaluate(sim, faction);
 }
 
@@ -1250,7 +1279,7 @@ public:
 };
 
 // legion carries `claimed_` for the WHOLE GAME - the one piece of agent state
-// that is not an RNG. This is why agents are per-game objects (PLAN.md §6.3).
+// that is not an RNG. This is why agents are per-game objects (PLAN.md Â§6.3).
 class LegionAgent : public GreedyBase {
 public:
     bool decide_movement(const GameState& s, int faction, int step, const LegalMask& legal,
@@ -1361,6 +1390,8 @@ protected:
     // score each one. Both default to tactician's behaviour exactly.
     virtual int max_candidates() const { return kMaxCandidates; }
     virtual int rollout_samples() const { return 1; }
+    // Whole turns played per rollout. 1 is tactician's behaviour exactly.
+    virtual int rollout_depth() const { return 1; }
 
 private:
     bool search_first_move(const GameState& state, int faction, const LegalMask& legal,
@@ -1414,7 +1445,7 @@ private:
             for (int j = 0; j < samples; ++j) {
                 Rng rollout_rng = (j == 0) ? seeded : Rng(seed + j * 7919);
                 total += rollout_and_score(state, faction, candidates[i], *shared_, rollout_rng,
-                                           *scratch_);
+                                           *scratch_, rollout_depth());
             }
             const double score = total / double(samples);
             if (!have_best || score > best_score) {  // strict: first maximum wins
@@ -1558,8 +1589,10 @@ public:
         : TacticianDetAgent(std::move(shared), std::move(scratch)) {}
 
 protected:
-    int max_candidates() const override { return kMaxCandidatesDeep; }
-    int rollout_samples() const override { return 8; }
+    // Â§12.7 measured more candidates and more samples as worth nothing, so
+    // neither is raised here; depth is the only change that has a mechanism
+    // behind it.
+    int rollout_depth() const override { return kDeepRolloutDepth; }
 };
 
 void build_agents(AgentSet& out, AgentKind kind, int num_factions, int64_t seed) {
@@ -1575,7 +1608,15 @@ void build_agents(AgentSet& out, AgentKind kind, int num_factions, int64_t seed)
         kind == AgentKind::kTacticianDeep) {
         shared = std::make_shared<TacticianShared>();
         build_agents(shared->mine, AgentKind::kMarshal, num_factions, seed);
-        build_agents(shared->opp, AgentKind::kRandom, num_factions, seed + 999983);
+        // The opponent model inside a rollout. Random is deliberate and was
+        // measured BETTER than a stronger one - but that was tuned at depth 1,
+        // where the simulation only has to survive part of a turn. Three turns
+        // of random play produces a position no real game would reach, so a
+        // deeper rollout wants a plausible opponent, and the non-monotonicity
+        // in depth (52.1% at 3, 50.9% at 6) is what that looks like.
+        build_agents(shared->opp,
+                     kind == AgentKind::kTacticianDeep ? AgentKind::kGreedy : AgentKind::kRandom,
+                     num_factions, seed + 999983);
         scratch = std::make_shared<GameState>();
     }
 
