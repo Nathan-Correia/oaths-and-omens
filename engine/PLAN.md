@@ -1252,7 +1252,7 @@ invariant every army mutation must preserve.
 | ~~M9~~ | ~~Neural policy runtime (§10)~~ | **done — `oo_run --neural` plays full games on random weights: 27 225 evals/s, 9.3 games/s at r7/f8, d=128 x4, after three answer-preserving optimisations (§10.9)** |
 | ~~M10a~~ | ~~Evaluation harness (§12.1)~~ | **done — `oo_eval`. Reproduces the known ordering with non-overlapping intervals, and a self-match lands on exactly 50.0 % (150-150), which is the paired mirror proving itself** |
 | M10b | Imitate tactician (§12.2) | **trained on 10.5M samples: beats `random` 100%, `greedy` 62.2%, near-parity with `marshal` at 44.2%, `tactician` 35.4%.** Exit criterion (beat `marshal`) not quite met - 44.2% [39.9, 48.6] |
-| M10c | Self-play (§12.3, §12.5, §12.6) | **THE TEACHER WAS THE BOTTLENECK** (§12.5): `tacticiandet` with deterministic buy tie-breaks took buy agreement 45.2% -> 99.1% and the ladder to 100 / 68.4 / 49.2 / 40.2, the best yet; DAgger (§12.6) then took it to 67.8 / 51.6 / 44.0, and imitation of this teacher is close to exhausted - deterministic movement and a second DAgger round both bought nothing. Next: a stronger teacher. Earlier in the milestone: machinery built (sampling, self-play dumping, outcome filtering, AWR, shaped VP returns). **No self-play objective has produced a gain** - filtering, outcome advantage, shaped-return advantage and one-ply value lookahead all leave the ladder flat. Diagnosed: AWR on on-policy data cannot propose an unseen action, and the value head cannot rank afterstates that differ in spending. The round's real yield was a decoder bug (early break on the type-ordered scan) worth +2 to +4 points against marshal on every checkpoint. Best is now `sp3` at 65.8 / 47.0 / 39.4. See §12.3 |
+| M10c | Self-play (§12.3, §12.5, §12.6) | **THE TEACHER WAS THE BOTTLENECK** (§12.5): `tacticiandet` with deterministic buy tie-breaks took buy agreement 45.2% -> 99.1% and the ladder to 100 / 68.4 / 49.2 / 40.2, the best yet; DAgger (§12.6) took it to 67.8 / 51.6 / 44.0, and self-play (§12.9) to **72.4 / 58.2 / 45.8** - level with the teacher on greedy and marshal. Imitation of this teacher is exhausted, and imitation of this teacher is close to exhausted - deterministic movement and a second DAgger round both bought nothing. Next: a stronger teacher. Earlier in the milestone: machinery built (sampling, self-play dumping, outcome filtering, AWR, shaped VP returns). **No self-play objective has produced a gain** - filtering, outcome advantage, shaped-return advantage and one-ply value lookahead all leave the ladder flat. Diagnosed: AWR on on-policy data cannot propose an unseen action, and the value head cannot rank afterstates that differ in spending. The round's real yield was a decoder bug (early break on the type-ordered scan) worth +2 to +4 points against marshal on every checkpoint. Best is now `sp3` at 65.8 / 47.0 / 39.4. See §12.3 |
 
 M1–M4 are where nearly all the risk lives. M5 is mechanical. M6 is the largest
 *volume* of work (~1 200 lines, §6.1) but low risk, since each agent is parity-tested
@@ -2516,6 +2516,80 @@ One red herring worth recording: swap drifted 98.9 %, which looked like the
 whole story. It is 0.08 % of decisions, and handing swap back to the teacher
 leaves the ladder unchanged (72.6 / 58.0 against `sp4`'s 72.4 / 58.2). A head
 with almost no gradient pinning it will flip wholesale and mean nothing.
+
+### 12.10 A stronger teacher: every knob measured, none of them it
+
+`rollout_and_score` gained a depth parameter and a buy callback - it had none,
+because it only ever played the remainder of one turn, which begins after the
+buy phase. Extra whole turns run through `run_turn`, stopping early once
+someone has won.
+
+Against `tacticiandet`, 2,000 games each:
+
+| | |
+|---|---|
+| 8 rollout samples averaged (§12.7) | 49.8 % [45.4, 54.2] |
+| 32 candidates instead of 10 (§12.7) | - |
+| **depth 3** | **52.1 % [50.0, 54.3]** |
+| depth 6 | 50.9 % [48.7, 53.1] |
+| depth 3, greedy rollout opponents | 52.0 % [49.8, 54.2] |
+
+Depth 3 is real and marginal, and it does not compound - depth 6 is worse than
+depth 3. The natural explanation was the rollout's random opponent model, which
+is tuned at depth 1 and reaches positions no real game would after three turns
+of random play; greedy opponents changed nothing, so that was not it either.
+
+**So every parameter of tactician's search is now measured and none is the
+binding constraint**: score variance, candidate count, rollout horizon,
+opponent model. What is left untouched is `evaluate()` itself - the positional
+score every rollout ultimately reduces to, weighing VP, outposts and army
+power. That is a design problem, not a knob, and it is the honest answer to
+"what would make a stronger teacher".
+
+Using the depth-3 teacher anyway, on the one policy that had never had DAgger
+applied to it: `dag3` = `sp4` + DAgger labelled by `tacticiandeep`. Flat -
+51.2 % [49.1, 53.4] over 2,000 games, ladder 70.4 / 55.1 / 44.7 against `sp4`'s
+73.0 / 56.8 / 45.3.
+
+### 12.11 Where M10 actually ends
+
+| | vs random | vs greedy | vs marshal | vs tactician |
+|---|---|---|---|---|
+| `bc10k` (start) | 100.0 % | 62.2 % | 44.2 % | 35.4 % |
+| `det1` | 100.0 % | 68.4 % | 49.2 % | 40.2 % |
+| `dag1` | 100.0 % | 67.8 % | 51.6 % | 44.0 % |
+| **`sp4` (best)** | 100.0 % | **72.4 %** | **58.2 %** | **45.8 %** |
+| `tacticiandet` (teacher) | - | 72.0 % | 58.6 % | 49.2 % |
+
+`sp4` is level with its teacher on greedy and marshal, beats marshal clearly,
+and is about 3.5 points off tactician - from 5.7 M parameters with no search at
+inference.
+
+**What worked, in order of size:** a deterministic buy teacher (§12.5), one
+round of self-play once buy could explore at all (§12.9), one round of DAgger
+(§12.6), and a decoder bug fixed by accident (§12.3).
+
+**What did not, which is the longer and more useful list:** four self-play
+objectives run before buy could explore, one-ply value lookahead, 5.5x the
+parameters, 8x the gradient weight on buy, every buy decode threshold from -2
+to +3, second rounds of both DAgger and self-play, higher exploration,
+deterministic movement, more rollout samples, more candidates, deeper rollouts,
+a better rollout opponent model, and DAgger from a deeper teacher.
+
+**The pattern.** Every mechanism gives exactly one round. Each fixes a finite
+deficit - DAgger covers states the teacher never showed, self-play selects among
+alternatives at one noise level - and none of them generates new deficits to
+fix. Expect one round from anything new here, and measure it against that.
+
+**The three rules that would have saved the most time:**
+
+1. Before concluding a learner cannot fit a target, check the target is a
+   function of its input. Ask the teacher the same question twice (§12.5).
+2. Drift magnitude means nothing alone. 32 % buy drift bought zero (§12.3),
+   3 % movement drift bought five points (§12.9). Only drift and strength
+   together separate churn from improvement.
+3. Head-to-head experiments need four figures of games. Two wrong conclusions
+   in §12.3 came from reading overlapping 150-game intervals as a ranking.
 
 Without search this is closer to iterated behaviour cloning or league play than
 to AlphaZero: generate games with the current policy, keep what wins, retrain,
