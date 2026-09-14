@@ -6,6 +6,8 @@
 #include "oo/neural.hpp"
 
 #include "oo/buy.hpp"
+#include "oo/turn.hpp"
+#include "oo/agent.hpp"
 #include "oo/encode.hpp"
 #include "oo/grid.hpp"
 #include "oo/rng.hpp"
@@ -47,6 +49,12 @@ std::atomic<long long> g_la_decisions{0};
 std::atomic<long long> g_la_changed{0};
 std::atomic<long long> g_la_cells_differ{0};
 std::atomic<long long> g_la_qty_only{0};
+std::atomic<long long> g_search_total{0};
+std::atomic<long long> g_search_changed{0};
+// How far apart the value head puts the candidates. If this is small next
+// to the head's own spread across positions generally (~0.25), it cannot
+// see the difference between them and no search built on it can work.
+std::atomic<long long> g_search_spread_milli{0};
 
 // How many extra copies of each repeatable buy action to propose. Capitals are
 // exempt from the per-turn recruit cap (buy.cpp), so the real limit is gold, and
@@ -327,7 +335,7 @@ void TorchPolicy::evaluate_impl(const DecisionRequest* requests, DecisionAnswer*
     // the cells right at the threshold, where the policy head is least sure
     // whether the purchase is worth it.
     auto decode_buy = [&](int i, const DecisionRequest& r, ChosenBuyActions& out,
-                          int delta, Rng* explore) {
+                          int delta, Rng* explore, float explore_tau) {
         out.clear();
         struct Scored {
             float score;
@@ -346,13 +354,13 @@ void TorchPolicy::evaluate_impl(const DecisionRequest* requests, DecisionAnswer*
             }
             if (variant > 8) variant = 8;
             float sc = buy_at(i, act.hex, variant);
-            if (explore != nullptr && cfg_.buy_temperature > 0.0f) {
+            if (explore != nullptr && explore_tau > 0.0f) {
                 // Perturb-and-argmax: adding Gumbel noise to logits and taking
                 // the top-k draws that set from the softmax, so each corpus game
                 // shows a legitimate sample of the policy rather than jitter.
                 double u = explore->random();
                 if (u <= 0.0) u = 1e-12;
-                sc += cfg_.buy_temperature * static_cast<float>(-std::log(-std::log(u)));
+                sc += explore_tau * static_cast<float>(-std::log(-std::log(u)));
             }
             scored.push_back({sc, k});
         }
@@ -529,7 +537,7 @@ void TorchPolicy::evaluate_impl(const DecisionRequest* requests, DecisionAnswer*
                 a.flag = swap_at(i, 0) > swap_at(i, 1);
                 break;
             case DecisionKind::kBuy:
-                decode_buy(i, r, *a.buy, 0, &sample_rng);
+                decode_buy(i, r, *a.buy, 0, &sample_rng, cfg_.buy_temperature);
                 break;
             case DecisionKind::kRectification: {
                 // Score (battle slot, unit type) and send units back one at a
@@ -582,6 +590,288 @@ void TorchPolicy::evaluate_impl(const DecisionRequest* requests, DecisionAnswer*
         }
     }
 
+    // --- ROLLOUT SEARCH ON THE OPENING MOVE (NeuralConfig::search_k) --------
+    //
+    // MOVEMENT, not buy, because movement is where this game demonstrably
+    // rewards search: tactician beats marshal 60/40 using nothing but a
+    // movement rollout, and the two differ in nothing else. Buy has no such
+    // evidence - the policy already reproduces the teacher's purchases 99.9 %
+    // of the time, the teacher is greedy's hand-written heuristic, and nothing
+    // measured here suggests a better buy policy exists. Searching buy found
+    // candidates the value head could rank (spread 0.085 against its overall
+    // 0.25) and ranked them to no effect: 50.6 % against the same weights.
+    //
+    // Step 0 only, once per faction per turn, exactly as tactician does it. A
+    // search at every movement step would cost about five times as much for
+    // decisions that are mostly forced follow-ups.
+    if (cfg_.search_k > 1) {
+        std::vector<int> mv_idx;
+        for (int i = 0; i < n; ++i) {
+            if (requests[i].kind == DecisionKind::kMovement && requests[i].step == 0) {
+                mv_idx.push_back(i);
+            }
+        }
+        if (!mv_idx.empty()) {
+            const int k = cfg_.search_k;
+            const size_t slots = mv_idx.size();
+
+            thread_local AgentSet mv_agents;
+            thread_local Rng mv_rng(cfg_.sample_seed * 6271 + 5);
+            thread_local std::unique_ptr<GameState> mv_scratch(new GameState());
+            if (mv_agents.num_factions != cfg_.num_factions) {
+                build_agents(mv_agents, AgentKind::kMarshal, cfg_.num_factions,
+                             cfg_.sample_seed + 8888);
+            }
+            const TurnDecisions mv_td = make_turn_decisions(mv_agents);
+
+            // Candidate openings: the policy's own top-k legal moves, plus the
+            // pass it would otherwise consider. Candidate 0 is the policy's
+            // argmax, so search can only depart from it when the rollout says
+            // so.
+            std::vector<Move> cand(slots * static_cast<size_t>(k));
+            std::vector<char> cand_is_pass(slots * static_cast<size_t>(k), 0);
+            std::vector<int> cand_n(slots, 0);
+            std::vector<EncodedPosition> succ;
+            std::vector<int> owner, which;
+
+            for (size_t si = 0; si < slots; ++si) {
+                const int i = mv_idx[si];
+                const DecisionRequest& r = requests[i];
+                const GameState& st = *r.state;
+
+                std::vector<std::pair<float, int> > opts;  // score, hex*6+dir (-1 = pass)
+                for (int h = 0; h < st.num_hexes; ++h) {
+                    for (int d = 0; d < NUM_DIRECTIONS; ++d) {
+                        if (r.legal_mask && r.legal_mask->cell[h][d]) {
+                            opts.push_back(std::make_pair(move_at(i, h, d), h * NUM_DIRECTIONS + d));
+                        }
+                    }
+                }
+                opts.push_back(std::make_pair(pass_at(i), -1));
+                std::sort(opts.begin(), opts.end(),
+                          [](const std::pair<float, int>& a, const std::pair<float, int>& b) {
+                              return a.first > b.first;
+                          });
+                const int take = std::min<int>(k, static_cast<int>(opts.size()));
+                cand_n[si] = take;
+
+                for (int j = 0; j < take; ++j) {
+                    const int code = opts[static_cast<size_t>(j)].second;
+                    const size_t slot = si * static_cast<size_t>(k) + static_cast<size_t>(j);
+                    if (code < 0) {
+                        cand_is_pass[slot] = 1;
+                    } else {
+                        cand[slot] = Move{static_cast<int16_t>(code / NUM_DIRECTIONS),
+                                          static_cast<int8_t>(code % NUM_DIRECTIONS)};
+                    }
+                    for (int rep = 0; rep < cfg_.search_samples; ++rep) {
+                        *mv_scratch = st;
+                        run_turn_from_movement(*mv_scratch, mv_td, mv_rng, r.faction,
+                                               cand_is_pass[slot] ? nullptr : &cand[slot]);
+                        DecisionRequest sr = r;
+                        sr.state = mv_scratch.get();
+                        sr.hex = -1;
+                        succ.emplace_back();
+                        encode_position(*mv_scratch, sr, succ.back());
+                        owner.push_back(static_cast<int>(si));
+                        which.push_back(j);
+                    }
+                }
+            }
+
+            const int m = static_cast<int>(succ.size());
+            if (m > 0) {
+                std::vector<int64_t> qv(static_cast<size_t>(m), 0);
+                auto in = torch::from_blob(succ.data(), {m, kPosBytes}, torch::kUInt8);
+                std::unique_lock<std::mutex> lk(gpu_mu_);
+                auto raw2 = in.to(device_);
+                auto qi2 = torch::from_blob(qv.data(), {m}, torch::kLong).to(device_);
+                auto o2 = module_.forward({raw2, qi2}).toGenericDict();
+                auto v = o2.at("value").toTensor().to(torch::kFloat32).to(torch::kCPU);
+                lk.unlock();
+
+                const float* vp = v.data_ptr<float>();
+                std::vector<double> sum(slots * static_cast<size_t>(k), 0.0);
+                std::vector<int> cnt(slots * static_cast<size_t>(k), 0);
+                for (int t = 0; t < m; ++t) {
+                    const size_t slot = static_cast<size_t>(owner[static_cast<size_t>(t)]) *
+                                            static_cast<size_t>(k) +
+                                        static_cast<size_t>(which[static_cast<size_t>(t)]);
+                    sum[slot] += vp[t];
+                    ++cnt[slot];
+                }
+                for (size_t si = 0; si < slots; ++si) {
+                    float best = -3.0e38f, lo_v = 3.0e38f, hi_v = -3.0e38f;
+                    int best_j = 0;
+                    for (int j = 0; j < cand_n[si]; ++j) {
+                        const size_t slot = si * static_cast<size_t>(k) + static_cast<size_t>(j);
+                        if (cnt[slot] == 0) continue;
+                        const float mean = static_cast<float>(sum[slot] / double(cnt[slot]));
+                        lo_v = std::min(lo_v, mean);
+                        hi_v = std::max(hi_v, mean);
+                        if (mean > best) {
+                            best = mean;
+                            best_j = j;
+                        }
+                    }
+                    if (hi_v > lo_v) {
+                        g_search_spread_milli.fetch_add(
+                            static_cast<long long>(1000.0f * (hi_v - lo_v)),
+                            std::memory_order_relaxed);
+                    }
+                    g_search_total.fetch_add(1, std::memory_order_relaxed);
+                    if (best_j != 0) g_search_changed.fetch_add(1, std::memory_order_relaxed);
+
+                    DecisionAnswer& a = answers[mv_idx[si]];
+                    const size_t slot = si * static_cast<size_t>(k) + static_cast<size_t>(best_j);
+                    a.flag = !cand_is_pass[slot];
+                    if (a.flag) a.move = cand[slot];
+                }
+            }
+        }
+    }
+
+    // --- ROLLOUT SEARCH ON BUY (disabled; see the note above) ---------------
+    if (false) {
+        std::vector<int> buy_idx;
+        for (int i = 0; i < n; ++i) {
+            if (requests[i].kind == DecisionKind::kBuy && answers[i].buy) buy_idx.push_back(i);
+        }
+        if (!buy_idx.empty()) {
+            const int k = cfg_.search_k;
+            const size_t slots = buy_idx.size();
+
+            // Opponents inside a rollout, and the agents that finish OUR turn
+            // once the candidate purchase is placed. Marshal rather than random:
+            // the turn has to end somewhere a value head can read, and random
+            // play does not produce such a position.
+            //
+            // THREAD_LOCAL - the gate runs evaluate() outside its lock, so
+            // several threads are in here at once (oo/policy.hpp).
+            thread_local AgentSet sim_agents;
+            thread_local Rng sim_rng(cfg_.sample_seed * 7919 + 13);
+            thread_local std::unique_ptr<GameState> scratch(new GameState());
+            if (sim_agents.num_factions != cfg_.num_factions) {
+                build_agents(sim_agents, AgentKind::kMarshal, cfg_.num_factions,
+                             cfg_.sample_seed + 4242);
+            }
+            const TurnDecisions sim_td = make_turn_decisions(sim_agents);
+
+            std::vector<ChosenBuyActions> cand(slots * static_cast<size_t>(k));
+            std::vector<EncodedPosition> succ;
+            std::vector<int> owner, which;
+            succ.reserve(slots * static_cast<size_t>(k));
+            std::vector<ChosenBuyActions> per_faction(MAX_FACTIONS);
+
+            for (size_t si = 0; si < slots; ++si) {
+                const int i = buy_idx[si];
+                const DecisionRequest& r = requests[i];
+                if (r.faction < 0 || r.faction >= MAX_FACTIONS) continue;
+                for (int j = 0; j < k; ++j) {
+                    ChosenBuyActions& c = cand[si * static_cast<size_t>(k) + j];
+                    decode_buy(i, r, c, 0, j == 0 ? nullptr : &sample_rng, cfg_.search_tau);
+                    bool dup = false;
+                    for (int q = 0; q < j && !dup; ++q) {
+                        const ChosenBuyActions& o = cand[si * static_cast<size_t>(k) + q];
+                        if (o.size() != c.size()) continue;
+                        dup = true;
+                        for (int t = 0; t < c.size() && dup; ++t) dup = (o[t] == c[t]);
+                    }
+                    if (dup) continue;
+
+                  for (int rep = 0; rep < cfg_.search_samples; ++rep) {
+                    *scratch = *r.state;
+                    // Our candidate, and a plausible purchase for everyone else
+                    // so the simulated turn is not played against factions that
+                    // bought nothing.
+                    LegalBuyActions legal;
+                    for (int f = 0; f < scratch->num_factions; ++f) {
+                        per_faction[f].clear();
+                        if (f == r.faction) {
+                            per_faction[f] = c;
+                        } else if (sim_agents.get(f)) {
+                            get_legal_buy_actions(*scratch, f, legal);
+                            sim_agents.get(f)->decide_buy(*scratch, f, legal, per_faction[f]);
+                        }
+                    }
+                    apply_buy_phase(*scratch, per_faction.data());
+
+                    // Play the turn out and score where it ENDS.
+                    run_turn_after_buy(*scratch, sim_td, sim_rng);
+
+                    DecisionRequest sr = r;
+                    sr.state = scratch.get();
+                    sr.hex = -1;
+                    succ.emplace_back();
+                    encode_position(*scratch, sr, succ.back());
+                    owner.push_back(static_cast<int>(si));
+                    which.push_back(j);
+                  }
+                }
+            }
+
+            const int m = static_cast<int>(succ.size());
+            if (m > 0) {
+                std::vector<int64_t> q2v(static_cast<size_t>(m), 0);
+                auto in = torch::from_blob(succ.data(), {m, kPosBytes}, torch::kUInt8);
+                std::unique_lock<std::mutex> lk(gpu_mu_);
+                auto raw2 = in.to(device_);
+                auto qi2 = torch::from_blob(q2v.data(), {m}, torch::kLong).to(device_);
+                auto o2 = module_.forward({raw2, qi2}).toGenericDict();
+                auto v = o2.at("value").toTensor().to(torch::kFloat32).to(torch::kCPU);
+                lk.unlock();
+
+                const float* vp = v.data_ptr<float>();
+                // Mean over this candidate's samples, NOT the max - taking the
+                // max would select the luckiest rollout rather than the best
+                // purchase, which is the opposite of reducing noise.
+                std::vector<double> sum(slots * static_cast<size_t>(k), 0.0);
+                std::vector<int> cnt(slots * static_cast<size_t>(k), 0);
+                for (int t = 0; t < m; ++t) {
+                    const size_t slot = static_cast<size_t>(owner[static_cast<size_t>(t)]) *
+                                            static_cast<size_t>(k) +
+                                        static_cast<size_t>(which[static_cast<size_t>(t)]);
+                    sum[slot] += vp[t];
+                    ++cnt[slot];
+                }
+                std::vector<float> best(slots, -3.0e38f);
+                std::vector<int> best_j(slots, 0);
+                for (size_t si = 0; si < slots; ++si) {
+                    for (int j = 0; j < k; ++j) {
+                        const size_t slot = si * static_cast<size_t>(k) + static_cast<size_t>(j);
+                        if (cnt[slot] == 0) continue;
+                        const float mean = static_cast<float>(sum[slot] / double(cnt[slot]));
+                        if (mean > best[si]) {
+                            best[si] = mean;
+                            best_j[si] = j;
+                        }
+                    }
+                }
+                for (size_t si = 0; si < slots; ++si) {
+                    float lo_v = 3.0e38f, hi_v = -3.0e38f;
+                    for (int j = 0; j < k; ++j) {
+                        const size_t slot = si * static_cast<size_t>(k) + static_cast<size_t>(j);
+                        if (cnt[slot] == 0) continue;
+                        const float mean = static_cast<float>(sum[slot] / double(cnt[slot]));
+                        lo_v = std::min(lo_v, mean);
+                        hi_v = std::max(hi_v, mean);
+                    }
+                    if (hi_v > lo_v) {
+                        g_search_spread_milli.fetch_add(
+                            static_cast<long long>(1000.0f * (hi_v - lo_v)),
+                            std::memory_order_relaxed);
+                    }
+                    ChosenBuyActions* dst_buy = answers[buy_idx[si]].buy;
+                    if (!dst_buy) continue;
+                    g_search_total.fetch_add(1, std::memory_order_relaxed);
+                    if (best_j[si] != 0) g_search_changed.fetch_add(1, std::memory_order_relaxed);
+                    *dst_buy = cand[si * static_cast<size_t>(k) +
+                                    static_cast<size_t>(best_j[si])];
+                }
+            }
+        }
+    }
+
     // --- ONE-PLY VALUE LOOKAHEAD ON BUY (see NeuralConfig::lookahead_k) -----
     //
     // Everything above is the plain policy. This is the part that makes the
@@ -627,7 +917,7 @@ void TorchPolicy::evaluate_impl(const DecisionRequest* requests, DecisionAnswer*
                     // marginal selection for the j-th best rejected one, so the
                     // operator can only depart from the policy when the value
                     // head prefers a DIFFERENT purchase, never a cheaper turn.
-                    decode_buy(i, r, c, j, nullptr);
+                    decode_buy(i, r, c, j, nullptr, 0.0f);
                     // Gumbel noise reproduces the plain decode often enough that
                     // skipping duplicates is most of the batch back.
                     bool dup = false;
@@ -757,6 +1047,18 @@ void TorchPolicy::evaluate_impl(const DecisionRequest* requests, DecisionAnswer*
 namespace {
 struct LookaheadReport {
     ~LookaheadReport() {
+        const long long st = g_search_total.load();
+        if (st > 0) {
+            std::fprintf(stderr,
+                         "buy search: %lld decisions, rollout chose something other "
+                         "than the policy's own answer %lld times (%.1f%%)\n",
+                         st, g_search_changed.load(),
+                         100.0 * double(g_search_changed.load()) / double(st));
+            std::fprintf(stderr,
+                         "  value spread across candidates: %.4f on average "
+                         "(the head's spread across positions generally is ~0.25)\n",
+                         double(g_search_spread_milli.load()) / 1000.0 / double(st));
+        }
         const long long d = g_la_decisions.load();
         if (d == 0) return;
         const long long c = g_la_changed.load();

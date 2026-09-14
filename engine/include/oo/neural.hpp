@@ -84,6 +84,45 @@ struct NeuralConfig {
     // its ceiling and is blind to over-buying. Win rate is not.
     float buy_threshold = 0.0f;
 
+    // ROLLOUT SEARCH ON BUY (PLAN.md §12.12). 0 or 1 disables.
+    //
+    // THE POLICY IMPROVEMENT OPERATOR the self-play loop never had. §12.9
+    // showed that advantage-weighted self-play contributes nothing - a control
+    // with the weighting switched off produced an identical player - because
+    // the advantage is one noisy trajectory return minus a critic fitted to
+    // that same policy, and it shrinks to zero as the two agree. Reweighting
+    // your own answers by your own estimate of your own quality has no fixed
+    // point but the policy you started with.
+    //
+    // Search does not have that problem. For each candidate purchase it plays
+    // the REST OF THE TURN out - movement, battles, collection - and scores the
+    // position the turn actually ends in. The answer it returns is better than
+    // the one the policy proposed, every time, however well the critic fits,
+    // which is the property that makes cloning it climb.
+    //
+    // Why this differs from the one-ply lookahead that failed in §12.3: that
+    // one scored the position immediately AFTER the buy, gold spent and nothing
+    // yet gained, which is nowhere in the value head's training distribution -
+    // it read a full treasury as better than any purchase and learned to buy
+    // nothing (15.6% against the same weights). An end-of-turn position is the
+    // shape the value head was actually trained on.
+    //
+    // Only ever used for GENERATING training data. The deployed policy is the
+    // bare network, which is the whole reason the cost is affordable.
+    int search_k = 0;
+
+    // Gumbel noise generating the candidate purchase sets. Candidate 0 is
+    // always the un-perturbed decode, so search can only depart from the policy
+    // when the rollout says to.
+    float search_tau = 1.0f;
+
+    // Rollouts averaged per candidate. A rollout ends where dice and three
+    // scripted opponents put it, so one sample is a noisy estimate of what a
+    // purchase is worth. Averaging separates "the estimate is noisy" from "the
+    // value head cannot tell these positions apart" - which point at completely
+    // different fixes.
+    int search_samples = 1;
+
     // ONE-PLY VALUE LOOKAHEAD ON THE BUY DECISION (PLAN.md §12.3).
     //
     // Three self-play objectives in a row produced a flat ladder, and the

@@ -68,8 +68,35 @@ void run_turn(GameState& state, const TurnDecisions& decisions, Rng& rng) {
         apply_buy_phase(state, chosen);
     }
 
+    run_turn_after_buy(state, decisions, rng);
+}
+
+void run_turn_after_buy(GameState& state, const TurnDecisions& decisions, Rng& rng) {
+    run_turn_from_movement(state, decisions, rng, /*faction=*/-1, /*first_action=*/nullptr);
+}
+
+void run_turn_from_movement(GameState& state, const TurnDecisions& decisions, Rng& rng,
+                            int faction, const Move* first_action) {
     // --- Movement ----------------------------------------------------------
     for (int step = 0; step < kMovementSteps; ++step) {
+        if (step == 0 && faction >= 0) {
+            MoveActions actions;
+            actions.clear();
+            if (first_action != nullptr) {
+                actions.set(faction, first_action->hex, first_action->dir);
+            }
+            LegalMask legal;
+            for (int f = 0; f < state.num_factions; ++f) {
+                if (f == faction) continue;
+                legal_movement_mask(state, f, legal);
+                Move chosen{};
+                if (decisions.movement(state, f, 0, legal, chosen, decisions.ctx)) {
+                    actions.set(f, chosen.hex, chosen.dir);
+                }
+            }
+            apply_movement_step(state, actions, rng, /*cavalry_only=*/false);
+            continue;
+        }
         MoveActions actions;
         actions.clear();
         LegalMask legal;

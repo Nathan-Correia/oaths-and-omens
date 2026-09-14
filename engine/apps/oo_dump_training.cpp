@@ -548,6 +548,9 @@ int main(int argc, char** argv) {
     // Buy exploration. Without it a self-play corpus has one purchase set per
     // position and no self-play objective can move the buy head at all.
     float buy_temp = 0.0f;
+    // Rollout search on buy. The improvement operator - see NeuralConfig.
+    int search_k = 0;
+    float search_tau = 1.0f;
     long long base_seed = 1;
 
     for (int i = 1; i < argc; ++i) {
@@ -569,6 +572,8 @@ int main(int argc, char** argv) {
         else if (a == "--in-flight") in_flight = std::atoi(next().c_str());
         else if (a == "--dagger") dagger = next();
         else if (a == "--buy-temperature") buy_temp = float(std::atof(next().c_str()));
+        else if (a == "--search") search_k = std::atoi(next().c_str());
+        else if (a == "--search-tau") search_tau = float(std::atof(next().c_str()));
         else {
             std::fprintf(stderr, "unknown option '%s'\n\n", a.c_str());
             usage();
@@ -620,6 +625,8 @@ int main(int argc, char** argv) {
         ncfg.lookahead_k = lookahead;
         ncfg.lookahead_tau = look_tau;
         ncfg.buy_temperature = buy_temp;
+        ncfg.search_k = search_k;
+        ncfg.search_tau = search_tau;
         std::string nerr;
         auto policy = oo::make_neural_policy(ncfg, nerr);
         if (!policy) {

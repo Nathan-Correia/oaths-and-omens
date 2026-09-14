@@ -207,6 +207,9 @@ struct Side {
     bool buy_selfagree = false;
     float buy_threshold = 0.0f;
     float buy_temperature = 0.0f;
+    int search_k = 0;
+    float search_tau = 1.0f;
+    int search_samples = 1;
     AgentKind kind = AgentKind::kRandom;
     // Ablation: decision kinds this side hands back to a scripted agent.
     bool fallback[kNumDecisionKinds] = {};
@@ -534,6 +537,9 @@ Result play_matchup(const Side& a, const Side& b, const RunConfig& cfg, long lon
             nc.lookahead_cells_only = s.lookahead_cells_only;
             nc.buy_threshold = s.buy_threshold;
             nc.buy_temperature = s.buy_temperature;
+            nc.search_k = s.search_k;
+            nc.search_tau = s.search_tau;
+            nc.search_samples = s.search_samples;
             auto p = make_neural_policy(nc, err);
             if (!p) std::fprintf(stderr, "side %s: %s\n", s.name.c_str(), err.c_str());
             return p;
@@ -649,6 +655,9 @@ int main(int argc, char** argv) {
     bool a_selfagree = false;
     float a_bt = 0.0f;
     float a_btemp = 0.0f;
+    int a_search = 0;
+    float search_tau = 1.0f;
+    int search_samples = 1;
 
     for (int i = 1; i < argc; ++i) {
         const std::string s = argv[i];
@@ -665,6 +674,9 @@ int main(int argc, char** argv) {
         else if (s == "--a-buy-selfagree") a_selfagree = true;
         else if (s == "--a-buy-threshold") a_bt = float(std::atof(next().c_str()));
         else if (s == "--a-buy-temperature") a_btemp = float(std::atof(next().c_str()));
+        else if (s == "--a-search") a_search = std::atoi(next().c_str());
+        else if (s == "--search-tau") search_tau = float(std::atof(next().c_str()));
+        else if (s == "--search-samples") search_samples = std::atoi(next().c_str());
         else if (s == "--a-fallback") fallback_kinds = next();
         else if (s == "--a-fallback-agent") fallback_agent = next();
         else if (s == "--games") pairs = std::atoi(next().c_str());
@@ -696,6 +708,9 @@ int main(int argc, char** argv) {
     a.buy_selfagree = a_selfagree;
     a.buy_threshold = a_bt;
     a.buy_temperature = a_btemp;
+    a.search_k = a_search;
+    a.search_tau = search_tau;
+    a.search_samples = search_samples;
     if (!fallback_kinds.empty()) {
         for (const std::string& k : split_commas(fallback_kinds)) {
             int found = -1;

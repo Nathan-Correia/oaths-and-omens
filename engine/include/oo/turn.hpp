@@ -52,6 +52,28 @@ void run_battle_phase(GameState& state, const TurnDecisions& decisions, Rng& rng
 
 void run_turn(GameState& state, const TurnDecisions& decisions, Rng& rng);
 
+// Everything a turn does AFTER the buy phase: movement, cavalry, battles,
+// terrain, collection, and the turn counter.
+//
+// Split out for neural search (PLAN.md §12.12), which needs to try a candidate
+// purchase and then see how the turn ends up. Evaluating the position
+// immediately after a buy is useless - the gold is spent and nothing has been
+// gained yet, and a value head trained on decision points reads that as pure
+// loss. An END-OF-TURN position is the shape it was trained on.
+void run_turn_after_buy(GameState& state, const TurnDecisions& decisions, Rng& rng);
+
+// The turn from the movement phase on, with ONE faction's first move forced.
+//
+// This is what a movement search needs: try a candidate opening move, let the
+// turn play out, and look at where it ends. `first_action` null means that
+// faction simply passes on step 0.
+//
+// Submission order matters and is preserved: the searching faction's action
+// goes in FIRST, before the opponents', because that ordering decides battle
+// creation order (see MoveActions).
+void run_turn_from_movement(GameState& state, const TurnDecisions& decisions, Rng& rng,
+                            int faction, const Move* first_action);
+
 // None (-1) until some faction has reached kVpToWin. Among those at or above it,
 // the strict highest total wins; an exact tie is broken by whoever settled their
 // capital LATER during setup (capital_settle_order is a single incrementing
