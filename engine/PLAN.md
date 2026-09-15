@@ -2591,6 +2591,90 @@ fix. Expect one round from anything new here, and measure it against that.
 3. Head-to-head experiments need four figures of games. Two wrong conclusions
    in §12.3 came from reading overlapping 150-game intervals as a ranking.
 
+### 12.12 Rollout search: an improvement operator at last, and it cannot be cloned
+
+**Self-play never worked, including the time it looked like it did.** §12.9
+credited `sp4`'s +5 to advantage-weighted self-play. A control - identical
+corpus, weighting switched OFF - produces an identical player: 50.1 %
+[47.9, 52.3] over 2,000 games. The gain came from training on a corpus
+generated WITH BUY EXPLORATION, which is self-distillation on perturbed
+trajectories, i.e. regularisation. That is a one-time benefit, which is exactly
+why round two was flat and round two at higher noise was worse.
+
+Why the RL part cannot work as built: the advantage is one sampled trajectory
+return minus a critic fitted to the same policy. The return is contaminated by
+sixteen turns of eight seats' decisions and dice, and the critic converges
+toward the policy's own returns, so the signal shrinks as the loop runs -
+sd 0.174 in round one, 0.111 in round two, with 92.5 % of weights inside ±0.5
+by then. Reweighting your own answers by your own estimate of your own quality
+has no fixed point but the policy you started with.
+
+**Search does not have that problem.** For each candidate opening move, play the
+rest of the turn out and score the position the turn ENDS in with the value
+head. The answer is better than the policy's regardless of how well the critic
+fits, because it comes from simulation rather than from policy/critic
+disagreement. Against the same weights, 2,000 games each: k=2 54.8 %
+[52.6, 57.0], k=3 54.7 %, k=4 53.4 %, k=8 51.8 %.
+
+Three details that decide whether it works:
+
+- **Movement, not buy.** Buy search ranked its candidates consistently
+  (value spread 0.085 against the head's overall 0.25) and achieved nothing:
+  50.6 % [47.2, 54.1], unchanged by averaging six rollouts. Buy has no
+  demonstrated headroom - the policy reproduces the teacher's purchases 99.9 %
+  of the time and the teacher is greedy's heuristic. Movement is where this
+  game is known to reward search: tactician beats marshal 60/40 on movement
+  rollouts and differs in nothing else. Building the buy version first was
+  hope, not evidence.
+- **Score an END-OF-TURN position.** §12.3's one-ply lookahead scored the
+  position straight after the buy - gold spent, nothing gained - which is
+  nowhere in the value head's training distribution, and it learned to buy
+  nothing (15.6 %).
+- **Keep it narrow.** The gain decays monotonically in k, and the search
+  overrides the policy 78 % of the time at k=4 and 89 % at k=8. The head ranks
+  the top two candidates reliably and degrades past that.
+
+#### And the clone is worse than the original
+
+`srch1`, trained on 6,000 games where the search chose every opening move,
+scores **46.5 % [44.3, 48.6]** against `sp4` and 69.5 / 50.6 / 43.9 on the
+ladder against 73.0 / 56.8 / 45.3.
+
+Training shows why: the network fits the SEARCH's moves at 79.0 % where it fits
+its OWN at 85 %. A search's choice depends on simulated outcomes that are not
+readable from the position, so the network learns "sometimes deviate from the
+obvious move" without learning when. An imperfect imitation of a search plays
+worse than a self-consistent policy.
+
+**So the blocker moved rather than lifted.** There is an improvement operator
+now; the network cannot absorb it. That is a different and more specific
+problem than anything earlier in M10: not a missing signal, but a
+representation that cannot hold the signal.
+
+#### Used rather than cloned
+
+| | vs greedy | vs marshal | vs tactician |
+|---|---|---|---|
+| `sp4` alone | 73.0 % | 56.8 % | 45.3 % |
+| **`sp4` + search k=2** | 72.4 % | **60.4 %** | **51.6 %** |
+| `tacticiandet` (teacher) | 72.0 % | 58.6 % | 49.2 % |
+
+Against marshal, 60.4 % [58.2, 62.5] over 2,000 games - clearly past the
+teacher. Against tactician, 51.6 % [49.4, 53.8] - LEVEL, and the interval
+includes 50, so this is not a demonstrated win. Two 500-game seeds reading 51.0
+and 52.2 are not evidence that it is one.
+
+Cost is 5.5 games/s against roughly 27 for the bare network, so it is a
+strength-for-speed trade, not a free upgrade. Which of those matters is a
+product decision, not a technical one.
+
+**What would make the clone work** is the open question worth pursuing: the
+movement head has to be able to represent what the search computes. Capacity
+moved movement agreement +4 points once (§12.6) and then plateaued, so more
+parameters alone is not obviously it. Giving the network features that carry
+what the rollout discovers - or predicting the search's VALUE rather than its
+choice - are the two directions with a mechanism behind them.
+
 Without search this is closer to iterated behaviour cloning or league play than
 to AlphaZero: generate games with the current policy, keep what wins, retrain,
 repeat. The obvious failure is a policy that beats its immediate predecessor
