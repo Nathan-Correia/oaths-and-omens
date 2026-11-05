@@ -8,10 +8,14 @@ Oaths and Omens is a game of territorial conquest, betrayal, and diplomacy playe
 
 Each player controls one faction and begins the game with a bag containing:
 
-- 24 infantry
-- 12 cavalry
-- 12 archers
+- 12 infantry
+- 6 cavalry
+- 6 archers
 - 1 city (your capital)
+- 3 outposts
+- 2 barracks
+- 2 storehouses
+- 2 temples
 - 1 D20 die
 
 ## Map Creation
@@ -166,15 +170,15 @@ Upgrade costs:
 
 | Upgrade | Cost |
 |---|---|
-| **Barracks** | 2 Fish, 4 Wood |
-| **Workshop** | 2 Iron, 2 Clay, 4 Wood |
-| **Temple** | 2 Fish, 2 Iron, 2 Clay, 4 Wood |
+| **Barracks** | 2 Fish, 1 Wood |
+| **Storehouse** | 1 Iron, 1 Clay, 2 Wood |
+| **Temple** | 1 Fish, 1 Iron, 1 Clay, 1 Wood |
 
 There are three outpost upgrades:
 
 - **Barracks**: removes the 1-infantry-per-turn recruiting cap at that outpost (the no-adjacent-enemy restriction still applies), and increases that outpost's silver income contribution from 1 to 2 per turn.
 - **Temple**: adds +1 to the player's total victory-point-per-round output (see Win Condition), on top of what the outpost formula would otherwise produce.
-- **Workshop**: doubles that outpost's resource output — 2 of its resource per turn instead of 1 (see Resources).
+- **Storehouse**: doubles that outpost's resource output — 2 of its resource per turn instead of 1 (see Resources).
 
 Note that converting an outpost directly from one upgrade to another still requires paying the new upgrade's full cost.
 
@@ -191,7 +195,7 @@ An outpost's resource output is determined by its own tile and its adjacent (ort
 - If the outpost is adjacent to both a mountain and a lake, its owner chooses each turn whether it produces Iron or Fish.
 - If the outpost is on a **desert** tile and is not adjacent to a mountain or lake, it produces no resources.
 
-An outpost only ever produces one resource type per turn, regardless of how many qualifying neighboring tiles it has (e.g. being adjacent to two mountains does not produce 2 Iron). A Workshop upgrade doubles the single resource's output to 2 per turn, but does not grant a second resource type.
+An outpost only ever produces one resource type per turn, regardless of how many qualifying neighboring tiles it has (e.g. being adjacent to two mountains does not produce 2 Iron). A Storehouse upgrade doubles the single resource's output to 2 per turn, but does not grant a second resource type.
 
 Resources may be spent to play action cards, to pay outpost upgrade costs, or traded to other players.
 
